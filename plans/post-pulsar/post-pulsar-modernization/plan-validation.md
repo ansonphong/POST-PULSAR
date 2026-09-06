@@ -25,3 +25,20 @@ coverage, blocked retry/revalidation, immutable snapshots, and exact
 reconciliation behavior match the approved Stage 2 design. Task references are
 one-to-one, dependencies are acyclic and ordered, and file ownership is
 workable.
+
+## Approved scope expansion
+
+The operator expanded scope during Stage 5 to multiple account profiles,
+built-in scheduling/daemon operation, and a sibling MCP/plugin repository. The
+superseding graph now contains 27 tasks across seven phases, with `T1.1`–`T1.3`
+retained as completed foundations. It passes the planner validator with zero
+errors and zero warnings.
+
+Three independent reviewers hardened system/state, security/execution quality,
+and MCP/plugin packaging. Final passes are all `VERIFIED`. Resolved gaps include
+atomic DRAFTS admission, per-bundle directory layout, lock ordering,
+DST/misfire/retry transitions, service-identity modes, TTY-only approval,
+complete OpenAPI/tool registries, cached frozen runtime provisioning, distinct
+Codex/Claude packaging, exact core-revision compatibility, portable focused
+verification, and per-repository commit ownership. Remaining high/medium plan
+gaps: none.

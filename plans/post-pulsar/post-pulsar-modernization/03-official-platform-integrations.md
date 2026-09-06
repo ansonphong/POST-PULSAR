@@ -13,21 +13,26 @@ adapter lifecycle into read-only `preflight`, resumable `prepare`, and one-shot
 writer and must checkpoint every returned upload/container ID, expiry, staged
 file, and processing transition before proceeding. `commit` may be called only
 after the orchestrator durably marks `final_dispatch_started` and performs
-exactly one final public-create request with no internal retry. Build a
-requests-based transport with bounded connect/read timeouts,
+exactly one final public-create request with no internal retry. Build an
+`httpx.Client` transport tested through `respx`, with bounded connect/read timeouts,
 Retry-After-aware pre-final retry handling, redacted diagnostics, response-size
 bounds, and Authorization-header-only tokens. Inherit the autouse socket-denial
 fixture established by `T2.1`; no platform-host exception is allowed. Keep the
 legacy BasePoster runnable until the atomic `T5.1`
 operational cutover and prevent raw response bodies or headers from becoming
 operator messages.
+Every adapter call carries an immutable profile/target snapshot. Resolve its
+allow-listed token environment reference only for the active job, create a new
+authenticated client per target, verify remote identity immediately before
+mutation, and close it before another profile runs. No Authorization header or
+resolved credential may cross profile boundaries or enter persisted state.
 
 **Test:** yes
 
 **Dependencies:**
-- T1.2
-- T1.3
+- T1.4
 - T2.1
+- T2.2
 
 **Files:**
 - `src/post_pulsar/platforms/__init__.py`
@@ -40,6 +45,8 @@ operator messages.
 - Tokens appear only in Authorization headers and are removed from exceptions, logs, and repr output.
 - The transport distinguishes safe pre-final retries from uncertain final create/publish dispatch.
 - All contract tests fail closed on any real socket; prepared artifacts and phases have an explicit durable checkpoint interface and `commit` cannot retry internally.
+- Cross-account tests prove headers, clients, expected identities, artifacts,
+  and sanitized errors cannot leak between profiles.
 
 **Verify-After:**
 - `.venv/bin/python -m pytest tests/unit/test_http.py -q` (focused)
@@ -62,6 +69,8 @@ safely re-uploaded; after final dispatch, expiry never downgrades ambiguity or
 authorizes another post. Bound polling/backoff, honor Retry-After, classify 4xx
 failures and post-dispatch network/5xx outcomes correctly, and never repeat an
 uncertain final create.
+The adapter instance is single-target and verifies the snapshotted numeric user
+ID and username for that profile; media IDs are never reused by another profile.
 
 **Test:** yes
 
@@ -104,6 +113,9 @@ none authorizes an automatic second publish. Retain staging/container IDs for
 every ambiguous result, clean only hash-matched pre-publication/known-terminal
 staging, persist alt/normalization warnings, and classify uncertainty without
 automatic retry.
+The adapter instance is single-target and validates its profile-specific user
+ID/token reference; public staging URLs remain under that profile's fingerprint
+path and no container is reused across profiles.
 Before staging or container creation, NFC-normalize the caption and enforce at
 most 2,200 Unicode code points, 30 hashtags, and 20 `@` mentions, with exact
 boundary contract tests and zero staging, HTTP mutation, or delivery-artifact

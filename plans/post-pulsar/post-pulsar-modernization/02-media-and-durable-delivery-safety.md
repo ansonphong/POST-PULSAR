@@ -37,11 +37,14 @@ reachability. Missing `ffprobe`, timeout, nonzero exit, malformed/oversized JSON
 and sanitized error paths are explicit tests. Instagram alt-text loss remains a
 persisted warning rather than silently claiming support.
 
+All private and public staging paths are scoped by stable `profile_id`.
+Descriptors carry profile and source-bucket identity, and no prepared artifact
+may be reused across profiles even when source hashes match.
+
 **Test:** yes
 
 **Dependencies:**
-- T1.2
-- T1.3
+- T1.4
 
 **Files:**
 - `src/post_pulsar/media.py`
@@ -82,11 +85,25 @@ every attempt checkpoints progress then fails at the same later phase must still
 block on the fifth failure. Persist and
 deduplicate preflight warning codes for later status rendering.
 
+The initial schema is multi-profile: add profiles, globally unique
+profile-target ownership, surrogate bundle keys with unique
+`(profile_id,bundle_id)`, source buckets, schedules, schedule runs, durable run
+requests, pause state, and durable draft-admission journals/member checkpoints.
+Add entity revisions, request-to-schedule/bundle
+links, idempotency key plus canonical result retention, and core-owned expiring
+confirmation intents with pending/approved/consumed/expired states. Repository
+methods atomically claim schedule occurrences with content, consume approved
+intents with idempotent requests, and enforce every transition; scheduler and
+control modules contain no ad hoc SQL. Target snapshots include the immutable profile,
+remote identity, token-reference name, and non-secret request settings. A
+profile may have only one active bundle, while failures in one profile cannot
+block another. Existing unknown/single-profile schemas fail with an actionable
+migration-required result until `T2.4` applies an explicit migration.
+
 **Test:** yes
 
 **Dependencies:**
-- T1.2
-- T1.3
+- T1.4
 
 **Files:**
 - `src/post_pulsar/state.py`
@@ -95,6 +112,7 @@ deduplicate preflight warning codes for later status rendering.
 **Acceptance:**
 - Schema creation and re-open are idempotent and reject unsupported future user_version values.
 - Illegal transitions, snapshot mutation, fingerprint drift, duplicate case-folded IDs, empty target snapshots, and automatic ambiguous retries are rejected transactionally.
+- Profile-root drift is rejected whenever stored active, archiving, blocked, or ambiguous work references the prior root.
 - Events and delivery errors contain safe operator context but cannot contain configured secret values.
 - Crash tests at every artifact/phase checkpoint prove stale pre-final work is resumable/safely failed and only stale `final_dispatch_started` becomes ambiguous; total and consecutive counters retain their distinct semantics.
 
@@ -103,8 +121,9 @@ deduplicate preflight warning codes for later status rendering.
 
 ### Task 2.3: Add single-instance locking and exact archival recovery
 
-Implement a state-directory process lock and an archive transaction that moves
-only the snapshotted exact members into `<posts_directory>/posted/ID`. Persist
+Implement the ordered instance, maintenance, and per-profile locks and an archive
+transaction that moves only the snapshotted exact members into
+`accounts/<profile>/POSTED/<bucket>/<bundle-id>`. Persist
 `archiving` before filesystem mutation, create a fingerprinted staging
 directory, verify fingerprint/membership, checkpoint each exact member after
 `os.replace`, hash-verify the complete staged set, then atomically rename to the
@@ -114,6 +133,18 @@ cross-filesystem fallback must copy to a temporary file, fsync, verify hash,
 atomically install it, and remove source only after durable verification.
 Ambiguous cases never overwrite or delete. Reject symlinks/cross-bundle paths
 and never use broad globs.
+
+The global order is `instance.lock` → `maintenance.lock` when applicable →
+sorted profile locks → short SQLite write transaction. Daemon mode owns the
+instance lock for life; one-shot mode owns it for the run; migration owns it
+before checking daemon/state and then takes maintenance. Daemon application
+services receive the already-held instance lease and never reacquire it;
+control threads only enqueue in short transactions. The source is always
+`accounts/<profile>/<bucket>/<bundle-id>/`; snapshot semantic content members
+and the operational `.ready` sentinel separately, verify both, and archive the
+whole exact container through staging. Require the snapshotted profile, bucket,
+and ready marker. A profile root cannot move while
+it has active, archiving, blocked, or ambiguous work.
 
 **Test:** yes
 
@@ -132,3 +163,46 @@ and never use broad globs.
 
 **Verify-After:**
 - `.venv/bin/python -m pytest tests/unit/test_archive.py -q` (focused)
+
+### Task 2.4: Add journaled single-account state and layout migration
+
+Implement explicit `--profile PROFILE --dry-run|--apply` migration from the
+legacy flat PHONG-BOT layout, which has no delivery database, to the
+multi-profile model. No pre-profile POST PULSAR schema was released: any
+existing unknown/non-current SQLite `user_version` fails closed and is never
+guessed or rewritten. Migration acquires the instance gate before checking
+state and then owns the maintenance lock. Create an owner-only backup of any
+current-schema state plus a durable migration journal. Validate the chosen
+profile, empty/conflict conditions, exact source hashes, destination hashes, and
+foreign keys, then commit imported current-schema rows and filesystem moves
+through resumable journal phases. Move each exact active bundle into
+the chosen profile's `RANDOM/<bundle-id>/` container and structured archives to
+`POSTED/RANDOM`; leave unknown legacy files untouched and report them. Every
+filesystem move is hash-verified and journaled so interruption resumes
+idempotently. Never infer a profile, token, or remote identity and never copy
+the old state into multiple profiles. For the no-database layout, create fresh
+state and move only exact valid bundles. Atomically create and snapshot each
+ready marker only after destination membership/fingerprint verification;
+unknown schemas, partial bundles, and unrelated files remain untouched.
+
+**Test:** yes
+
+**Dependencies:**
+- T2.2
+- T2.3
+
+**Files:**
+- `src/post_pulsar/migration.py`
+- `tests/unit/test_migration.py`
+
+**Acceptance:**
+- Dry-run is read-only and reports exact database/filesystem changes and all
+  required operator inputs without secret values.
+- Apply is journal/backup-first, crash-resumable, and hash/FK validated; the
+  legacy no-database source has no published/failed/ambiguous delivery rows to
+  infer, and existing databases are left untouched.
+- Daemon/lock contention, identity mismatch, unknown layouts, and conflicting
+  destinations fail closed without partial cutover or destructive guessing.
+
+**Verify-After:**
+- `.venv/bin/python -m pytest tests/unit/test_migration.py -q` (focused)

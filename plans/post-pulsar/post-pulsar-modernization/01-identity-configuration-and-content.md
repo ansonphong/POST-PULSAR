@@ -106,3 +106,68 @@ Replace PhongBot._get_basename_without_number and prefix globbing with the Stage
 
 **Verify-After:**
 - `.venv/bin/python -m pytest tests/unit/test_content.py -q` (focused)
+
+### Task 1.4: Add profiles, account roots, standard buckets, and ready markers
+
+Extend the typed configuration and exact discovery model with stable
+`profile_id` values, globally unique remote platform identities, isolated
+account roots, per-target environment-variable references, unpublished
+`DRAFTS/{QUEUE,RANDOM,REELS}` roots, and the publishable `QUEUE`, `RANDOM`, and
+`REELS` buckets. The tracked example defines
+`ansonphong` and `360hextile` X profiles using operator-replaced remote-ID
+placeholders and distinct token variable names only. Add non-secret daemon and
+control settings, including agent-capability, operator-verifier, bootstrap, and
+endpoint-record paths. `T4.5`/`T4.6` own secure secret initialization and
+rotation. Enumerate only immediate `<bundle-id>` directories in each bucket and
+scan each directory non-recursively with the exact filename grammar. Admit a
+publishable bundle only when its canonical `.ready` sentinel is present; the
+sentinel is an operational member excluded from the semantic content
+fingerprint. Reuse `scan_inbox(bundle_directory)` but require exactly one parsed
+bundle whose ID and case match the container directory; nested directories,
+extra bundle IDs, and a sentinel anywhere except that directory are errors.
+`QUEUE` and `REELS` order by case-folded ID; `RANDOM` returns candidates
+for the transactional selector in `T4.1`. `REELS` accepts one video only.
+Reject overlapping/nested/case-colliding roots, symlinks, invalid profile IDs,
+duplicate `(platform, expected_remote_user_id)` ownership, unsafe environment
+variable references. Replace the original top-level `[x]`/`[instagram]` model
+with an explicit `[[profiles]]` schema whose target tables define enabled flag,
+expected numeric ID, expected username, token environment reference, and
+platform request settings. Declare `tzdata` for portable IANA timezone support.
+Stored-work root drift is enforced later by `T2.2`/`T4.1`, after durable state
+exists.
+
+**Test:** yes
+
+**Dependencies:**
+- T1.2
+- T1.3
+
+**Files:**
+- `src/post_pulsar/config.py`
+- `src/post_pulsar/content.py`
+- `post-pulsar.toml.example`
+- `.env.example`
+- `pyproject.toml`
+- `tests/unit/test_config.py`
+- `tests/unit/test_profiles.py`
+
+**Acceptance:**
+- Profiles and account roots are stable, isolated, immutable configuration
+  identities; tokens and real remote IDs remain outside tracked examples.
+- `QUEUE`, `RANDOM`, and `REELS` discovery uses exact bundle membership and
+  requires the matching regular ready marker without following symlinks.
+- The only accepted publishable shape is
+  `BUCKET/<bundle-id>/{exact content members,.ready}`; container and parsed IDs
+  match exactly and scanning never descends another level.
+- DRAFTS content is never a publication candidate; later core admission copies
+  it through a daemon-owned journaled staging directory, verifies the approved
+  semantic fingerprint, installs the sentinel last, and atomically renames the
+  complete bundle directory into a publishable bucket while retaining the draft.
+- The two requested X usernames have independent secret references, and one
+  remote platform identity cannot be assigned to multiple profiles.
+- Invalid roots, IDs, bucket content, and ready-marker races fail before state
+  or network mutation.
+
+**Verify-After:**
+- `.venv/bin/python -m pytest tests/unit/test_config.py tests/unit/test_profiles.py -q` (focused)
+- `! rg -n "(access_token|token)[[:space:]]*=[[:space:]]*['\"][^'\"]+" post-pulsar.toml.example .env.example` (scoped_check)

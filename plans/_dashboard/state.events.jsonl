@@ -12,3 +12,6 @@
 {"event":"commit","sha":"1110bd5","message":"feat: add secure local configuration","time":"2026-09-06T02:12:30Z"}
 {"event":"commit","sha":"f3cdabe","message":"feat(content): implement exact bundle discovery","time":"2026-09-06T02:13:15Z"}
 {"event":"commit","sha":"dfb32e9","message":"fix: keep credential scan strict","time":"2026-09-06T02:13:22Z"}
+{"event":"commit","sha":"b1b0982","message":"chore(plan): mark T1.2 DONE","time":"2026-09-06T02:14:08Z"}
+{"event":"commit","sha":"4ed3c68","message":"fix(content): bind text parsing to fingerprint bytes","time":"2026-09-06T02:22:14Z"}
+{"event":"commit","sha":"9342aab","message":"fix: harden config numeric and path validation","time":"2026-09-06T02:22:57Z"}

@@ -1,5 +1,10 @@
 # POST PULSAR Modernization Gap Scanner
 
+> Historical note: this report records hardening of the original 15-task scope.
+> The operator-approved Stage 5 expansion was separately re-planned and hardened
+> in `scope-expansion-hardening.md`; that report supersedes “no gaps” claims for
+> the current 27-task graph.
+
 > `/meta-loop-gap plans/post-pulsar/post-pulsar-modernization --budget auto --iterations 3`
 
 Progressive-depth plan hardening focused on execution feasibility, supported API
