@@ -35,3 +35,4 @@
 {"event":"commit","sha":"305e1b1","message":"fix(media): verify consumed bytes and isolated cleanup","time":"2026-09-06T04:35:52Z"}
 {"event":"commit","sha":"dab484e","message":"fix(media): close failed public staging descriptors","time":"2026-09-06T04:42:18Z"}
 {"event":"commit","sha":"d7e0382","message":"fix(state): expose durable recovery readers","time":"2026-09-06T04:42:55Z"}
+{"event":"commit","sha":"ba71b88","message":"chore(plan): mark T2.1 DONE","time":"2026-09-06T04:43:02Z"}
