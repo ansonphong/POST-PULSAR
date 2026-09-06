@@ -172,7 +172,11 @@ work take precedence over new admission.
 
 **Files:**
 - `src/post_pulsar/scheduler.py`
+- `src/post_pulsar/state.py`
+- `src/post_pulsar/app.py`
 - `tests/unit/test_scheduler.py`
+- `tests/unit/test_state.py`
+- `tests/unit/test_app.py`
 
 **Acceptance:**
 - Duplicate ticks, restart, DST fold/gap, rollback, simultaneous slots, and
@@ -198,6 +202,8 @@ work take precedence over new admission.
 - Cron/RRULE and unbounded catch-up are rejected.
 
 **Verify-After:**
+- `.venv/bin/python -m pytest tests/unit/test_state.py -q` (focused)
+- `.venv/bin/python -m pytest tests/unit/test_app.py -q` (focused)
 - `.venv/bin/python -m pytest tests/unit/test_scheduler.py -q` (focused)
 
 ### Task 4.5: Add the foreground daemon and authenticated control API
