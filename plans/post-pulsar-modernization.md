@@ -1,7 +1,7 @@
 ---
-stage: 1
+stage: 2
 repo: POST-PULSAR
-stage_state: active
+stage_state: done
 ---
 
 # POST PULSAR modernization
@@ -13,7 +13,7 @@ Instagram, suitable for manual use or an external OS scheduler.
 ## Waterfall record
 
 - Stage 1 — Brainstorm: complete; direction converged.
-- Stage 2 — Design: pending.
+- Stage 2 — Design: complete; quality gate B+ (8.55/10).
 - Stage 3 — Plan: pending.
 - Stage 4 — Harden: pending.
 - Stage 5 — Execute: pending.
@@ -44,4 +44,3 @@ automated verification. Those opportunities belong only in the final report.
 - Fresh installation, lint, type checks, offline tests, build, and dependency
   audit pass on the declared Python baseline.
 - README and migration guidance describe prerequisites and limitations honestly.
-
