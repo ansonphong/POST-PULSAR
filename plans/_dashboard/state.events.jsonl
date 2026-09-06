@@ -42,3 +42,8 @@
 {"event":"commit","sha":"4abfc83","message":"feat(platforms): define safe adapter transport contracts","time":"2026-09-06T05:03:29Z"}
 {"event":"commit","sha":"1e9574b","message":"feat(archive): add crash-safe exact archival","time":"2026-09-06T05:03:42Z"}
 {"event":"commit","sha":"62645a2","message":"fix(platforms): reject retryable post-final results","time":"2026-09-06T05:10:35Z"}
+{"event":"commit","sha":"d2e29f0","message":"chore(plan): mark T3.1 DONE","time":"2026-09-06T05:11:24Z"}
+{"event":"commit","sha":"5dc0bf7","message":"fix(archive): close lock and filesystem races","time":"2026-09-06T05:23:27Z"}
+{"event":"commit","sha":"5dc0bf7","message":"fix(archive): close lock and filesystem races","time":"2026-09-06T05:26:18Z"}
+{"event":"commit","sha":"5c4d682","message":"feat(instagram): add official publishing adapter","time":"2026-09-06T05:26:18Z"}
+{"event":"commit","sha":"e5b24a2","message":"feat(platforms): add official X v2 adapter","time":"2026-09-06T05:26:32Z"}
