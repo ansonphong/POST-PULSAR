@@ -190,6 +190,58 @@ def test_control_files_must_be_distinct_and_inside_state_directory(
         load_local_settings(path)
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        (
+            'agent_capability_file = ".post-pulsar/control/agent-capability"',
+            'agent_capability_file = ".post-pulsar/control"',
+        ),
+        (
+            'bootstrap_file = ".post-pulsar/control/bootstrap.json"',
+            'bootstrap_file = ".post-pulsar/control/endpoint.json/child"',
+        ),
+        (
+            'log_file = ".post-pulsar/logs/post_pulsar.log"',
+            'log_file = ".post-pulsar/control"',
+        ),
+        (
+            'log_file = ".post-pulsar/logs/post_pulsar.log"',
+            'log_file = ".post-pulsar/control/bootstrap.json/child"',
+        ),
+    ],
+)
+def test_control_and_log_paths_reject_ancestor_descendant_collisions(
+    tmp_path: Path, field: str, replacement: str
+) -> None:
+    path = _write_config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(field, replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="overlap"):
+        load_local_settings(path)
+
+
+def test_component_prefixes_are_not_path_collisions(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        'log_file = ".post-pulsar/logs/post_pulsar.log"',
+        'log_file = ".post-pulsar/control/agent-capability.log"',
+    ).replace(
+        'bootstrap_file = ".post-pulsar/control/bootstrap.json"',
+        'bootstrap_file = ".post-pulsar/control/endpoint.json.backup"',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    settings = load_local_settings(path)
+
+    assert settings.app.log_file.name == "agent-capability.log"
+    assert settings.app.bootstrap_file.name == "endpoint.json.backup"
+
+
 @pytest.mark.parametrize("deployment_mode", ["shared", "HARDENED", ""])
 def test_deployment_mode_is_strict(tmp_path: Path, deployment_mode: str) -> None:
     path = _write_config(tmp_path)
@@ -237,8 +289,21 @@ def test_timeout_settings_must_be_finite(tmp_path: Path, invalid: str) -> None:
         "http://media.example.com/post-pulsar/",
         "https://user@media.example.com/post-pulsar/",
         "https://media.example.com/post-pulsar/?key=value",
+        "https://media.example.com/post-pulsar/?",
+        "https://media.example.com/post-pulsar/#fragment",
+        "https://media.example.com/post-pulsar/#",
         "https://127.0.0.1/post-pulsar/",
+        "https://[::1]/post-pulsar/",
         "https://2130706433/post-pulsar/",
+        "https://0x7f000001/post-pulsar/",
+        "https://127.1/post-pulsar/",
+        "https://%31%32%37.0.0.1/post-pulsar/",
+        "https://127%2e0%2e0%2e1/post-pulsar/",
+        "https://１２７。０。０。１/post-pulsar/",
+        "https://１2７．０.0｡１/post-pulsar/",
+        "https://２１３０７０６４３３/post-pulsar/",
+        f"https://{'é' * 64}.example/post-pulsar/",
+        "https://media.example.com/../private/",
         "https://media.example.com/%2e%2e/private/",
         "https://media.example.com/post-pulsar",
     ],
@@ -266,6 +331,27 @@ def test_credentials_use_only_selected_profiles_allowlisted_reference(
     assert credentials.profile_id == "ansonphong"
     assert credentials.for_target("x").reveal() == token
     assert credentials.instagram_access_token is None
+
+
+@pytest.mark.parametrize("invalid", ["threads", "", "X"])
+def test_dynamic_target_accessors_reject_unknown_names(
+    tmp_path: Path, invalid: str
+) -> None:
+    settings = load_local_settings(_write_config(tmp_path))
+    profile = settings.profile("ansonphong")
+    credentials = validate_publishing_credentials(
+        settings,
+        "ansonphong",
+        ("x",),
+        {"POST_PULSAR_X_ANSONPHONG_USER_ACCESS_TOKEN": "secret"},
+    )
+    assert profile.target("x") is profile.x
+    assert profile.target("instagram") is profile.instagram
+
+    with pytest.raises(ConfigurationError, match="unsupported publishing target"):
+        profile.target(invalid)  # type: ignore[arg-type]
+    with pytest.raises(ConfigurationError, match="unsupported publishing target"):
+        credentials.for_target(invalid)  # type: ignore[arg-type]
 
 
 def test_required_disabled_snapshot_target_still_loads_credential(
@@ -326,6 +412,7 @@ def test_secret_values_are_redacted_and_not_json_serializable(tmp_path: Path) ->
     assert x_token not in rendered
     assert instagram_token not in rendered
     assert "<redacted>" in rendered
+    assert credentials.for_target("instagram").reveal() == instagram_token
     with pytest.raises(TypeError):
         json.dumps(credentials)
     assert isinstance(credentials.x_user_access_token, SecretValue)
@@ -341,6 +428,98 @@ def test_boolean_is_not_accepted_as_integer_setting(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigurationError, match="app.log_backups"):
         load_local_settings(path)
+
+
+@pytest.mark.parametrize(
+    ("table", "key", "original", "invalid"),
+    [
+        ("profiles.x", "request_timeout_seconds", "30", "nan"),
+        ("profiles.x", "processing_timeout_seconds", "300", "inf"),
+        ("profiles.instagram", "request_timeout_seconds", "30", "-inf"),
+        ("profiles.instagram", "processing_timeout_seconds", "300", "nan"),
+    ],
+)
+def test_all_timeout_settings_must_be_finite(
+    tmp_path: Path, table: str, key: str, original: str, invalid: str
+) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    prefix, section_text = text.split(f"[{table}]", maxsplit=1)
+    section_text = section_text.replace(f"{key} = {original}", f"{key} = {invalid}", 1)
+    path.write_text(f"{prefix}[{table}]{section_text}", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=key):
+        load_local_settings(path)
+
+
+def test_oversized_timeout_has_sanitized_error(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    oversized = "1" + ("0" * 400)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "request_timeout_seconds = 30",
+            f"request_timeout_seconds = {oversized}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError) as caught:
+        load_local_settings(path)
+
+    message = str(caught.value)
+    assert message.endswith("request_timeout_seconds must be a finite positive number")
+    assert oversized not in message
+
+
+@pytest.mark.parametrize(
+    ("state_directory", "account_root", "media_directory"),
+    [
+        ("accounts/ansonphong", "accounts/ansonphong", "public-media/one"),
+        ("accounts/ansonphong/state", "accounts/ansonphong", "public-media/one"),
+        ("ACCOUNTS/ANSONPHONG/state", "accounts/ansonphong", "public-media/one"),
+        (".post-pulsar", "accounts/ansonphong", "accounts/ansonphong/media"),
+        (".post-pulsar", "accounts/ansonphong", "Accounts/AnsonPhong/media"),
+        ("runtime", "accounts/ansonphong", "runtime"),
+        ("runtime/state", "accounts/ansonphong", "runtime"),
+        ("Runtime/State", "accounts/ansonphong", "runtime"),
+    ],
+)
+def test_runtime_directory_overlap_combinations_are_rejected(
+    tmp_path: Path,
+    state_directory: str,
+    account_root: str,
+    media_directory: str,
+) -> None:
+    profile = _profile(
+        account_root=account_root,
+        media_directory=media_directory,
+    )
+    path = _write_config(tmp_path, profile)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'state_directory = ".post-pulsar"',
+            f'state_directory = "{state_directory}"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="overlap"):
+        load_local_settings(path)
+
+
+def test_runtime_path_comparison_is_component_aware(tmp_path: Path) -> None:
+    settings = load_local_settings(
+        _write_config(
+            tmp_path,
+            _profile(account_root=".post-pulsar-archive"),
+        )
+    )
+
+    assert (
+        settings.profile("ansonphong").account_root
+        == (tmp_path / ".post-pulsar-archive").resolve()
+    )
 
 
 def test_log_file_may_be_inside_state_but_not_an_account_root(

@@ -127,7 +127,12 @@ class ProfileSettings:
 
     def target(self, name: TargetName) -> XSettings | InstagramSettings:
         """Return a configured target, including a currently disabled target."""
-        target = self.x if name == "x" else self.instagram
+        if name == "x":
+            target: XSettings | InstagramSettings | None = self.x
+        elif name == "instagram":
+            target = self.instagram
+        else:
+            raise ConfigurationError(f"unsupported publishing target: {name}")
         if target is None:
             raise ConfigurationError(
                 f"profile {self.profile_id!r} has no configured {name} target"
@@ -161,9 +166,12 @@ class PublishingCredentials:
 
     def for_target(self, target: TargetName) -> SecretValue:
         """Return a required target's credential without rendering it."""
-        value = (
-            self.x_user_access_token if target == "x" else self.instagram_access_token
-        )
+        if target == "x":
+            value = self.x_user_access_token
+        elif target == "instagram":
+            value = self.instagram_access_token
+        else:
+            raise ConfigurationError(f"unsupported publishing target: {target}")
         if value is None:
             raise ConfigurationError(f"publishing credential unavailable for {target}")
         return value
@@ -786,11 +794,19 @@ def _validate_path_separation(
             path, app.state_directory
         ):
             raise ConfigurationError(f"{label} must be inside app.state_directory")
-    normalized = [_portable_path_parts(path) for path in control_files.values()]
-    if len(normalized) != len(set(normalized)):
-        raise ConfigurationError("control files must be distinct")
-    if any(_paths_equal(app.log_file, path) for path in control_files.values()):
-        raise ConfigurationError("app.log_file must not equal a control file")
+    control_items = tuple(control_files.items())
+    for index, (left_name, left_path) in enumerate(control_items):
+        for right_name, right_path in control_items[index + 1 :]:
+            if _paths_overlap(left_path, right_path):
+                raise ConfigurationError(
+                    "control files must be distinct and must not overlap: "
+                    f"{left_name}, {right_name}"
+                )
+    for label, path in control_items:
+        if _paths_overlap(app.log_file, path):
+            raise ConfigurationError(
+                f"app.log_file must not overlap control path {label}"
+            )
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:

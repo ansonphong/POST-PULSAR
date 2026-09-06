@@ -276,9 +276,13 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
     root = supplied_root.resolve(strict=True)
     if not root.is_dir():
         raise NotADirectoryError(root)
+    root_before = os.lstat(root)
+    if not stat.S_ISDIR(root_before.st_mode):
+        raise NotADirectoryError(root)
 
     issues: list[InboxIssue] = []
     candidates: list[PublishableBundle] = []
+    bucket_snapshots: list[tuple[Path, os.stat_result]] = []
     misplaced_ready = root / ".ready"
     misplaced_ready_exists = False
     try:
@@ -308,7 +312,7 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
     for bucket in _PUBLISHABLE_BUCKETS:
         bucket_path = root / bucket
         try:
-            bucket_mode = os.lstat(bucket_path).st_mode
+            bucket_before = os.lstat(bucket_path)
         except FileNotFoundError:
             continue
         except OSError:
@@ -321,7 +325,9 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
                 )
             )
             continue
-        if stat.S_ISLNK(bucket_mode) or not stat.S_ISDIR(bucket_mode):
+        if stat.S_ISLNK(bucket_before.st_mode) or not stat.S_ISDIR(
+            bucket_before.st_mode
+        ):
             issues.append(
                 _bucket_issue(
                     "unsafe_bucket",
@@ -331,6 +337,7 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
                 )
             )
             continue
+        bucket_snapshots.append((bucket_path, bucket_before))
 
         try:
             entries = sorted(
@@ -382,6 +389,7 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
             )
         )
 
+    issues.extend(_scan_generation_issues(root, root_before, bucket_snapshots))
     issues.sort(key=_issue_sort_key)
     if any(issue.severity == "error" for issue in issues):
         return AccountScan(bundles=(), issues=tuple(issues))
@@ -394,6 +402,49 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
         )
     )
     return AccountScan(bundles=tuple(candidates), issues=tuple(issues))
+
+
+def _scan_generation_issues(
+    root: Path,
+    root_before: os.stat_result,
+    bucket_snapshots: list[tuple[Path, os.stat_result]],
+) -> tuple[InboxIssue, ...]:
+    issues: list[InboxIssue] = []
+    try:
+        root_after = os.lstat(root)
+    except OSError:
+        root_after = None
+    if root_after is None or not (
+        stat.S_ISDIR(root_after.st_mode)
+        and _same_file_identity(root_before, root_after)
+    ):
+        issues.append(
+            _bucket_issue(
+                "account_root_changed",
+                root,
+                None,
+                "Account root changed during publishable-bucket discovery.",
+            )
+        )
+
+    for bucket_path, bucket_before in bucket_snapshots:
+        try:
+            bucket_after = os.lstat(bucket_path)
+        except OSError:
+            bucket_after = None
+        if bucket_after is None or not (
+            stat.S_ISDIR(bucket_after.st_mode)
+            and _same_file_identity(bucket_before, bucket_after)
+        ):
+            issues.append(
+                _bucket_issue(
+                    "bucket_changed",
+                    bucket_path,
+                    None,
+                    "Publishable bucket changed during discovery.",
+                )
+            )
+    return tuple(issues)
 
 
 def _scan_bundle_directory(

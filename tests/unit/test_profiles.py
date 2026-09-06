@@ -327,3 +327,40 @@ def test_ready_marker_at_account_root_is_rejected(tmp_path: Path) -> None:
 
     assert scan.bundles == ()
     assert "misplaced_ready_marker" in _codes(scan)
+
+
+@pytest.mark.parametrize(
+    ("replace", "code"),
+    [("root", "account_root_changed"), ("bucket", "bucket_changed")],
+)
+def test_account_scan_rejects_root_or_bucket_generation_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace: str,
+    code: str,
+) -> None:
+    root = tmp_path / "account"
+    _ready_bundle(root, "QUEUE", "post", "post.jpg")
+    original_scan = content_module._scan_bundle_directory
+    replaced = False
+
+    def scan_then_replace(
+        bucket: str, bundle_directory: Path
+    ) -> tuple[object, tuple[object, ...]]:
+        nonlocal replaced
+        result = original_scan(bucket, bundle_directory)  # type: ignore[arg-type]
+        if not replaced:
+            replaced = True
+            target = root if replace == "root" else root / "QUEUE"
+            old = tmp_path / f"old-{replace}"
+            target.rename(old)
+            target.mkdir(parents=True)
+        return result
+
+    monkeypatch.setattr(content_module, "_scan_bundle_directory", scan_then_replace)
+
+    scan = scan_account_root(root)
+
+    assert replaced
+    assert scan.bundles == ()
+    assert code in _codes(scan)
