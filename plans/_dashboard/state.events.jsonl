@@ -56,3 +56,6 @@
 {"event":"commit","sha":"0ca898d","message":"fix(migration): bind durable cutover state","time":"2026-09-06T06:10:22Z"}
 {"event":"commit","sha":"44d39f8","message":"fix(migration): keep completed dry runs immutable","time":"2026-09-06T06:18:26Z"}
 {"event":"commit","sha":"bc7ab0f","message":"fix(platforms): close durable publishing boundaries","time":"2026-09-06T06:20:40Z"}
+{"event":"commit","sha":"10cb746","message":"chore(plan): mark T3.3 DONE","time":"2026-09-06T06:22:04Z"}
+{"event":"commit","sha":"cea8246","message":"fix(migration): reject authoritative WAL ambiguity","time":"2026-09-06T06:24:29Z"}
+{"event":"commit","sha":"cd10587","message":"fix(x): honor directional URL boundaries","time":"2026-09-06T06:27:08Z"}
