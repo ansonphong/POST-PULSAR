@@ -26,7 +26,7 @@ stage_state: active
 - [x] #6fd4 `T2.1` **Task T2.1:** Inspect and prepare media safely
 - [x] #5262 `T2.2` **Task T2.2:** Implement the SQLite delivery state machine
 - [x] #7951 `T2.3` **Task T2.3:** Add single-instance locking and exact archival recovery
-- [ ] #bd92 `T2.4` **Task T2.4:** Add journaled single-account state and layout migration
+- [x] #bd92 `T2.4` **Task T2.4:** Add journaled single-account state and layout migration
 
 ### Phase 3: Official Platform Integrations ([`03-official-platform-integrations.md`](03-official-platform-integrations.md))
 
