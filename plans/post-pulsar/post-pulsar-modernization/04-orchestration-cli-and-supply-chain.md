@@ -275,12 +275,14 @@ promotion. The operational sentinel is excluded from the semantic fingerprint.
 - `src/post_pulsar/daemon.py`
 - `src/post_pulsar/control.py`
 - `src/post_pulsar/admission.py`
+- `src/post_pulsar/secure_files.py`
 - `src/post_pulsar/config.py`
 - `src/post_pulsar/state.py`
 - `post-pulsar.toml.example`
 - `api/control-v1.openapi.json`
 - `tests/unit/test_daemon.py`
 - `tests/unit/test_admission.py`
+- `tests/unit/test_secure_files.py`
 - `tests/unit/test_config.py`
 - `tests/unit/test_state.py`
 - `tests/contract/test_control.py`
