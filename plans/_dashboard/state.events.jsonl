@@ -73,3 +73,5 @@
 {"event":"commit","sha":"a9fa746","message":"chore(plan): mark T4.3 DONE","time":"2026-09-06T08:18:41Z"}
 {"event":"commit","sha":"2c07fc2","message":"docs(plan): repair T4.4 execution scope","time":"2026-09-06T08:23:15Z"}
 {"event":"commit","sha":"1aa342b","message":"feat(scheduler): add deterministic profile scheduling","time":"2026-09-06T08:33:42Z"}
+{"event":"commit","sha":"30d8f24","message":"chore(plan): mark T4.4 DONE","time":"2026-09-06T08:34:36Z"}
+{"event":"commit","sha":"590b029","message":"feat(control): add authenticated foreground daemon","time":"2026-09-06T08:54:04Z"}

@@ -40,7 +40,7 @@ stage_state: active
 - [x] #1efa `T4.2` **Task T4.2:** Expose safe run, status, retry, and reconcile commands
 - [x] #8ae2 `T4.3` **Task T4.3:** Lock dependencies and enforce CI security gates
 - [x] #0ef7 `T4.4` **Task T4.4:** Implement deterministic profile scheduling
-- [ ] #371e `T4.5` **Task T4.5:** Add the foreground daemon and authenticated control API
+- [x] #371e `T4.5` **Task T4.5:** Add the foreground daemon and authenticated control API
 - [ ] #1a24 `T4.6` **Task T4.6:** Extend the CLI for profiles, scheduling, daemon control, and migration
 
 ### Phase 5: Operations, Documentation, and Integration ([`05-operations-documentation-and-integration.md`](05-operations-documentation-and-integration.md))
