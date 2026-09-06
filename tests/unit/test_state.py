@@ -58,6 +58,28 @@ def _target(remote_id: str = "10001") -> TargetSnapshot:
     )
 
 
+def _instagram_profile_target() -> ProfileTargetSnapshot:
+    return ProfileTargetSnapshot(
+        platform="instagram",
+        expected_remote_user_id="20001",
+        expected_username="anson.phong",
+        token_env_var="POST_PULSAR_INSTAGRAM_ANSONPHONG_ACCESS_TOKEN",
+        request_settings={"timeout": 30, "media_base_url": "https://media.example/"},
+    )
+
+
+def _instagram_target() -> TargetSnapshot:
+    return TargetSnapshot(
+        platform="instagram",
+        expected_remote_user_id="20001",
+        expected_username="anson.phong",
+        token_env_var="POST_PULSAR_INSTAGRAM_ANSONPHONG_ACCESS_TOKEN",
+        api_version="v26.0",
+        adapter_version=1,
+        request_settings={"timeout": 30, "media_base_url": "https://media.example/"},
+    )
+
+
 def _file(name: str = "post.jpg") -> BundleFileSnapshot:
     return BundleFileSnapshot(
         relative_name=name,
@@ -79,7 +101,7 @@ def _repository(tmp_path: Path, clock: FakeClock) -> StateRepository:
     repository.register_profile(
         "ansonphong",
         tmp_path / "accounts/ansonphong",
-        (_profile_target(),),
+        (_profile_target(), _instagram_profile_target()),
         config_hash="1" * 64,
     )
     return repository
@@ -233,6 +255,15 @@ def test_empty_snapshots_fingerprint_drift_and_snapshot_mutation_fail(
             files=(_file(),),
             targets=(),
         )
+    with pytest.raises(ConflictError, match="target snapshot"):
+        repository.add_bundle(
+            profile_id="ansonphong",
+            bundle_id="wrong-target",
+            fingerprint="b" * 64,
+            source_bucket="QUEUE",
+            files=(_file(),),
+            targets=(_target("99999"),),
+        )
     bundle_key = _bundle(repository)
     with pytest.raises(ConflictError, match="fingerprint drift"):
         repository.assert_bundle_source(
@@ -318,6 +349,56 @@ def test_artifact_checkpoint_is_idempotent_but_not_mutable(tmp_path: Path) -> No
         )
 
 
+def test_instagram_container_and_public_staging_checkpoints_are_durable(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = repository.add_bundle(
+        profile_id="ansonphong",
+        bundle_id="instagram-post",
+        fingerprint="b" * 64,
+        source_bucket="QUEUE",
+        files=(_file("instagram-post.jpg"),),
+        targets=(_instagram_target(),),
+    )
+    repository.claim_delivery(bundle_key, "instagram", "claim")
+    expiry = clock() + timedelta(hours=24)
+
+    child = repository.checkpoint_artifact(
+        bundle_key,
+        "instagram",
+        kind="instagram_child_container",
+        ordinal=0,
+        external_id="child-1",
+        expires_at=expiry,
+        processing_metadata={"state": "IN_PROGRESS"},
+    )
+    parent = repository.checkpoint_artifact(
+        bundle_key,
+        "instagram",
+        kind="instagram_parent_container",
+        ordinal=0,
+        external_id="parent-1",
+        expires_at=expiry,
+        processing_metadata={"state": "FINISHED"},
+    )
+    staged = repository.checkpoint_artifact(
+        bundle_key,
+        "instagram",
+        kind="staged_public",
+        ordinal=0,
+        relative_path="ansonphong/hash/media.jpg",
+        sha256="e" * 64,
+        expires_at=expiry,
+    )
+
+    assert child.external_id == "child-1"
+    assert parent.external_id == "parent-1"
+    assert staged.relative_path == "ansonphong/hash/media.jpg"
+    assert staged.expires_at == expiry
+
+
 def test_published_resets_consecutive_failures_and_preserves_lifetime_attempts(
     tmp_path: Path,
 ) -> None:
@@ -360,14 +441,37 @@ def test_stale_final_dispatch_is_ambiguous_and_never_auto_retried(
         repository.claim_delivery(bundle_key, "x", "again")
 
 
-def test_stale_pre_final_attempt_becomes_safely_retryable_failure(
+def test_uncertain_final_result_can_be_marked_ambiguous_transactionally(
     tmp_path: Path,
 ) -> None:
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
     repository.claim_delivery(bundle_key, "x", "claim")
-    repository.advance_delivery_phase(bundle_key, "x", "processing")
+    repository.advance_delivery_phase(bundle_key, "x", "final_dispatch_started")
+
+    delivery = repository.mark_delivery_ambiguous(
+        bundle_key,
+        "x",
+        error_code="dispatch_timeout",
+        error_message="Final request timed out; outcome is unknown.",
+    )
+
+    assert delivery.status == "ambiguous"
+    assert not delivery.safe_to_retry
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
+@pytest.mark.parametrize("phase", ["preparing", "processing", "ready"])
+def test_stale_pre_final_attempt_becomes_safely_retryable_failure(
+    tmp_path: Path, phase: str
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    repository.claim_delivery(bundle_key, "x", "claim")
+    if phase != "preparing":
+        repository.advance_delivery_phase(bundle_key, "x", phase)  # type: ignore[arg-type]
     clock.advance(hours=1)
 
     recovered = repository.recover_stale(clock() - timedelta(minutes=30))
@@ -472,6 +576,14 @@ def test_schedule_occurrence_content_claim_and_random_counter_are_atomic(
     )
     assert replay == run
     assert run.state == "dispatching"
+    completed = repository.transition_schedule_run(
+        run.run_id, "completed", expected_revision=1
+    )
+    assert completed.state == "completed"
+    with pytest.raises(TransitionError, match="schedule run"):
+        repository.transition_schedule_run(
+            run.run_id, "failed", expected_revision=2
+        )
     assert repository.next_selection_counter("ansonphong") == 0
     assert repository.next_selection_counter("ansonphong") == 1
 

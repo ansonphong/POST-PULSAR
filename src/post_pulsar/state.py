@@ -24,6 +24,16 @@ DeliveryStatus: TypeAlias = Literal[
 DeliveryPhase: TypeAlias = Literal[
     "preparing", "processing", "ready", "final_dispatch_started"
 ]
+ScheduleRunState: TypeAlias = Literal[
+    "queued",
+    "due",
+    "missed",
+    "dispatching",
+    "no_content",
+    "completed",
+    "failed",
+    "ambiguous",
+]
 
 SCHEMA_VERSION: Final = 1
 _APPLICATION_ID: Final = 0x50505352
@@ -35,6 +45,16 @@ _PHASE_ORDER: Final = {
     "processing": 1,
     "ready": 2,
     "final_dispatch_started": 3,
+}
+_SCHEDULE_RUN_TRANSITIONS: Final = {
+    "queued": frozenset({"due", "missed"}),
+    "due": frozenset({"dispatching", "no_content"}),
+    "dispatching": frozenset({"completed", "failed", "ambiguous"}),
+    "missed": frozenset(),
+    "no_content": frozenset(),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "ambiguous": frozenset(),
 }
 _ARTIFACT_KINDS: Final = frozenset(
     {
@@ -233,7 +253,7 @@ class ScheduleRunRecord:
     scheduled_at: datetime
     utc_offset_minutes: int
     schedule_hash: str
-    state: str
+    state: ScheduleRunState
     revision: int
 
 
@@ -833,14 +853,25 @@ class StateRepository:
             if active is not None:
                 raise ConflictError("profile already has one active bundle")
             configured = {
-                str(row[0])
-                for row in self._connection.execute(
-                    "SELECT platform FROM profile_targets WHERE profile_id = ?",
-                    (profile_id,),
-                )
+                target[0]: target for target in self._stored_profile_targets(profile_id)
             }
-            if not {target[0] for target in normalized_targets}.issubset(configured):
-                raise StateValidationError("target snapshot is not configured for profile")
+            for target in normalized_targets:
+                current = configured.get(str(target[0]))
+                if current is None:
+                    raise StateValidationError(
+                        "target snapshot is not configured for profile"
+                    )
+                target_binding = (
+                    str(target[1]),
+                    str(target[2]),
+                    str(target[3]),
+                    str(target[7]),
+                )
+                current_binding = (current[1], current[2], current[3], current[5])
+                if target_binding != current_binding:
+                    raise ConflictError(
+                        "target snapshot does not match current profile target"
+                    )
             cursor = self._connection.execute(
                 "INSERT INTO bundles(profile_id, bundle_id, fingerprint, source_bucket, "
                 "profile_root_snapshot, status, created_at, updated_at) "
@@ -1308,6 +1339,33 @@ class StateRepository:
             )
         return self.get_delivery(bundle_key, platform)
 
+    def mark_delivery_ambiguous(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> DeliveryRecord:
+        """Persist an uncertain final-create result without permitting a retry."""
+
+        platform = _validate_platform(platform)
+        error_code = self._safe_text(error_code, "delivery error code", maximum=64)
+        error_message = self._safe_text(error_message, "delivery error message")
+        with self._transaction():
+            row = self._delivery_row(bundle_key, platform)
+            if (
+                str(row["status"]) != "in_flight"
+                or str(row["phase"]) != "final_dispatch_started"
+            ):
+                raise TransitionError(
+                    "only an uncertain final-dispatch result can become ambiguous"
+                )
+            self._mark_ambiguous_locked(
+                bundle_key, platform, error_code, error_message
+            )
+        return self.get_delivery(bundle_key, platform)
+
     def recover_stale(
         self, stale_before: datetime
     ) -> tuple[tuple[int, Platform, str], ...]:
@@ -1326,7 +1384,10 @@ class StateRepository:
                 platform = cast(Platform, str(row["platform"]))
                 if str(row["phase"]) == "final_dispatch_started":
                     self._mark_ambiguous_locked(
-                        bundle_key, platform, "stale_final_dispatch"
+                        bundle_key,
+                        platform,
+                        "stale_final_dispatch",
+                        "Final dispatch outcome is unknown.",
                     )
                     recovered.append((bundle_key, platform, "ambiguous"))
                     continue
@@ -1653,6 +1714,34 @@ class StateRepository:
         if row is None:
             raise StateValidationError("unknown schedule run")
         return self._schedule_run_from_row(row)
+
+    def transition_schedule_run(
+        self,
+        run_id: int,
+        state: ScheduleRunState,
+        *,
+        expected_revision: int,
+    ) -> ScheduleRunRecord:
+        """Apply one legal, revision-guarded schedule-run transition."""
+
+        if state not in _SCHEDULE_RUN_TRANSITIONS:
+            raise StateValidationError("unknown schedule run state")
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT * FROM schedule_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateValidationError("unknown schedule run")
+            self._require_revision(row, expected_revision, "schedule run")
+            current = str(row["state"])
+            if state not in _SCHEDULE_RUN_TRANSITIONS[current]:
+                raise TransitionError("illegal schedule run transition")
+            self._connection.execute(
+                "UPDATE schedule_runs SET state = ?, revision = revision + 1, "
+                "updated_at = ? WHERE run_id = ?",
+                (state, self._now_text(), run_id),
+            )
+        return self.get_schedule_run(run_id)
 
     def next_selection_counter(self, profile_id: str) -> int:
         with self._transaction():
@@ -2141,16 +2230,20 @@ class StateRepository:
         return tuple(self._admission_member_from_row(row) for row in rows)
 
     def _mark_ambiguous_locked(
-        self, bundle_key: int, platform: Platform, error_code: str
+        self,
+        bundle_key: int,
+        platform: Platform,
+        error_code: str,
+        error_message: str,
     ) -> None:
         now = self._now_text()
         self._connection.execute(
             "UPDATE deliveries SET status = 'ambiguous', phase = NULL, "
             "safe_to_retry = 0, next_attempt_at = NULL, claim_token = NULL, "
-            "error_code = ?, error_message = 'Final dispatch outcome is unknown.', "
+            "error_code = ?, error_message = ?, "
             "revision = revision + 1, updated_at = ? "
             "WHERE bundle_key = ? AND platform = ?",
-            (error_code, now, bundle_key, platform),
+            (error_code, error_message, now, bundle_key, platform),
         )
         self._block_bundle_locked(bundle_key, error_code)
         self._insert_event_locked(
@@ -2414,7 +2507,7 @@ class StateRepository:
             scheduled_at=_parse_timestamp(str(row["scheduled_at"])),
             utc_offset_minutes=int(row["utc_offset_minutes"]),
             schedule_hash=str(row["schedule_hash"]),
-            state=str(row["state"]),
+            state=cast(ScheduleRunState, str(row["state"])),
             revision=int(row["revision"]),
         )
 
