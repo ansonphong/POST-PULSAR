@@ -284,6 +284,30 @@ def test_profile_identity_and_active_root_snapshot_are_immutable(
     assert updated.revision == 2
 
 
+def test_archive_conflict_can_transition_archiving_bundle_to_blocked(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository)
+    claim = _claim(repository, bundle_key, "x", "archive-block-claim")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+    )
+    repository.publish_delivery(
+        bundle_key,
+        "x",
+        remote_id="tweet-archive-block",
+        **claim,  # type: ignore[arg-type]
+    )
+    archiving = repository.begin_archiving(bundle_key, expected_revision=1)
+
+    blocked = repository.block_bundle(
+        bundle_key, "archive_conflict", expected_revision=archiving.revision
+    )
+
+    assert blocked.status == "blocked"
+
+
 def test_bundle_admission_is_single_use_exact_and_profile_isolated(
     tmp_path: Path,
 ) -> None:

@@ -1327,7 +1327,7 @@ class StateRepository:
         with self._transaction():
             row = self._bundle_row(bundle_key)
             self._require_revision(row, expected_revision, "bundle")
-            if str(row["status"]) not in {"active", "blocked"}:
+            if str(row["status"]) not in {"active", "blocked", "archiving"}:
                 raise TransitionError("bundle cannot transition to blocked")
             self._block_bundle_locked(bundle_key, reason)
             self._insert_event_locked(
