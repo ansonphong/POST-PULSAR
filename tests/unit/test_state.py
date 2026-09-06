@@ -143,6 +143,76 @@ def test_schema_initialization_reopen_and_pragmas_are_idempotent(
         assert repository.schema_version == 1
 
 
+def test_public_readers_reconstruct_profile_work_after_reopen(tmp_path: Path) -> None:
+    clock = FakeClock()
+    path = tmp_path / "reconstruct.sqlite3"
+    repository = StateRepository(path, clock=clock)
+    repository.register_profile(
+        "ansonphong",
+        tmp_path / "accounts/ansonphong",
+        (_profile_target(), _instagram_profile_target()),
+        config_hash="1" * 64,
+    )
+    bundle_key = repository.add_bundle(
+        profile_id="ansonphong",
+        bundle_id="reconstruct",
+        fingerprint="b" * 64,
+        source_bucket="QUEUE",
+        files=(_file("z-last.jpg"), _file("A-first.jpg")),
+        targets=(_instagram_target(), _target()),
+    )
+    claim = _claim(repository, bundle_key, "x", "reconstruct-claim")
+    artifact = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=1,
+        external_id="media-reconstruct",
+        expires_at=clock() + timedelta(hours=1),
+        **claim,  # type: ignore[arg-type]
+    )
+    first_artifact = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="media-reconstruct-first",
+        expires_at=clock() + timedelta(hours=1),
+        **claim,  # type: ignore[arg-type]
+    )
+    failed = repository.fail_delivery(
+        bundle_key,
+        "x",
+        error_code="transient",
+        error_message="Retry later.",
+        retry_at=clock() + timedelta(minutes=5),
+        **claim,  # type: ignore[arg-type]
+    )
+    repository.close()
+
+    with StateRepository(path, clock=clock) as reopened:
+        assert reopened.list_active_bundles("ansonphong") == (
+            reopened.get_bundle(bundle_key),
+        )
+        assert reopened.list_failed_deliveries("ansonphong") == (failed,)
+        assert reopened.list_protected_bundles("ansonphong") == (
+            reopened.get_bundle(bundle_key),
+        )
+        assert [
+            item.relative_name for item in reopened.list_bundle_files(bundle_key)
+        ] == ["A-first.jpg", "z-last.jpg"]
+        assert [
+            item.platform for item in reopened.list_target_snapshots(bundle_key)
+        ] == ["instagram", "x"]
+        assert [
+            item.platform for item in reopened.list_bundle_deliveries(bundle_key)
+        ] == ["instagram", "x"]
+        assert reopened.list_delivery_artifacts(bundle_key, "x") == (
+            first_artifact,
+            artifact,
+        )
+
+
 @pytest.mark.parametrize("version", [0, 2, 999])
 def test_unknown_or_future_schema_requires_explicit_migration(
     tmp_path: Path, version: int
@@ -716,6 +786,121 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     assert replay.result == completed.result
 
 
+def test_resume_always_requires_confirmation_even_when_work_becomes_due(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    pause = repository.get_pause_state()
+
+    with pytest.raises(TransitionError, match="confirmation"):
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="resume",
+            arguments={},
+            idempotency_key="resume-without-work",
+            expected_revision=pause.revision,
+        )
+    assert repository.claim_next_run_request("no-resume-worker") is None
+
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="resume-due",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="09:00",
+        misfire_grace_seconds=60,
+        enabled=True,
+    )
+    run = repository.create_schedule_occurrence(
+        schedule.schedule_key,
+        local_date="2026-09-07",
+        scheduled_at=datetime(2026, 9, 7, 9, tzinfo=UTC),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
+    )
+    repository.transition_schedule_run(
+        run.run_id, "due", expected_revision=run.revision
+    )
+
+    with pytest.raises(TransitionError, match="confirmation"):
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="resume",
+            arguments={},
+            idempotency_key="resume-without-work",
+            expected_revision=pause.revision,
+        )
+    assert repository.claim_next_run_request("still-no-resume-worker") is None
+
+    intent = repository.create_confirmation_intent(
+        action="resume",
+        arguments={},
+        profile_id="ansonphong",
+        resource_revision=pause.revision,
+        fingerprint=None,
+        consequence="Resume queued publishing work.",
+        expires_at=clock() + timedelta(minutes=5),
+    )
+    repository.approve_confirmation_intent(intent.intent_id, expected_revision=1)
+    confirmed = repository.consume_intent_with_request(
+        intent_id=intent.intent_id,
+        action="resume",
+        arguments={},
+        profile_id="ansonphong",
+        resource_revision=pause.revision,
+        fingerprint=None,
+        idempotency_key="confirmed-resume",
+    )
+    assert confirmed.status == "queued"
+
+
+def test_nonconfirmed_request_revision_is_atomic_and_replay_is_canonical(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="disable-request",
+        bucket="RANDOM",
+        timezone="UTC",
+        weekdays=(1,),
+        local_time="10:00",
+        misfire_grace_seconds=60,
+        enabled=False,
+    )
+    request = repository.create_run_request(
+        profile_id="ansonphong",
+        action="schedule_disable",
+        arguments={"enabled": False},
+        idempotency_key="disable-revision-1",
+        expected_revision=schedule.revision,
+        schedule_key=schedule.schedule_key,
+    )
+    repository.set_schedule_enabled(
+        schedule.schedule_key, True, expected_revision=schedule.revision
+    )
+
+    assert repository.create_run_request(
+        profile_id="ansonphong",
+        action="schedule_disable",
+        arguments={"enabled": False},
+        idempotency_key="disable-revision-1",
+        expected_revision=schedule.revision,
+        schedule_key=schedule.schedule_key,
+    ) == request
+    with pytest.raises(ConflictError, match="revision"):
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="schedule_disable",
+            arguments={"enabled": False},
+            idempotency_key="disable-stale-revision",
+            expected_revision=schedule.revision,
+            schedule_key=schedule.schedule_key,
+        )
+
+
 def test_approved_intent_is_consumed_once_with_idempotent_request(
     tmp_path: Path,
 ) -> None:
@@ -1146,8 +1331,15 @@ def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> N
     dispatching = repository.claim_schedule_content(
         third.run_id, bundle_key, expected_revision=third_due.revision
     )
+    with pytest.raises(TransitionError, match="illegal schedule run transition"):
+        repository.transition_schedule_run(
+            third.run_id, "no_content", expected_revision=dispatching.revision
+        )
+    still_dispatching = repository.get_schedule_run(third.run_id)
+    assert still_dispatching.state == "dispatching"
+    assert still_dispatching.bundle_key == bundle_key
     assert repository.transition_schedule_run(
-        third.run_id, "failed", expected_revision=dispatching.revision
+        third.run_id, "failed", expected_revision=still_dispatching.revision
     ).state == "failed"
 
 

@@ -49,7 +49,7 @@ _PHASE_ORDER: Final = {
 _SCHEDULE_RUN_TRANSITIONS: Final = {
     "queued": frozenset({"due", "missed"}),
     "due": frozenset({"dispatching", "no_content"}),
-    "dispatching": frozenset({"completed", "no_content", "failed", "ambiguous"}),
+    "dispatching": frozenset({"completed", "failed", "ambiguous"}),
     "missed": frozenset(),
     "no_content": frozenset(),
     "completed": frozenset(),
@@ -135,6 +135,7 @@ _ALWAYS_CONFIRMED_ACTIONS: Final = frozenset(
         "enqueue",
         "run_now",
         "publish_now",
+        "resume",
         "schedule_enable",
         "cancel",
         "delete",
@@ -1166,6 +1167,101 @@ class StateRepository:
         row = self._delivery_row(bundle_key, _validate_platform(platform))
         return self._delivery_from_row(row)
 
+    def list_active_bundles(self, profile_id: str) -> tuple[BundleRecord, ...]:
+        """Return active work for one profile in canonical bundle order."""
+
+        self._require_profile(profile_id)
+        rows = self._connection.execute(
+            "SELECT * FROM bundles WHERE profile_id = ? AND status = 'active' "
+            "ORDER BY bundle_id COLLATE NOCASE, bundle_id, bundle_key",
+            (profile_id,),
+        )
+        return tuple(self._bundle_from_row(row) for row in rows)
+
+    def list_failed_deliveries(
+        self, profile_id: str
+    ) -> tuple[DeliveryRecord, ...]:
+        """Return every failed delivery owned by one profile deterministically."""
+
+        self._require_profile(profile_id)
+        rows = self._connection.execute(
+            "SELECT d.* FROM deliveries d JOIN bundles b "
+            "ON b.bundle_key = d.bundle_key WHERE b.profile_id = ? "
+            "AND d.status = 'failed' ORDER BY b.bundle_id COLLATE NOCASE, "
+            "b.bundle_id, d.platform, d.bundle_key",
+            (profile_id,),
+        )
+        return tuple(self._delivery_from_row(row) for row in rows)
+
+    def list_protected_bundles(self, profile_id: str) -> tuple[BundleRecord, ...]:
+        """Return bundles that retain profile root and target ownership."""
+
+        self._require_profile(profile_id)
+        rows = self._connection.execute(
+            "SELECT DISTINCT b.* FROM bundles b LEFT JOIN deliveries d "
+            "ON d.bundle_key = b.bundle_key WHERE b.profile_id = ? "
+            "AND (b.status IN ('active', 'blocked', 'archiving') "
+            "OR d.status = 'ambiguous') ORDER BY b.bundle_id COLLATE NOCASE, "
+            "b.bundle_id, b.bundle_key",
+            (profile_id,),
+        )
+        return tuple(self._bundle_from_row(row) for row in rows)
+
+    def list_bundle_files(self, bundle_key: int) -> tuple[BundleFileSnapshot, ...]:
+        """Load the immutable exact-member manifest for an admitted bundle."""
+
+        self._bundle_row(bundle_key)
+        rows = self._connection.execute(
+            "SELECT * FROM bundle_files WHERE bundle_key = ? "
+            "ORDER BY relative_name COLLATE NOCASE, relative_name",
+            (bundle_key,),
+        )
+        return tuple(self._bundle_file_from_row(row) for row in rows)
+
+    def list_target_snapshots(self, bundle_key: int) -> tuple[TargetSnapshot, ...]:
+        """Load immutable target semantics in platform order."""
+
+        self._bundle_row(bundle_key)
+        rows = self._connection.execute(
+            "SELECT * FROM target_snapshots WHERE bundle_key = ? ORDER BY platform",
+            (bundle_key,),
+        )
+        return tuple(self._target_snapshot_from_row(row) for row in rows)
+
+    def list_bundle_deliveries(self, bundle_key: int) -> tuple[DeliveryRecord, ...]:
+        """Load all per-target delivery state in platform order."""
+
+        self._bundle_row(bundle_key)
+        rows = self._connection.execute(
+            "SELECT * FROM deliveries WHERE bundle_key = ? ORDER BY platform",
+            (bundle_key,),
+        )
+        return tuple(self._delivery_from_row(row) for row in rows)
+
+    def list_delivery_artifacts(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        attempt_count: int | None = None,
+    ) -> tuple[ArtifactRecord, ...]:
+        """Load durable checkpoints for one delivery and optional exact attempt."""
+
+        platform = _validate_platform(platform)
+        self._delivery_row(bundle_key, platform)
+        if attempt_count is not None and attempt_count <= 0:
+            raise StateValidationError("artifact attempt count must be positive")
+        query = (
+            "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ?"
+        )
+        parameters: tuple[object, ...] = (bundle_key, platform)
+        if attempt_count is not None:
+            query += " AND attempt_count = ?"
+            parameters += (attempt_count,)
+        query += " ORDER BY attempt_count, kind, ordinal"
+        rows = self._connection.execute(query, parameters)
+        return tuple(self._artifact_from_row(row) for row in rows)
+
     def assert_bundle_source(
         self,
         bundle_key: int,
@@ -2045,6 +2141,10 @@ class StateRepository:
             current = str(row["state"])
             if state not in _SCHEDULE_RUN_TRANSITIONS[current]:
                 raise TransitionError("illegal schedule run transition")
+            if state == "no_content" and row["bundle_key"] is not None:
+                raise TransitionError(
+                    "schedule run with claimed content cannot become no-content"
+                )
             updated = self._connection.execute(
                 "UPDATE schedule_runs SET state = ?, revision = revision + 1, "
                 "updated_at = ? WHERE run_id = ? AND state = ? AND revision = ?",
@@ -2174,6 +2274,13 @@ class StateRepository:
             raise StateValidationError(
                 "run request action does not accept a confirmation intent"
             )
+        self._assert_request_resource_revision_locked(
+            action=action,
+            profile_id=profile_id,
+            bundle_key=bundle_key,
+            schedule_key=schedule_key,
+            expected_revision=expected_revision,
+        )
         now = self._now_text()
         cursor = self._connection.execute(
             "INSERT INTO run_requests(profile_id, action, arguments_json, request_sha256, "
@@ -2861,15 +2968,46 @@ class StateRepository:
             return bool(schedule["enabled"]) or due is not None or arguments.get(
                 "enabled"
             ) is True
-        if action == "resume":
-            due = self._connection.execute(
-                "SELECT 1 FROM schedule_runs sr JOIN schedules s "
-                "ON s.schedule_key = sr.schedule_key WHERE s.profile_id = ? "
-                "AND sr.state IN ('due', 'dispatching') LIMIT 1",
-                (profile_id,),
-            ).fetchone()
-            return due is not None
         return False
+
+    def _assert_request_resource_revision_locked(
+        self,
+        *,
+        action: str,
+        profile_id: str,
+        bundle_key: int | None,
+        schedule_key: int | None,
+        expected_revision: int,
+    ) -> None:
+        """Bind a new request to the current resource inside its insert transaction."""
+
+        if bundle_key is not None:
+            self._require_revision(
+                self._bundle_row(bundle_key), expected_revision, "run request bundle"
+            )
+            return
+        if schedule_key is not None:
+            self._require_revision(
+                self._schedule_row(schedule_key),
+                expected_revision,
+                "run request schedule",
+            )
+            return
+        if action in {"pause", "resume"}:
+            pause = cast(
+                sqlite3.Row,
+                self._connection.execute(
+                    "SELECT * FROM pause_state WHERE singleton = 1"
+                ).fetchone(),
+            )
+            self._require_revision(pause, expected_revision, "run request pause state")
+            return
+        profile = self._connection.execute(
+            "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
+        self._require_revision(
+            cast(sqlite3.Row, profile), expected_revision, "run request profile"
+        )
 
     def _assert_confirmation_resource_locked(
         self,
@@ -3062,6 +3200,30 @@ class StateRepository:
             status=cast(BundleStatus, str(row["status"])),
             revision=int(row["revision"]),
             archive_path=cast(str | None, row["archive_path"]),
+        )
+
+    def _bundle_file_from_row(self, row: sqlite3.Row) -> BundleFileSnapshot:
+        return BundleFileSnapshot(
+            relative_name=str(row["relative_name"]),
+            role=str(row["role"]),
+            ordinal=cast(int | None, row["ordinal"]),
+            media_kind=cast(str | None, row["media_kind"]),
+            mime_type=cast(str | None, row["mime_type"]),
+            size_bytes=int(row["size_bytes"]),
+            sha256=str(row["sha256"]),
+        )
+
+    def _target_snapshot_from_row(self, row: sqlite3.Row) -> TargetSnapshot:
+        return TargetSnapshot(
+            platform=cast(Platform, str(row["platform"])),
+            expected_remote_user_id=str(row["expected_remote_user_id"]),
+            expected_username=str(row["expected_username"]),
+            token_env_var=str(row["token_env_var"]),
+            api_version=str(row["api_version"]),
+            adapter_version=int(row["adapter_version"]),
+            request_settings=cast(
+                Mapping[str, object], json.loads(str(row["request_settings_json"]))
+            ),
         )
 
     def _delivery_from_row(self, row: sqlite3.Row) -> DeliveryRecord:
