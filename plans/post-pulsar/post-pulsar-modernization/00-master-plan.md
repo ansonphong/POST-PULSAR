@@ -36,7 +36,7 @@ stage_state: active
 
 ### Phase 4: Orchestration, CLI, and Supply Chain ([`04-orchestration-cli-and-supply-chain.md`](04-orchestration-cli-and-supply-chain.md))
 
-- [ ] #aa9e `T4.1` **Task T4.1:** Build safe one-run orchestration
+- [x] #aa9e `T4.1` **Task T4.1:** Build safe one-run orchestration
 - [ ] #1efa `T4.2` **Task T4.2:** Expose safe run, status, retry, and reconcile commands
 - [ ] #8ae2 `T4.3` **Task T4.3:** Lock dependencies and enforce CI security gates
 - [ ] #0ef7 `T4.4` **Task T4.4:** Implement deterministic profile scheduling

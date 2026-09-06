@@ -61,3 +61,7 @@
 {"event":"commit","sha":"cd10587","message":"fix(x): honor directional URL boundaries","time":"2026-09-06T06:27:08Z"}
 {"event":"commit","sha":"43a6a03","message":"chore(plan): mark T3.2 DONE","time":"2026-09-06T06:28:48Z"}
 {"event":"commit","sha":"c1f3747","message":"fix(migration): recover bound WAL checkpoints","time":"2026-09-06T06:36:59Z"}
+{"event":"commit","sha":"41f15fd","message":"chore(plan): mark T2.4 DONE","time":"2026-09-06T06:40:29Z"}
+{"event":"commit","sha":"782f95c","message":"feat(app): build safe one-run orchestration","time":"2026-09-06T07:07:11Z"}
+{"event":"commit","sha":"5a9a4f5","message":"test(app): assert reacquired instance lease","time":"2026-09-06T07:07:43Z"}
+{"event":"commit","sha":"2e64c01","message":"fix(app): close one-run recovery gaps","time":"2026-09-06T07:53:57Z"}
