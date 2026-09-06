@@ -433,8 +433,8 @@ def _validated_media_base_url(value: str) -> str:
     hostname = parsed.hostname
     if hostname is None:  # Guard the Optional property after URL parsing.
         raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
-    hostname = hostname.rstrip(".")
-    if "%" in hostname or _looks_like_noncanonical_ipv4(hostname):
+    hostname = _ascii_idna_hostname(hostname, label)
+    if _looks_like_noncanonical_ipv4(hostname):
         raise ConfigurationError(f"{label} must not contain an IP literal")
     try:
         ipaddress.ip_address(hostname)
@@ -458,6 +458,22 @@ def _validated_media_base_url(value: str) -> str:
     ):
         raise ConfigurationError(f"{label} must not contain traversal")
     return value
+
+
+def _ascii_idna_hostname(hostname: str, label: str) -> str:
+    """Return one strict ASCII hostname representation without resolving it."""
+    try:
+        ascii_hostname = hostname.encode("idna", errors="strict").decode(
+            "ascii", errors="strict"
+        )
+    except UnicodeError:
+        raise ConfigurationError(
+            f"{label} must be a safe public HTTPS base URL"
+        ) from None
+    normalized = ascii_hostname.rstrip(".").casefold()
+    if not normalized or "%" in normalized:
+        raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
+    return normalized
 
 
 def _looks_like_noncanonical_ipv4(hostname: str) -> bool:
