@@ -23,3 +23,15 @@
 {"event":"commit","sha":"b9eee37","message":"feat: add multi-profile content buckets","time":"2026-09-06T03:34:32Z"}
 {"event":"commit","sha":"0bce512","message":"fix(content): make missing sentinel branch explicit","time":"2026-09-06T03:35:07Z"}
 {"event":"commit","sha":"e45af87","message":"fix: harden profile access and bucket scans","time":"2026-09-06T03:43:01Z"}
+{"event":"commit","sha":"6458dd0","message":"chore(plan): mark T1.4 DONE","time":"2026-09-06T03:46:39Z"}
+{"event":"commit","sha":"06a795e","message":"feat(state): add durable delivery state machine","time":"2026-09-06T04:00:08Z"}
+{"event":"commit","sha":"c901f22","message":"fix(state): prioritize active root drift guard","time":"2026-09-06T04:00:32Z"}
+{"event":"commit","sha":"0724c9e","message":"fix(state): satisfy strict repository typing","time":"2026-09-06T04:01:19Z"}
+{"event":"commit","sha":"7346d48","message":"refactor(state): make fallback paths explicit","time":"2026-09-06T04:02:02Z"}
+{"event":"commit","sha":"880aec6","message":"feat(media): add safe media preparation","time":"2026-09-06T04:03:20Z"}
+{"event":"commit","sha":"54fdae4","message":"fix(state): complete transactional repository contracts","time":"2026-09-06T04:06:50Z"}
+{"event":"commit","sha":"c59a414","message":"fix(media): close staging and network race windows","time":"2026-09-06T04:23:51Z"}
+{"event":"commit","sha":"43ca007","message":"fix(state): enforce durable ownership invariants","time":"2026-09-06T04:28:31Z"}
+{"event":"commit","sha":"305e1b1","message":"fix(media): verify consumed bytes and isolated cleanup","time":"2026-09-06T04:35:52Z"}
+{"event":"commit","sha":"dab484e","message":"fix(media): close failed public staging descriptors","time":"2026-09-06T04:42:18Z"}
+{"event":"commit","sha":"d7e0382","message":"fix(state): expose durable recovery readers","time":"2026-09-06T04:42:55Z"}
