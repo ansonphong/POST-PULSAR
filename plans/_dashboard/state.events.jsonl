@@ -16,3 +16,10 @@
 {"event":"commit","sha":"4ed3c68","message":"fix(content): bind text parsing to fingerprint bytes","time":"2026-09-06T02:22:14Z"}
 {"event":"commit","sha":"9342aab","message":"fix: harden config numeric and path validation","time":"2026-09-06T02:22:57Z"}
 {"event":"commit","sha":"84d055a","message":"plan: expand post pulsar for profiles and MCP","time":"2026-09-06T02:59:07Z"}
+{"event":"commit","sha":"70d7b50","message":"harden(plan): verify expanded execution graph","time":"2026-09-06T03:08:40Z"}
+{"event":"commit","sha":"4f903c5","message":"fix(content): close discovery race and nofollow gap","time":"2026-09-06T03:11:33Z"}
+{"event":"commit","sha":"60bf6b2","message":"fix(config): reject validation edge-case bypasses","time":"2026-09-06T03:13:01Z"}
+{"event":"commit","sha":"89a2ab8","message":"fix(config): reject IDNA numeric host aliases","time":"2026-09-06T03:17:31Z"}
+{"event":"commit","sha":"b9eee37","message":"feat: add multi-profile content buckets","time":"2026-09-06T03:34:32Z"}
+{"event":"commit","sha":"0bce512","message":"fix(content): make missing sentinel branch explicit","time":"2026-09-06T03:35:07Z"}
+{"event":"commit","sha":"e45af87","message":"fix: harden profile access and bucket scans","time":"2026-09-06T03:43:01Z"}
