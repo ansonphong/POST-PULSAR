@@ -569,7 +569,7 @@ class StateRepository:
             try:
                 self._connection.execute("PRAGMA journal_mode = WAL").fetchone()
             except sqlite3.OperationalError:
-                pass
+                return
         except BaseException:
             self._connection.close()
             raise
@@ -1107,14 +1107,13 @@ class StateRepository:
                 raise TransitionError("ambiguous delivery cannot be retried automatically")
             if str(bundle["status"]) != "active":
                 raise TransitionError("delivery cannot be claimed while bundle is not active")
-            if status == "pending":
-                pass
-            elif status == "failed" and bool(delivery["safe_to_retry"]):
-                due = _optional_datetime(delivery["next_attempt_at"])
-                if due is not None and due > self._now():
-                    raise TransitionError("failed delivery retry is not due")
-            else:
-                raise TransitionError("delivery is not claimable")
+            if status != "pending":
+                if status == "failed" and bool(delivery["safe_to_retry"]):
+                    due = _optional_datetime(delivery["next_attempt_at"])
+                    if due is not None and due > self._now():
+                        raise TransitionError("failed delivery retry is not due")
+                else:
+                    raise TransitionError("delivery is not claimable")
             self._connection.execute(
                 "UPDATE deliveries SET status = 'in_flight', phase = 'preparing', "
                 "attempt_count = attempt_count + 1, claim_token = ?, "
