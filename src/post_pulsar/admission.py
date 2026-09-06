@@ -183,6 +183,9 @@ class DraftAdmissionService:
         """Finish post-rename journals and roll back incomplete hidden copies."""
         recovered: list[AdmissionRecord] = []
         for journal in self._repository.list_recoverable_admissions():
+            profile = self._repository.get_profile(journal.profile_id)
+            if profile.account_root.resolve(strict=False) != self._root:
+                continue
             destination = self._root / journal.destination_path
             temporary = (
                 destination.parent

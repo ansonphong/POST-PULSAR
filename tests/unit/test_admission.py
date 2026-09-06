@@ -106,6 +106,33 @@ def test_admission_copies_exact_members_installs_ready_last_and_retains_sources(
     assert scan_inbox(root / "QUEUE/hello").bundles[0].fingerprint == fingerprint
 
 
+def test_recovery_never_rolls_back_another_profiles_journal(tmp_path: Path) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+
+    def stop_after_journal(boundary):
+        if boundary == "after_journal":
+            raise RuntimeError("crash before copy")
+
+    with pytest.raises(RuntimeError, match="before copy"):
+        DraftAdmissionService(
+            repository, root, fault_injector=stop_after_journal
+        ).admit(
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            expected_fingerprint=fingerprint,
+            intent_id=intent_id,
+        )
+    journal = repository.list_recoverable_admissions()[0]
+    other_root = tmp_path / "other-account"
+    other_root.mkdir()
+    assert DraftAdmissionService(repository, other_root).recover() == ()
+    assert repository.get_admission(journal.journal_id).phase == "started"
+    assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+
+
 def test_admission_rejects_symlinks_drift_duplicates_and_destination_conflicts(
     tmp_path: Path,
 ) -> None:
