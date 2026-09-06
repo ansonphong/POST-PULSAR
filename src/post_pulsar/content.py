@@ -101,8 +101,8 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
     collision_names = _find_casefold_filename_collisions(paths)
 
     for path in paths:
+        potential_id = _potential_bundle_id(path.name)
         if path.name.casefold() in collision_names:
-            potential_id = _potential_bundle_id(path.name)
             if potential_id is not None:
                 invalid_bundle_keys.add(potential_id.casefold())
             issues.append(
@@ -116,8 +116,22 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
             )
             continue
 
-        if path.is_symlink():
-            potential_id = _potential_bundle_id(path.name)
+        try:
+            mode = path.stat(follow_symlinks=False).st_mode
+        except OSError:
+            if potential_id is not None:
+                invalid_bundle_keys.add(potential_id.casefold())
+            issues.append(
+                _issue(
+                    "error",
+                    "unreadable_entry",
+                    path,
+                    potential_id,
+                    "Inbox entry metadata could not be read.",
+                )
+            )
+            continue
+        if stat.S_ISLNK(mode):
             if potential_id is not None:
                 invalid_bundle_keys.add(potential_id.casefold())
             issues.append(
@@ -130,22 +144,7 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
                 )
             )
             continue
-
-        try:
-            mode = path.stat(follow_symlinks=False).st_mode
-        except OSError:
-            issues.append(
-                _issue(
-                    "error",
-                    "unreadable_entry",
-                    path,
-                    None,
-                    "Inbox entry metadata could not be read.",
-                )
-            )
-            continue
         if not stat.S_ISREG(mode):
-            potential_id = _potential_bundle_id(path.name)
             if potential_id is not None:
                 invalid_bundle_keys.add(potential_id.casefold())
             issues.append(
@@ -555,20 +554,44 @@ def _read_regular_bytes(path: Path) -> bytes:
 
 
 def _open_regular(path: Path) -> BinaryIO:
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError("bundle member is not a regular file")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+
     def opener(filename: str, flags: int) -> int:
-        no_follow = getattr(os, "O_NOFOLLOW", 0)
-        return os.open(filename, flags | no_follow)
+        guarded_flags = flags if no_follow is None else flags | no_follow
+        return os.open(filename, guarded_flags)
 
     source = open(path, "rb", opener=opener)
     try:
-        is_regular = stat.S_ISREG(os.fstat(source.fileno()).st_mode)
+        opened = os.fstat(source.fileno())
+        after = os.lstat(path)
     except OSError:
         source.close()
         raise
-    if not is_regular:
+    if not (
+        stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(after.st_mode)
+        and _same_file_identity(before, opened)
+        and _same_file_identity(opened, after)
+    ):
         source.close()
-        raise OSError("bundle member is not a regular file")
+        raise OSError("bundle member changed or is not a regular file")
     return source
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare open-path identities, failing closed if a platform has no identity."""
+
+    left_identity = (left.st_dev, left.st_ino)
+    right_identity = (right.st_dev, right.st_ino)
+    return (
+        left_identity != (0, 0)
+        and right_identity != (0, 0)
+        and os.path.samestat(left, right)
+    )
 
 
 def _issue(

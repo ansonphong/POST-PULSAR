@@ -252,6 +252,56 @@ def test_symlink_is_rejected_and_never_followed(tmp_path: Path) -> None:
     assert "symlink_entry" in _codes(scan)
 
 
+def test_unreadable_numbered_member_invalidates_its_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path, "post-1.jpg", b"one")
+    unreadable = _write(tmp_path, "post-2.jpg", b"two")
+    original_stat = Path.stat
+
+    def fail_member_stat(
+        path: Path, *, follow_symlinks: bool = True
+    ) -> object:
+        if path == unreadable and not follow_symlinks:
+            raise FileNotFoundError(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", fail_member_stat)
+
+    scan = scan_inbox(tmp_path)
+
+    assert scan.bundles == ()
+    assert [(issue.code, issue.bundle_id) for issue in scan.issues] == [
+        ("unreadable_entry", "post")
+    ]
+
+
+def test_missing_o_nofollow_rejects_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    member = _write(tmp_path, "post.jpg", b"expected")
+    target = _write(tmp_path.parent, f"{tmp_path.name}-swap-target.jpg", b"secret")
+    original_open = content_module.os.open
+    swapped = False
+
+    def swap_then_open(path: str, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if Path(path) == member and not swapped:
+            member.unlink()
+            member.symlink_to(target)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.delattr(content_module.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.setattr(content_module.os, "open", swap_then_open)
+
+    scan = scan_inbox(tmp_path)
+
+    assert swapped
+    assert scan.bundles == ()
+    assert "unreadable_member" in _codes(scan)
+
+
 def test_issue_order_is_deterministic(tmp_path: Path) -> None:
     _write(tmp_path, "z.md")
     _write(tmp_path, "a.md")
