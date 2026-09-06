@@ -7,6 +7,8 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -446,6 +448,136 @@ def test_dry_run_rejects_wal_only_state_without_touching_source_or_sidecars(
         assert _filesystem_snapshot(state) == before_state
     finally:
         repository.close()
+
+
+def test_apply_recovers_bound_wal_after_real_hard_crash(tmp_path: Path) -> None:
+    root = _legacy(tmp_path)
+    script = """
+import os
+import sys
+from pathlib import Path
+from post_pulsar.config import ProfileSettings
+from post_pulsar.migration import migrate_legacy_layout
+
+workspace = Path(sys.argv[1])
+profile = ProfileSettings(
+    "operator", workspace / "accounts/operator", "UTC", None, None
+)
+
+def crash(boundary: str) -> None:
+    if boundary == "after_state_ready":
+        os._exit(73)
+
+migrate_legacy_layout(
+    selected_profile_id="operator",
+    profile=profile,
+    legacy_posts_directory=workspace / "legacy-posts",
+    state_directory=workspace / "state",
+    config_hash="c" * 64,
+    mode="apply",
+    fault_injector=crash,
+)
+"""
+    environment = os.environ.copy()
+    source_root = Path.cwd() / "src"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(source_root), environment.get("PYTHONPATH", ""))
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert crashed.returncode == 73
+    assert crashed.stdout == ""
+    assert crashed.stderr == ""
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    wal = Path(f"{database}-wal")
+    assert wal.stat().st_size > 0
+
+    report = _run(tmp_path, mode="apply")
+
+    assert report.phase == "complete"
+    active = _profile(tmp_path).account_root / "RANDOM/cat"
+    archived = _profile(tmp_path).account_root / "POSTED/RANDOM/dog"
+    assert {path.name for path in active.iterdir()} == {"cat.jpg", "cat.txt", ".ready"}
+    assert {path.name for path in archived.iterdir()} == {"dog.jpg", ".ready"}
+    assert not (root / "cat.jpg").exists()
+    assert not (root / "posted/dog.jpg").exists()
+    assert (root / "config.json").read_bytes() == b"do-not-read"
+    with StateRepository(database) as repository:
+        assert repository.get_profile("operator").profile_id == "operator"
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM admission_journals "
+                "WHERE profile_id = 'operator' AND phase = 'installed'"
+            ).fetchone()[0]
+            == 2
+        )
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as instance:
+        with locks.acquire_maintenance(instance) as maintenance:
+            with locks.acquire_profiles(
+                instance, ("operator",), maintenance=maintenance
+            ):
+                pass
+
+
+def test_apply_rejects_foreign_wal_despite_a_bound_journal(tmp_path: Path) -> None:
+    root = _legacy(tmp_path)
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_journal_created":
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+    state = tmp_path / "state"
+    database = state / "post_pulsar.sqlite3"
+    script = """
+import os
+import sys
+from pathlib import Path
+from post_pulsar.state import StateRepository
+
+database = Path(sys.argv[1])
+repository = StateRepository(database)
+repository.register_profile(
+    "foreign", Path(sys.argv[2]), (), config_hash="f" * 64
+)
+os._exit(74)
+"""
+    environment = os.environ.copy()
+    source_root = Path.cwd() / "src"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(source_root), environment.get("PYTHONPATH", ""))
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(database), str(tmp_path / "foreign")],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert crashed.returncode == 74
+    wal = Path(f"{database}-wal")
+    before_database = database.read_bytes()
+    before_wal = wal.read_bytes()
+
+    with pytest.raises(MigrationError, match="profile binding"):
+        _run(tmp_path, mode="apply")
+
+    assert database.read_bytes() == before_database
+    assert wal.read_bytes() == before_wal
+    assert (root / "cat.jpg").read_bytes() == b"cat-image"
+    assert not _profile(tmp_path).account_root.exists()
 
 
 def _filesystem_snapshot(

@@ -170,6 +170,9 @@ def migrate_legacy_layout(
                 instance, (selected_profile_id,), maintenance=maintenance
             ):
                 database_existed = os.path.lexists(database)
+                if journal_existed:
+                    _validate_destinations(plan, allow_existing=True)
+                    _recover_bound_wal(database, backup, plan, profile)
                 plan = _preflight_state(
                     plan, database, backup, resuming=journal_existed
                 )
@@ -817,32 +820,323 @@ def _inspect_database(database: Path) -> None:
         raise MigrationError("migration database path is unsafe")
     try:
         with _read_only_database(database) as connection:
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            application_id = int(
-                connection.execute("PRAGMA application_id").fetchone()[0]
-            )
-            tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if (
-                version != SCHEMA_VERSION
-                or application_id != _APPLICATION_ID
-                or not _REQUIRED_TABLES.issubset(tables)
-                or _schema_manifest_digest(connection)
-                != _expected_schema_manifest_digest()
-            ):
-                raise MigrationError(
-                    "existing database schema is not current and canonical"
-                )
+            _inspect_database_connection(connection)
     except MigrationError:
         raise
     except sqlite3.DatabaseError:
         raise MigrationError(
             "existing database schema could not be validated"
         ) from None
+
+
+def _inspect_database_connection(connection: sqlite3.Connection) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if (
+        version != SCHEMA_VERSION
+        or application_id != _APPLICATION_ID
+        or not _REQUIRED_TABLES.issubset(tables)
+        or _schema_manifest_digest(connection) != _expected_schema_manifest_digest()
+    ):
+        raise MigrationError("existing database schema is not current and canonical")
+
+
+def _recover_bound_wal(
+    database: Path,
+    backup: Path,
+    plan: _MigrationPlan,
+    profile: ProfileSettings,
+) -> None:
+    """Checkpoint only authoritative WAL state proven to belong to this journal."""
+
+    if not os.path.lexists(database):
+        return
+    wal = Path(f"{database}-wal")
+    wal_before = _immutable_file_snapshot(wal, required=False)
+    if wal_before is None or wal_before[3] == 0:
+        return
+    if plan.database_sha256 is None:
+        if os.path.lexists(backup):
+            raise MigrationError("migration recovery backup binding conflicts")
+    else:
+        if not os.path.lexists(backup):
+            raise MigrationError("migration recovery backup checkpoint is missing")
+        _validate_backup(backup, plan.database_sha256)
+    database_before = _immutable_file_snapshot(database, required=True)
+    if database_before is None:  # pragma: no cover - required=True is fail closed
+        raise MigrationError("migration database is unavailable")
+    shm = Path(f"{database}-shm")
+    shm_before = _immutable_file_snapshot(shm, required=False)
+    with tempfile.TemporaryDirectory(
+        prefix=".migration-wal-inspection-", dir=database.parent
+    ) as temporary_directory:
+        inspection_database = Path(temporary_directory) / database.name
+        _copy_database_snapshot(database, inspection_database, database_before)
+        _copy_database_snapshot(
+            wal,
+            Path(f"{inspection_database}-wal"),
+            wal_before,
+        )
+        inspection_uri = f"file:{quote(str(inspection_database))}?mode=rw"
+        try:
+            inspection = sqlite3.connect(
+                inspection_uri, uri=True, isolation_level=None, timeout=0
+            )
+            try:
+                _inspect_database_connection(inspection)
+                _validate_bound_recovery_state(inspection, plan, profile)
+            finally:
+                inspection.close()
+        except MigrationError:
+            raise
+        except sqlite3.DatabaseError:
+            raise MigrationError(
+                "migration recovery WAL could not be validated"
+            ) from None
+    if (
+        _immutable_file_snapshot(database, required=True) != database_before
+        or _immutable_file_snapshot(wal, required=True) != wal_before
+        or _immutable_file_snapshot(shm, required=False) != shm_before
+    ):
+        raise MigrationError("migration recovery database changed during validation")
+    uri = f"file:{quote(str(database))}?mode=rw"
+    try:
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=0)
+        try:
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint is None or int(checkpoint[0]) != 0:
+                raise MigrationError("migration recovery WAL remains busy")
+        finally:
+            connection.close()
+    except MigrationError:
+        raise
+    except sqlite3.DatabaseError:
+        raise MigrationError("migration recovery WAL could not be validated") from None
+    remaining = _immutable_file_snapshot(wal, required=False)
+    if remaining is not None and remaining[3] > 0:
+        raise MigrationError("migration recovery WAL could not be checkpointed")
+
+
+def _copy_database_snapshot(
+    source: Path,
+    destination: Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+        opened = os.fstat(descriptor)
+        with (
+            os.fdopen(descriptor, "rb") as input_file,
+            destination.open("xb") as output,
+        ):
+            while chunk := input_file.read(_COPY_BYTES):
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        named = os.lstat(source)
+    except (FileExistsError, FileNotFoundError, OSError):
+        raise MigrationError("migration recovery database snapshot is unsafe") from None
+    opened_snapshot = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mode,
+        opened.st_size,
+        opened.st_mtime_ns,
+    )
+    named_snapshot = (
+        named.st_dev,
+        named.st_ino,
+        named.st_mode,
+        named.st_size,
+        named.st_mtime_ns,
+    )
+    if opened_snapshot != expected or named_snapshot != expected:
+        raise MigrationError("migration recovery database changed during snapshot")
+    destination.chmod(0o600)
+
+
+def _validate_bound_recovery_state(
+    connection: sqlite3.Connection,
+    plan: _MigrationPlan,
+    profile: ProfileSettings,
+) -> None:
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise MigrationError("migration recovery state foreign keys are invalid")
+    forbidden_tables = (
+        "bundles",
+        "target_snapshots",
+        "bundle_files",
+        "deliveries",
+        "delivery_artifacts",
+        "events",
+        "schedules",
+        "schedule_runs",
+        "run_requests",
+        "confirmation_intents",
+        "selection_counters",
+    )
+    if any(
+        int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in forbidden_tables
+    ):
+        raise MigrationError("migration recovery state contains unrelated records")
+    pause_rows = connection.execute(
+        "SELECT singleton, paused, revision FROM pause_state"
+    ).fetchall()
+    if [tuple(int(value) for value in row) for row in pause_rows] != [(1, 0, 1)]:
+        raise MigrationError("migration recovery pause state conflicts")
+
+    profiles = connection.execute(
+        "SELECT profile_id, account_root, config_hash FROM profiles"
+    ).fetchall()
+    if len(profiles) > 1:
+        raise MigrationError("migration recovery profile binding conflicts")
+    if profiles:
+        stored_profile = tuple(str(value) for value in profiles[0])
+        expected_profile = (plan.profile_id, plan.account_root, plan.config_hash)
+        if stored_profile != expected_profile:
+            raise MigrationError("migration recovery profile binding conflicts")
+        _validate_recovery_targets(connection, profile)
+    elif plan.phase != "planned":
+        raise MigrationError("migration recovery profile checkpoint is missing")
+    elif connection.execute("SELECT COUNT(*) FROM profile_targets").fetchone()[0]:
+        raise MigrationError("migration recovery target binding conflicts")
+
+    expected_items = {item.bundle_id.casefold(): item for item in plan.items}
+    admissions = connection.execute(
+        "SELECT journal_id, profile_id, bucket, bundle_id, fingerprint, source_path, "
+        "destination_path, intent_id, phase FROM admission_journals"
+    ).fetchall()
+    if admissions and not profiles:
+        raise MigrationError("migration recovery admission has no profile")
+    seen: set[str] = set()
+    for row in admissions:
+        journal_id = int(row[0])
+        bundle_id = str(row[3])
+        key = bundle_id.casefold()
+        item = expected_items.get(key)
+        if item is None or key in seen:
+            raise MigrationError("migration recovery admission conflicts")
+        seen.add(key)
+        expected_identity = (
+            plan.profile_id,
+            "RANDOM",
+            item.bundle_id,
+            item.fingerprint,
+            f"legacy/{item.source_relative}/{item.bundle_id}",
+            item.destination_relative,
+            None,
+        )
+        actual_identity = (*tuple(str(value) for value in row[1:7]), row[7])
+        if actual_identity != expected_identity:
+            raise MigrationError("migration recovery admission conflicts")
+        phase = str(row[8])
+        if phase not in {"started", "copying", "ready_installed", "installed"}:
+            raise MigrationError("migration recovery admission phase conflicts")
+        _validate_recovery_members(connection, journal_id, item, phase)
+        _validate_recovery_filesystem_checkpoint(plan, item, phase)
+
+
+def _validate_recovery_targets(
+    connection: sqlite3.Connection, profile: ProfileSettings
+) -> None:
+    expected: dict[str, tuple[str, str, str, dict[str, object]]] = {
+        target.platform: (
+            target.expected_remote_user_id,
+            target.expected_username,
+            target.token_env_var,
+            dict(target.request_settings),
+        )
+        for target in _profile_targets(profile)
+    }
+    rows = connection.execute(
+        "SELECT platform, expected_remote_user_id, expected_username, token_env_var, "
+        "request_settings_json, request_settings_sha256 FROM profile_targets"
+    ).fetchall()
+    if len(rows) != len(expected):
+        raise MigrationError("migration recovery target binding conflicts")
+    for row in rows:
+        platform = str(row[0])
+        target = expected.get(platform)
+        settings_text = str(row[4])
+        try:
+            settings = json.loads(settings_text)
+        except json.JSONDecodeError:
+            raise MigrationError(
+                "migration recovery target binding conflicts"
+            ) from None
+        if (
+            target is None
+            or tuple(str(value) for value in row[1:4]) != target[:3]
+            or settings != target[3]
+            or hashlib.sha256(settings_text.encode()).hexdigest() != str(row[5])
+        ):
+            raise MigrationError("migration recovery target binding conflicts")
+
+
+def _validate_recovery_members(
+    connection: sqlite3.Connection,
+    journal_id: int,
+    item: MigrationItem,
+    admission_phase: str,
+) -> None:
+    expected = {member.relative_name.casefold(): member for member in item.members}
+    rows = connection.execute(
+        "SELECT relative_name, sha256, size_bytes, phase FROM admission_members "
+        "WHERE journal_id = ?",
+        (journal_id,),
+    ).fetchall()
+    seen: set[str] = set()
+    phases: list[str] = []
+    for row in rows:
+        name = str(row[0])
+        key = name.casefold()
+        member = expected.get(key)
+        phase = str(row[3])
+        if (
+            member is None
+            or key in seen
+            or name != member.relative_name
+            or str(row[1]) != member.sha256
+            or int(row[2]) != member.size_bytes
+            or phase not in {"planned", "copied", "verified"}
+        ):
+            raise MigrationError("migration recovery admission member conflicts")
+        seen.add(key)
+        phases.append(phase)
+    if admission_phase == "started" and rows:
+        raise MigrationError("migration recovery admission member phase conflicts")
+    if admission_phase == "copying" and not rows:
+        raise MigrationError("migration recovery admission member phase conflicts")
+    if admission_phase in {"ready_installed", "installed"} and (
+        seen != set(expected) or any(phase != "verified" for phase in phases)
+    ):
+        raise MigrationError("migration recovery admission member phase conflicts")
+
+
+def _validate_recovery_filesystem_checkpoint(
+    plan: _MigrationPlan, item: MigrationItem, admission_phase: str
+) -> None:
+    destination = Path(plan.account_root) / item.destination_relative
+    staging = destination.parent / f".{item.bundle_id}.{item.fingerprint}.migration"
+    if admission_phase == "installed":
+        if not os.path.lexists(destination):
+            raise MigrationError("migration recovery installed destination is missing")
+        _verify_destination(destination, item, require_ready=True)
+    elif admission_phase == "ready_installed":
+        target = destination if os.path.lexists(destination) else staging
+        if not os.path.lexists(target):
+            raise MigrationError("migration recovery ready destination is missing")
+        _verify_destination(target, item, require_ready=True)
 
 
 def _preflight_state(
