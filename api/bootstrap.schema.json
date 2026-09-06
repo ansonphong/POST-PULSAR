@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://post-pulsar.local/schemas/bootstrap-v1.json",
+  "title": "POST PULSAR secretless control bootstrap",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "installation_id", "endpoint_record", "agent_capability", "service"],
+  "properties": {
+    "schema": {"const": "post-pulsar.bootstrap/v1"},
+    "installation_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "endpoint_record": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "agent_capability": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "identifier"],
+      "properties": {
+        "mode": {
+          "enum": ["manual", "systemd-user", "launchd-agent", "windows-service", "windows-task"]
+        },
+        "identifier": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$"
+        }
+      }
+    }
+  }
+}
