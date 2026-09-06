@@ -9,7 +9,6 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -29,6 +28,7 @@ from post_pulsar.state import (
     StateRepository,
     StateValidationError,
     TransitionError,
+    validate_action_arguments,
 )
 
 CONTROL_SCHEMA: Final = "post-pulsar.control/v1"
@@ -292,7 +292,11 @@ class ControlApplication:
             raise StateValidationError("unknown control route")
         route = segments[2:]
         if method == "GET" and route == ("health",):
-            return {"status": "ok"}, 200
+            failures = repository.control_events(limit=10)
+            return {
+                "status": "degraded" if failures else "ok",
+                "callback_failures": failures,
+            }, 200
         if method == "GET" and route == ("capabilities",):
             return {
                 "core_semver": __version__,
@@ -414,7 +418,28 @@ class ControlApplication:
         if method == "GET" and len(route) == 2 and route[0] == "confirmations":
             return _intent(repository.get_confirmation_intent(route[1])), 200
         if method == "POST" and route == ("confirmations",):
+            _exact_body(
+                body,
+                {
+                    "action",
+                    "profile_id",
+                    "resource_revision",
+                    "consequence",
+                    "arguments",
+                    "bundle_key",
+                    "schedule_key",
+                    "fingerprint",
+                },
+                {
+                    "action",
+                    "profile_id",
+                    "resource_revision",
+                    "consequence",
+                    "arguments",
+                },
+            )
             action = _text(body, "action")
+            validate_action_arguments(action, _object(body, "arguments", default={}))
             if action in _PUBLISH_ACTIONS and not self._allow_agent_publish:
                 return {"code": "agent_publish_disabled"}, 403
             key, revision = _write_headers(headers)
@@ -437,6 +462,26 @@ class ControlApplication:
             )
             return _intent(intent), 201
         if method == "POST" and route == ("operator", "confirmations"):
+            _exact_body(
+                body,
+                {
+                    "action",
+                    "profile_id",
+                    "resource_revision",
+                    "consequence",
+                    "arguments",
+                    "bundle_key",
+                    "schedule_key",
+                    "fingerprint",
+                },
+                {
+                    "action",
+                    "profile_id",
+                    "resource_revision",
+                    "consequence",
+                    "arguments",
+                },
+            )
             if headers.get("x-post-pulsar-principal") != "operator":
                 raise ControlSecurityError("operator principal is required")
             self._operator_auth(headers)
@@ -489,6 +534,21 @@ class ControlApplication:
             and route[2] == "consume"
         ):
             key, revision = _write_headers(headers)
+            _exact_body(
+                body,
+                {
+                    "action",
+                    "profile_id",
+                    "resource_revision",
+                    "arguments",
+                    "bundle_key",
+                    "schedule_key",
+                    "fingerprint",
+                },
+                {"action", "profile_id", "resource_revision", "arguments"},
+            )
+            if _integer(body, "resource_revision") != revision:
+                raise ConflictError("intent revision header drift")
             action = _text(body, "action")
             intent = repository.get_confirmation_intent(route[1])
             if (
@@ -512,6 +572,16 @@ class ControlApplication:
         action = _action_for_route(method, route, body)
         if action is not None:
             key, revision = _write_headers(headers)
+            if action in {"edit_caption", "edit_alt"}:
+                _exact_body(body, {"text"}, {"text"})
+            elif action == "admit_draft":
+                _exact_body(body, {"arguments"}, {"arguments"})
+            else:
+                _exact_body(
+                    body,
+                    {"profile_id", "arguments", "bundle_key", "schedule_key"},
+                    {"profile_id"},
+                )
             profile_id = (
                 route[1]
                 if len(route) >= 6 and route[0] == "profiles"
@@ -519,7 +589,10 @@ class ControlApplication:
             )
             arguments = dict(_object(body, "arguments", default={}))
             if len(route) >= 6 and route[0] == "profiles":
-                arguments.update({"bucket": route[3], "bundle_id": route[5]})
+                if action in {"edit_caption", "edit_alt"}:
+                    arguments.update({"bucket": route[3], "bundle_id": route[5]})
+                elif arguments.get("bundle_id") != route[5]:
+                    raise StateValidationError("draft path and body identity disagree")
                 if "text" in body:
                     text_value = body["text"]
                     if not isinstance(text_value, str) or len(text_value) > 10000:
@@ -545,6 +618,7 @@ class ControlApplication:
                 if schedule_key != route_schedule_key:
                     raise StateValidationError("schedule path and body keys disagree")
                 schedule_key = route_schedule_key
+            validate_action_arguments(action, arguments)
             enabling = _publication_enabling(
                 repository, action, arguments, schedule_key
             )
@@ -769,6 +843,12 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _assert_secret_target(path: Path, *, allow_missing: bool) -> None:
+    from post_pulsar.secure_files import SecureFileError, assert_owner_file
+
+    try:
+        assert_owner_file(path, allow_missing=allow_missing)
+    except (OSError, SecureFileError):
+        raise ControlSecurityError("credential file is unsafe or unavailable") from None
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -786,32 +866,13 @@ def _assert_secret_target(path: Path, *, allow_missing: bool) -> None:
 
 
 def _atomic_owner_write(path: Path, payload: bytes) -> None:
+    from post_pulsar.secure_files import SecureFileError, atomic_owner_write
+
     _assert_secret_target(path, allow_missing=True)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    parent = path.parent.lstat()
-    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-        raise ControlSecurityError("credential directory is unsafe")
-    path.parent.chmod(0o700)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        path.chmod(0o600)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+        atomic_owner_write(path, payload)
+    except (OSError, SecureFileError):
+        raise ControlSecurityError("credential file write is unsafe") from None
 
 
 def _one(query: Mapping[str, list[str]], key: str) -> str | None:
@@ -851,6 +912,13 @@ def _text(body: Mapping[str, object], key: str, default: str | None = None) -> s
     if not isinstance(value, str) or not value or len(value) > 512:
         raise StateValidationError(f"{key} is invalid")
     return value
+
+
+def _exact_body(
+    body: Mapping[str, object], allowed: set[str], required: set[str]
+) -> None:
+    if set(body) - allowed or required - set(body):
+        raise StateValidationError("request fields do not match the exact contract")
 
 
 def _optional_text(body: Mapping[str, object], key: str) -> str | None:

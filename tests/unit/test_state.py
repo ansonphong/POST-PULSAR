@@ -37,40 +37,72 @@ class FakeClock:
 
 
 @pytest.mark.parametrize("published", [True, False])
-def test_operator_decision_recovers_linked_ambiguous_occurrence(tmp_path: Path, published: bool) -> None:
+def test_operator_decision_recovers_linked_ambiguous_occurrence(
+    tmp_path: Path, published: bool
+) -> None:
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     key = _bundle(repository)
     schedule = repository.create_schedule(
-        profile_id="ansonphong", schedule_id="recovery", bucket="QUEUE",
-        timezone="UTC", weekdays=(5,), local_time="12:00",
-        misfire_grace_seconds=60, enabled=True,
+        profile_id="ansonphong",
+        schedule_id="recovery",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(5,),
+        local_time="12:00",
+        misfire_grace_seconds=60,
+        enabled=True,
     )
     run = repository.claim_schedule_occurrence(
-        schedule.schedule_key, bundle_key=key, local_date="2026-09-05",
-        scheduled_at=clock(), utc_offset_minutes=0, schedule_hash=schedule.config_hash,
+        schedule.schedule_key,
+        bundle_key=key,
+        local_date="2026-09-05",
+        scheduled_at=clock(),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
     )
     claim = _claim(repository, key, "x", "unknown")
     repository.advance_delivery_phase(key, "x", "final_dispatch_started", **claim)
-    repository.mark_delivery_ambiguous(key, "x", error_code="unknown", error_message="Unknown.", **claim)
+    repository.mark_delivery_ambiguous(
+        key, "x", error_code="unknown", error_message="Unknown.", **claim
+    )
     repository.synchronize_schedule_run(run.run_id)
     assert repository.get_schedule_run(run.run_id).state == "ambiguous"
-    repository.operator_reconcile(key, "x", published_remote_id="remote" if published else None,
-                                  expected_bundle_revision=repository.get_bundle(key).revision)
-    assert repository.get_schedule_run(run.run_id).state == ("dispatching" if published else "failed")
+    repository.operator_reconcile(
+        key,
+        "x",
+        published_remote_id="remote" if published else None,
+        expected_bundle_revision=repository.get_bundle(key).revision,
+    )
+    assert repository.get_schedule_run(run.run_id).state == (
+        "dispatching" if published else "failed"
+    )
     if not published:
         assert repository.list_recoverable_schedule_runs(clock()) == ()
-        repository.operator_retry(key, "x", expected_bundle_revision=repository.get_bundle(key).revision,
-                                  validated_snapshot=_target())
-    assert [item.run_id for item in repository.list_recoverable_schedule_runs(clock())] == [run.run_id]
+        repository.operator_retry(
+            key,
+            "x",
+            expected_bundle_revision=repository.get_bundle(key).revision,
+            validated_snapshot=_target(),
+        )
+    assert [
+        item.run_id for item in repository.list_recoverable_schedule_runs(clock())
+    ] == [run.run_id]
 
 
 def test_interrupted_draft_edit_is_never_requeued(tmp_path: Path) -> None:
     repository = _repository(tmp_path, FakeClock())
     request = repository.create_run_request(
-        profile_id="ansonphong", action="edit_caption", arguments={"bucket": "DRAFTS",
-        "bundle_id": "post", "fingerprint": "b" * 64, "text": "new text"},
-        idempotency_key="edit", expected_revision=1,
+        profile_id="ansonphong",
+        action="edit_caption",
+        arguments={
+            "bucket": "DRAFTS",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "text": "new text",
+        },
+        idempotency_key="edit",
+        expected_revision=1,
     )
     repository.claim_next_run_request("old")
     repository.recover_claimed_run_requests("new")
@@ -1710,7 +1742,7 @@ def test_nonconfirmed_request_revision_is_atomic_and_replay_is_canonical(
     request = repository.create_run_request(
         profile_id="ansonphong",
         action="schedule_disable",
-        arguments={"enabled": False},
+        arguments={},
         idempotency_key="disable-revision-1",
         expected_revision=schedule.revision,
         schedule_key=schedule.schedule_key,
@@ -1723,7 +1755,7 @@ def test_nonconfirmed_request_revision_is_atomic_and_replay_is_canonical(
         repository.create_run_request(
             profile_id="ansonphong",
             action="schedule_disable",
-            arguments={"enabled": False},
+            arguments={},
             idempotency_key="disable-revision-1",
             expected_revision=schedule.revision,
             schedule_key=schedule.schedule_key,
@@ -1734,7 +1766,7 @@ def test_nonconfirmed_request_revision_is_atomic_and_replay_is_canonical(
         repository.create_run_request(
             profile_id="ansonphong",
             action="schedule_disable",
-            arguments={"enabled": False},
+            arguments={},
             idempotency_key="disable-stale-revision",
             expected_revision=schedule.revision,
             schedule_key=schedule.schedule_key,
@@ -1749,7 +1781,12 @@ def test_approved_intent_is_consumed_once_with_idempotent_request(
     bundle_key = _bundle(repository)
     intent = repository.create_confirmation_intent(
         action="run_now",
-        arguments={"bundle_key": bundle_key},
+        arguments={
+            "bucket": "QUEUE",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "trigger_id": "exact",
+        },
         profile_id="ansonphong",
         resource_revision=1,
         fingerprint="b" * 64,
@@ -1764,7 +1801,12 @@ def test_approved_intent_is_consumed_once_with_idempotent_request(
     request = repository.consume_intent_with_request(
         intent_id=intent.intent_id,
         action="run_now",
-        arguments={"bundle_key": bundle_key},
+        arguments={
+            "bucket": "QUEUE",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "trigger_id": "exact",
+        },
         profile_id="ansonphong",
         resource_revision=1,
         fingerprint="b" * 64,
@@ -1774,7 +1816,12 @@ def test_approved_intent_is_consumed_once_with_idempotent_request(
     replay = repository.consume_intent_with_request(
         intent_id=intent.intent_id,
         action="run_now",
-        arguments={"bundle_key": bundle_key},
+        arguments={
+            "bucket": "QUEUE",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "trigger_id": "exact",
+        },
         profile_id="ansonphong",
         resource_revision=1,
         fingerprint="b" * 64,
@@ -1984,7 +2031,12 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
         repository.create_run_request(
             profile_id="ansonphong",
             action="run_now",
-            arguments={"bundle_key": bundle_key},
+            arguments={
+                "bucket": "QUEUE",
+                "bundle_id": "post",
+                "fingerprint": "b" * 64,
+                "trigger_id": "exact",
+            },
             idempotency_key="unconfirmed-run",
             expected_revision=1,
             bundle_key=bundle_key,
@@ -2010,7 +2062,12 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
 
     intent = repository.create_confirmation_intent(
         action="run_now",
-        arguments={"bundle_key": bundle_key},
+        arguments={
+            "bucket": "QUEUE",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "trigger_id": "exact",
+        },
         profile_id="ansonphong",
         resource_revision=1,
         fingerprint="b" * 64,
@@ -2024,7 +2081,12 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
         repository.consume_intent_with_request(
             intent_id=intent.intent_id,
             action="run_now",
-            arguments={"bundle_key": bundle_key},
+            arguments={
+                "bucket": "QUEUE",
+                "bundle_id": "post",
+                "fingerprint": "b" * 64,
+                "trigger_id": "exact",
+            },
             profile_id="ansonphong",
             resource_revision=1,
             fingerprint="b" * 64,
@@ -2045,7 +2107,7 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
     )
     schedule_intent = repository.create_confirmation_intent(
         action="schedule_enable",
-        arguments={"enabled": True},
+        arguments={},
         profile_id="ansonphong",
         resource_revision=schedule.revision,
         fingerprint=schedule.config_hash,
@@ -2059,7 +2121,7 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
     schedule_request = repository.consume_intent_with_request(
         intent_id=schedule_intent.intent_id,
         action="schedule_enable",
-        arguments={"enabled": True},
+        arguments={},
         profile_id="ansonphong",
         resource_revision=schedule.revision,
         fingerprint=schedule.config_hash,

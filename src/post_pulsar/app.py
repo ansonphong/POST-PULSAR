@@ -55,6 +55,7 @@ from post_pulsar.state import (
     ConflictError,
     DeliveryPhase,
     DeliveryRecord,
+    Platform,
     StateRepository,
     StateValidationError,
     TargetSnapshot,
@@ -84,6 +85,8 @@ class RunOnceRequest:
     schedule_run_id: int | None = None
     expected_bundle_key: int | None = None
     expected_fingerprint: str | None = None
+    only_platform: Platform | None = None
+    archive_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +235,9 @@ class OneRunApplication:
                 ):
                     return RunOutcome("invalid", code="exact_bundle_conflict")
                 bundle = exact
+                resources.callback(
+                    repository.synchronize_bundle_occurrences, bundle.bundle_key
+                )
             elif schedule_run is not None and schedule_run.bundle_key is not None:
                 bundle = repository.get_bundle(schedule_run.bundle_key)
             elif schedule_run is not None:
@@ -404,6 +410,10 @@ class OneRunApplication:
                     outcome="published",
                 )
                 return self._archive(repository, bundle, profile_lease=profile_lease)
+            if request.archive_only:
+                return _outcome(
+                    "deferred", bundle, "remaining_deliveries_require_dispatch"
+                )
 
             selected = _find_stored_source(profile, bundle)
             if selected is None:
@@ -442,6 +452,10 @@ class OneRunApplication:
                 delivery
                 for delivery in deliveries
                 if _delivery_is_due(delivery, self._clock())
+                and (
+                    request.only_platform is None
+                    or delivery.platform == request.only_platform
+                )
             )
             if not required:
                 return _outcome("deferred", bundle, "retry_not_due")

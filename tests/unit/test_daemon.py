@@ -165,9 +165,13 @@ def test_callback_failure_is_durable_and_worker_continues(tmp_path: Path) -> Non
         continued.set()
 
     daemon = ForegroundDaemon(
-        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
         recovery=lambda: (_ for _ in ()).throw(ValueError("secret-value")),
-        schedule_admission=schedule, poll_seconds=0.01,
+        schedule_admission=schedule,
+        poll_seconds=0.01,
         server_factory=lambda *args: _Server(*args),
     )
     try:

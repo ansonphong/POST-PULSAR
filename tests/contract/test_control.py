@@ -19,21 +19,207 @@ from post_pulsar.control import (
 from post_pulsar.state import ProfileTargetSnapshot, StateRepository
 
 
-@pytest.mark.parametrize("path,arguments", [
-    ("pause", {"unexpected": True}),
-    ("schedules", {}),
-    ("schedules", {"schedule_id": "bad", "bucket": "QUEUE", "timezone": "UTC",
-                   "weekdays": [True], "local_time": "12:00", "misfire_grace_seconds": 60, "enabled": False}),
-])
-def test_malformed_action_rejected_before_durable_admission(tmp_path: Path, path: str, arguments: dict) -> None:
+@pytest.mark.parametrize(
+    "path,arguments",
+    [
+        ("pause", {"unexpected": True}),
+        ("schedules", {}),
+        (
+            "schedules",
+            {
+                "schedule_id": "bad",
+                "bucket": "QUEUE",
+                "timezone": "UTC",
+                "weekdays": [True],
+                "local_time": "12:00",
+                "misfire_grace_seconds": 60,
+                "enabled": False,
+            },
+        ),
+    ],
+)
+def test_malformed_action_rejected_before_durable_admission(
+    tmp_path: Path, path: str, arguments: dict
+) -> None:
     app = _application(tmp_path)
     token = (tmp_path / "agent").read_text().strip()
-    response = _call(app, "POST", "/control/v1/" + path, token=token,
-                     body={"profile_id": "profile", "arguments": arguments},
-                     headers={"Idempotency-Key": "malformed", "If-Match": "1"})
-    assert response.status == 400
+    response = _call(
+        app,
+        "POST",
+        "/control/v1/" + path,
+        token=token,
+        body={"profile_id": "profile", "arguments": arguments},
+        headers={"Idempotency-Key": "malformed", "If-Match": "1"},
+    )
+    assert response.status == 422
     with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
         assert repository.claim_next_run_request("worker") is None
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "admit_draft",
+        "enqueue",
+        "run_now",
+        "publish_now",
+        "pause",
+        "resume",
+        "schedule_create",
+        "schedule_update",
+        "schedule_enable",
+        "schedule_disable",
+        "cancel",
+        "delete",
+        "retry",
+        "reconcile",
+        "edit_caption",
+        "edit_alt",
+    ],
+)
+def test_every_action_has_matching_schema_and_durable_admission(
+    tmp_path: Path, action: str
+) -> None:
+    from PIL import Image
+    from post_pulsar.state import (
+        BundleFileSnapshot,
+        TargetSnapshot,
+        REQUEST_ARGUMENT_SCHEMAS,
+    )
+
+    app = _application(tmp_path, allow_publish=True)
+    token = (tmp_path / "agent").read_text().strip()
+    values = {
+        "bucket": "QUEUE",
+        "bundle_id": "post",
+        "fingerprint": "b" * 64,
+        "trigger_id": "exact",
+        "platform": "x",
+        "published_remote_id": "remote",
+        "schedule_id": "morning",
+        "timezone": "UTC",
+        "weekdays": [0, 2],
+        "local_time": "12:00",
+        "misfire_grace_seconds": 60,
+        "enabled": False,
+        "text": "caption",
+    }
+    arguments = {
+        field: values[field] for field in REQUEST_ARGUMENT_SCHEMAS[action]["required"]
+    }
+    body = {"profile_id": "profile", "arguments": arguments}
+    with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+        if action in {
+            "enqueue",
+            "run_now",
+            "publish_now",
+            "cancel",
+            "delete",
+            "retry",
+            "reconcile",
+        }:
+            key = repository.add_bundle(
+                profile_id="profile",
+                bundle_id="post",
+                fingerprint="b" * 64,
+                source_bucket="QUEUE",
+                files=(
+                    BundleFileSnapshot(
+                        "post.jpg", "image", None, "image", "image/jpeg", 1, "a" * 64
+                    ),
+                ),
+                targets=(
+                    TargetSnapshot("x", "1", "profile", "TOKEN_REFERENCE", "2", 1, {}),
+                ),
+            )
+            body.update(bundle_key=key, fingerprint="b" * 64)
+        if action in {"schedule_update", "schedule_enable", "schedule_disable"}:
+            schedule = repository.create_schedule(
+                profile_id="profile",
+                schedule_id="morning",
+                bucket="QUEUE",
+                timezone="UTC",
+                weekdays=[0],
+                local_time="12:00",
+                misfire_grace_seconds=60,
+                enabled=False,
+            )
+            body.update(schedule_key=schedule.schedule_key)
+            if action == "schedule_enable":
+                body["fingerprint"] = schedule.config_hash
+    direct = {
+        "pause": ("POST", "/pause"),
+        "resume": ("POST", "/resume"),
+        "schedule_create": ("POST", "/schedules"),
+        "schedule_update": ("PATCH", "/schedules/1"),
+        "schedule_disable": ("POST", "/schedules/1/disable"),
+    }
+    if action in {"edit_caption", "edit_alt"}:
+        drafts = tmp_path / "account/DRAFTS"
+        drafts.mkdir(parents=True)
+        Image.new("RGB", (8, 8)).save(drafts / "post.jpg")
+        (drafts / "post.txt").write_text("original")
+        body = {"text": "caption"}
+        method, route = (
+            "PATCH",
+            "/profiles/profile/buckets/DRAFTS/bundles/post/"
+            + ("caption" if action == "edit_caption" else "alt"),
+        )
+    elif action in direct:
+        method, route = direct[action]
+    else:
+        method, route = "POST", "/confirmations"
+        body.update(
+            action=action, resource_revision=1, consequence="Authorize exact action."
+        )
+        if action == "admit_draft":
+            body["fingerprint"] = "b" * 64
+        document = json.loads(
+            (Path(__file__).parents[2] / "api/control-v1.openapi.json").read_text()
+        )
+        Draft202012Validator(
+            document["components"]["schemas"]["Confirmation"]
+        ).validate(body)
+    malformed = json.loads(json.dumps(body))
+    if "arguments" in malformed:
+        malformed["arguments"]["unexpected"] = True
+    else:
+        malformed["text"] = 1
+    rejected = _call(
+        app,
+        method,
+        "/control/v1" + route,
+        token=token,
+        body=malformed,
+        headers={"Idempotency-Key": "invalid", "If-Match": "1"},
+    )
+    assert rejected.status == 422
+    response = _call(
+        app,
+        method,
+        "/control/v1" + route,
+        token=token,
+        body=body,
+        headers={"Idempotency-Key": "valid", "If-Match": "1"},
+    )
+    assert response.status == (201 if route == "/confirmations" else 202), response.body
+    if route == "/confirmations":
+        intent = json.loads(response.body)["data"]
+        with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+            repository.approve_confirmation_intent(
+                intent["intent_id"], expected_revision=1
+            )
+        del body["consequence"]
+        response = _call(
+            app,
+            "POST",
+            f"/control/v1/confirmations/{intent['intent_id']}/consume",
+            token=token,
+            body=body,
+            headers={"Idempotency-Key": "consume", "If-Match": "1"},
+        )
+        assert response.status == 202, response.body
+    assert json.loads(response.body)["data"]["action"] == action
 
 
 def _application(tmp_path: Path, *, allow_publish: bool = False) -> ControlApplication:
@@ -126,7 +312,13 @@ def test_writes_need_revision_idempotency_and_publish_permission(
             "action": "run_now",
             "profile_id": "profile",
             "resource_revision": 1,
-            "arguments": {},
+            "arguments": {
+                "bucket": "QUEUE",
+                "bundle_id": "post",
+                "fingerprint": "a" * 64,
+                "trigger_id": "exact",
+            },
+            "consequence": "Publish exact content.",
         },
         headers={"Idempotency-Key": "intent-1", "If-Match": '"1"'},
     )
@@ -315,7 +507,12 @@ def test_openapi_is_authoritative_and_has_every_operation() -> None:
             "resource_revision": 1,
             "bundle_key": 1,
             "fingerprint": "a" * 64,
-            "arguments": {},
+            "arguments": {
+                "bucket": "QUEUE",
+                "bundle_id": "post",
+                "fingerprint": "a" * 64,
+                "trigger_id": "exact",
+            },
             "consequence": "Publish the exact bundle.",
         }
     )

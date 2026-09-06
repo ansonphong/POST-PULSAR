@@ -13,6 +13,7 @@ import re
 import signal
 import stat
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
@@ -1185,29 +1186,47 @@ def _daemon_foreground(
         with StateRepository.open_existing(database, clock=clock) as repository:
             repository.recover_claimed_run_requests(holder["daemon"]._worker_token)
             for profile in settings.profiles:
-                DraftAdmissionService(repository, profile.account_root).recover()
+                try:
+                    DraftAdmissionService(repository, profile.account_root).recover()
+                except Exception:
+                    repository.record_callback_failure(
+                        phase="admission", profile_id=profile.profile_id
+                    )
                 protected.extend(repository.list_protected_bundles(profile.profile_id))
         daemon = holder["daemon"]
         lease = daemon._lease
         if lease is None:
             raise StateError("daemon instance lease is unavailable")
         for bundle in protected:
-            OneRunApplication(
-                settings.config_path,
-                locks=daemon._locks,
-                instance_lease=lease,
-                environ=environ,
-                clock=clock,
-                adapter_factory=adapter_factory,
-            ).run_once(
-                RunOnceRequest(
-                    bundle.profile_id,
-                    bundle.source_bucket,
-                    f"daemon-recovery-{bundle.bundle_key}",
-                    expected_bundle_key=bundle.bundle_key,
-                    expected_fingerprint=bundle.fingerprint,
-                )
-            )
+
+            def recover_bundle() -> None:
+                try:
+                    OneRunApplication(
+                        settings.config_path,
+                        locks=daemon._locks,
+                        instance_lease=lease,
+                        environ=environ,
+                        clock=clock,
+                        adapter_factory=adapter_factory,
+                    ).run_once(
+                        RunOnceRequest(
+                            bundle.profile_id,
+                            bundle.source_bucket,
+                            f"daemon-recovery-{bundle.bundle_key}",
+                            expected_bundle_key=bundle.bundle_key,
+                            expected_fingerprint=bundle.fingerprint,
+                        )
+                    )
+                except Exception:
+                    with StateRepository.open_existing(
+                        database, clock=clock
+                    ) as repository:
+                        repository.record_callback_failure(
+                            phase="recovery", bundle_key=bundle.bundle_key
+                        )
+
+            if not daemon.dispatch_if_running(recover_bundle):
+                break
 
     def admit_schedules() -> None:
         from post_pulsar.scheduler import DeterministicScheduler
@@ -1219,21 +1238,36 @@ def _daemon_foreground(
         if lease is None:
             raise StateError("daemon instance lease is unavailable")
         for item in work:
-            OneRunApplication(
-                settings.config_path,
-                locks=daemon._locks,
-                instance_lease=lease,
-                environ=environ,
-                clock=clock,
-                adapter_factory=adapter_factory,
-            ).run_once(
-                RunOnceRequest(
-                    item.profile_id,
-                    item.bucket,
-                    f"schedule-{item.run_id}",
-                    schedule_run_id=item.run_id,
-                )
-            )
+
+            def dispatch_occurrence() -> None:
+                try:
+                    OneRunApplication(
+                        settings.config_path,
+                        locks=daemon._locks,
+                        instance_lease=lease,
+                        environ=environ,
+                        clock=clock,
+                        adapter_factory=adapter_factory,
+                    ).run_once(
+                        RunOnceRequest(
+                            item.profile_id,
+                            item.bucket,
+                            f"schedule-{item.run_id}",
+                            schedule_run_id=item.run_id,
+                        )
+                    )
+                except Exception:
+                    with StateRepository.open_existing(
+                        database, clock=clock
+                    ) as repository:
+                        repository.record_callback_failure(
+                            phase="schedule",
+                            run_id=item.run_id,
+                            profile_id=item.profile_id,
+                        )
+
+            if not daemon.dispatch_if_running(dispatch_occurrence):
+                break
 
     def execute(request: RunRequestRecord) -> Mapping[str, object]:
         return _execute_daemon_request(
@@ -1438,11 +1472,10 @@ def _execute_daemon_request(
                 expected_bundle_revision=request.expected_revision,
                 validated_snapshot=snapshot,
             )
-            return _delivery_document(delivery)
         if request.action == "reconcile":
             if request.bundle_key is None:
                 raise StateError("reconcile request lost its exact resource")
-            _assert_request_bundle_identity(repository, request)
+            bundle = _assert_request_bundle_identity(repository, request)
             platform = _request_platform(request)
             remote_id = request.arguments.get("published_remote_id")
             if remote_id is not None and not isinstance(remote_id, str):
@@ -1453,7 +1486,28 @@ def _execute_daemon_request(
                 published_remote_id=remote_id,
                 expected_bundle_revision=request.expected_revision,
             )
-            return _delivery_document(delivery)
+            if remote_id is None:
+                return _delivery_document(delivery)
+    if request.action in {"retry", "reconcile"}:
+        outcome = OneRunApplication(
+            settings.config_path,
+            locks=daemon._locks,
+            instance_lease=lease,
+            environ=environ,
+            clock=clock,
+            adapter_factory=adapter_factory,
+        ).run_once(
+            RunOnceRequest(
+                request.profile_id,
+                bundle.source_bucket,
+                f"operator-{request.request_id}",
+                expected_bundle_key=bundle.bundle_key,
+                expected_fingerprint=bundle.fingerprint,
+                only_platform=platform if request.action == "retry" else None,
+                archive_only=request.action == "reconcile",
+            )
+        )
+        return _run_result(outcome)
     raise StateError("daemon request action is unsupported")
 
 
@@ -1477,16 +1531,24 @@ def _edit_draft_text(
     suffix = ".txt" if request.action == "edit_caption" else "-alt.txt"
     destination = drafts / f"{matches[0].bundle_id}{suffix}"
     payload = cast(str, request.arguments["text"]).encode("utf-8")
-    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(destination, flags)
+        original = destination.lstat()
     except FileNotFoundError:
-        descriptor = os.open(destination, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        original = None
+    if original is not None and (
+        not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
+    ):
+        raise StateError("draft text member is unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".draft-edit-", dir=drafts)
+    temporary = Path(temporary_name)
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise StateError("draft text member is unsafe")
-        os.ftruncate(descriptor, 0)
+        if os.name == "nt":
+            from post_pulsar.secure_files import _windows_secure, _windows_validate
+
+            _windows_secure(temporary, False)
+            _windows_validate(temporary)
+        else:
+            os.fchmod(descriptor, 0o600)
         remaining = memoryview(payload)
         while remaining:
             written = os.write(descriptor, remaining)
@@ -1494,8 +1556,38 @@ def _edit_draft_text(
                 raise StateError("draft text edit could not make progress")
             remaining = remaining[written:]
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
+        descriptor = -1
+        current = [
+            item
+            for item in scan_inbox(drafts).bundles
+            if item.bundle_id == matches[0].bundle_id
+        ]
+        if len(current) != 1 or current[0].fingerprint != matches[0].fingerprint:
+            raise ConflictError("draft identity changed during edit")
+        try:
+            latest = destination.lstat()
+        except FileNotFoundError:
+            latest = None
+        if original != latest:
+            raise ConflictError("draft text identity changed during edit")
+        if latest is not None:
+            source_fd = os.open(destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if os.fstat(source_fd) != original:
+                    raise ConflictError(
+                        "draft text identity changed before replacement"
+                    )
+            finally:
+                os.close(source_fd)
+        os.replace(temporary, destination)
+        from post_pulsar.secure_files import fsync_directory
+
+        fsync_directory(drafts)
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
     edited = [
         item
         for item in scan_inbox(drafts).bundles

@@ -8,6 +8,7 @@ import hashlib
 import os
 import shutil
 import stat
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Final, cast
@@ -266,19 +267,18 @@ def _copy_exact(source: Path, destination: Path, sha256: str, size_bytes: int) -
 
 
 def _secure_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = path.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise AdmissionError("admission directory is unsafe")
-    path.chmod(0o700)
+    from post_pulsar.secure_files import SecureFileError, secure_directory
+
+    try:
+        secure_directory(path)
+    except (OSError, SecureFileError):
+        raise AdmissionError("admission directory is unsafe") from None
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    from post_pulsar.secure_files import fsync_directory
+
+    fsync_directory(path)
 
 
 def _no_follow() -> int:
@@ -295,6 +295,16 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
             raise ConflictError("admission destination already exists") from None
         return
     libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        renamex = libc.renamex_np
+        renamex.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        renamex.restype = ctypes.c_int
+        result = renamex(os.fsencode(source), os.fsencode(destination), 4)
+        if result == 0:
+            return
+        if ctypes.get_errno() in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise ConflictError("admission destination already exists")
+        raise AdmissionError("atomic admission install failed")
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
         raise AdmissionError("atomic no-replace rename is unavailable")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -104,29 +103,15 @@ def write_bootstrap(
     destination = Path(path)
     record = validate_bootstrap(value)
     _assert_safe_target(destination, allow_missing=True)
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    parent = destination.parent.lstat()
-    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-        raise BootstrapError("bootstrap directory is unsafe")
-    if os.name != "nt":
-        destination.parent.chmod(0o700)
-    temporary = destination.parent / f".{destination.name}.{secrets.token_hex(8)}"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    from post_pulsar.secure_files import SecureFileError, atomic_owner_write
+
     try:
         payload = (
             json.dumps(record.document(), sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, destination)
-        if os.name != "nt":
-            destination.chmod(0o600)
-        _fsync_parent(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+        atomic_owner_write(destination, payload)
+    except (OSError, SecureFileError):
+        raise BootstrapError("bootstrap target is unsafe") from None
     return record
 
 
@@ -144,6 +129,12 @@ def load_bootstrap(path: str | Path) -> BootstrapRecord:
 
 
 def _assert_safe_target(path: Path, *, allow_missing: bool) -> None:
+    from post_pulsar.secure_files import SecureFileError, assert_owner_file
+
+    try:
+        assert_owner_file(path, allow_missing=allow_missing)
+    except (OSError, SecureFileError):
+        raise BootstrapError("bootstrap target is unsafe or missing") from None
     try:
         metadata = path.lstat()
     except FileNotFoundError:

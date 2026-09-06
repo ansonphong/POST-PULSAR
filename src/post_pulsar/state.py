@@ -105,6 +105,7 @@ _EVENT_TYPES: Final = frozenset(
         "bundle_cancelled",
         "bundle_deleted",
         "warning",
+        "callback_failed",
     }
 )
 _REQUEST_ACTIONS: Final = frozenset(
@@ -167,6 +168,145 @@ _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SCHEDULE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
+
+# The HTTP schema and durable validation share the same action argument contract.
+_ARGUMENT_FIELDS: Final = {
+    "bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
+    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "bucket": {"type": "string", "enum": ["QUEUE", "RANDOM", "REELS"]},
+    "trigger_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+    "platform": {"type": "string", "enum": ["x", "instagram"]},
+    "published_remote_id": {
+        "type": ["string", "null"],
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    },
+    "schedule_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "timezone": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "format": "iana-timezone",
+    },
+    "weekdays": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 7,
+        "uniqueItems": True,
+        "items": {"type": "integer", "minimum": 0, "maximum": 6},
+    },
+    "local_time": {"type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"},
+    "misfire_grace_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
+    "enabled": {"type": "boolean"},
+    "text": {"type": "string", "maxLength": 10000},
+}
+_ACTION_FIELDS: Final = {
+    "admit_draft": ("bucket", "bundle_id"),
+    "enqueue": ("bucket", "bundle_id", "fingerprint", "trigger_id"),
+    "run_now": ("bucket", "bundle_id", "fingerprint", "trigger_id"),
+    "publish_now": ("bucket", "bundle_id", "fingerprint", "trigger_id"),
+    "pause": (),
+    "resume": (),
+    "schedule_enable": (),
+    "schedule_disable": (),
+    "schedule_create": (
+        "schedule_id",
+        "bucket",
+        "timezone",
+        "weekdays",
+        "local_time",
+        "misfire_grace_seconds",
+        "enabled",
+    ),
+    "schedule_update": (
+        "schedule_id",
+        "bucket",
+        "timezone",
+        "weekdays",
+        "local_time",
+        "misfire_grace_seconds",
+        "enabled",
+    ),
+    "cancel": ("bundle_id", "fingerprint"),
+    "delete": ("bundle_id", "fingerprint"),
+    "retry": ("bundle_id", "fingerprint", "platform"),
+    "reconcile": ("bundle_id", "fingerprint", "platform", "published_remote_id"),
+    "edit_caption": ("bucket", "bundle_id", "fingerprint", "text"),
+    "edit_alt": ("bucket", "bundle_id", "fingerprint", "text"),
+}
+REQUEST_ARGUMENT_SCHEMAS: Final = {
+    action: {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(fields),
+        "properties": {
+            field: (
+                {"const": "DRAFTS"}
+                if field == "bucket" and action in {"edit_caption", "edit_alt"}
+                else _ARGUMENT_FIELDS[field]
+            )
+            for field in fields
+        },
+    }
+    for action, fields in _ACTION_FIELDS.items()
+}
+
+
+def validate_action_arguments(action: str, arguments: object) -> None:
+    schema = REQUEST_ARGUMENT_SCHEMAS.get(action)
+    if (
+        schema is None
+        or not isinstance(arguments, dict)
+        or set(arguments) != set(schema["required"])
+    ):
+        raise StateValidationError("action arguments do not match the exact contract")
+    for field, value in arguments.items():
+        _validate_argument_value(value, schema["properties"][field])
+    if action in {"schedule_create", "schedule_update"}:
+        _validate_timezone(arguments["timezone"])
+
+
+def _validate_argument_value(value: object, schema: Mapping[str, object]) -> None:
+    if "const" in schema:
+        valid = value == schema["const"]
+    else:
+        types = schema["type"]
+        allowed = [types] if isinstance(types, str) else types
+        kind = (
+            "null"
+            if value is None
+            else {str: "string", int: "integer", bool: "boolean", list: "array"}.get(
+                type(value)
+            )
+        )
+        valid = kind in allowed
+    if not valid:
+        raise StateValidationError("action argument type is invalid")
+    if value is None:
+        return
+    if "enum" in schema and value not in schema["enum"]:
+        raise StateValidationError("action argument value is invalid")
+    if isinstance(value, str):
+        if (
+            not schema.get("minLength", 0)
+            <= len(value)
+            <= schema.get("maxLength", 10000)
+        ):
+            raise StateValidationError("action argument length is invalid")
+        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+            raise StateValidationError("action argument format is invalid")
+    if type(value) is int and not schema.get("minimum", 0) <= value <= schema.get(
+        "maximum", 86400
+    ):
+        raise StateValidationError("action argument bound is invalid")
+    if isinstance(value, list):
+        if not schema["minItems"] <= len(value) <= schema["maxItems"]:
+            raise StateValidationError("action argument array length is invalid")
+        for item in value:
+            _validate_argument_value(item, schema["items"])
+        if schema.get("uniqueItems") and len(set(value)) != len(value):
+            raise StateValidationError("action argument array contains duplicates")
+
+
 _MIME_TYPE_RE: Final = re.compile(
     r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}\Z"
 )
@@ -722,7 +862,13 @@ class StateRepository:
             )
         self.path = Path(database_path)
         if not _existing_only:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            from post_pulsar.secure_files import secure_directory
+
+            secure_directory(self.path.parent)
+        elif os.name == "nt":
+            from post_pulsar.secure_files import _windows_validate
+
+            _windows_validate(self.path.parent)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._secrets = tuple(value for value in secret_values if value)
         expected_identity: os.stat_result | None = None
@@ -2830,6 +2976,7 @@ class StateRepository:
                 f"operator_retry:{int(delivery['attempt_count'])}",
                 {},
             )
+            self._synchronize_bundle_occurrences_locked(bundle_key)
         return self.get_delivery(bundle_key, platform)
 
     def operator_reconcile(
@@ -2910,7 +3057,108 @@ class StateRepository:
                 f"delivery_reconciled:{int(delivery['attempt_count'])}",
                 {"resolution": resolution},
             )
+            self._synchronize_bundle_occurrences_locked(bundle_key)
         return self.get_delivery(bundle_key, platform)
+
+    def _synchronize_bundle_occurrences_locked(self, bundle_key: int) -> None:
+        bundle = self._bundle_row(bundle_key)
+        statuses = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT status FROM deliveries WHERE bundle_key = ?", (bundle_key,)
+            )
+        }
+        if "ambiguous" in statuses:
+            state = "ambiguous"
+        elif str(bundle["status"]) == "archived" and statuses == {"published"}:
+            state = "completed"
+        elif "failed" in statuses or str(bundle["status"]) == "blocked":
+            state = "failed"
+        else:
+            state = "dispatching"
+        self._connection.execute(
+            "UPDATE schedule_runs SET state = ?, revision = revision + 1, updated_at = ? "
+            "WHERE bundle_key = ? AND state IN ('dispatching', 'failed', 'ambiguous') AND state != ?",
+            (state, self._now_text(), bundle_key, state),
+        )
+
+    def synchronize_bundle_occurrences(self, bundle_key: int) -> None:
+        with self._transaction():
+            self._synchronize_bundle_occurrences_locked(bundle_key)
+
+    def record_callback_failure(
+        self,
+        *,
+        phase: str,
+        bundle_key: int | None = None,
+        run_id: int | None = None,
+        profile_id: str | None = None,
+    ) -> None:
+        """Fail closed at a callback boundary without storing exception text."""
+        if phase not in {"recovery", "schedule", "admission"}:
+            raise StateValidationError("callback phase is invalid")
+        with self._transaction():
+            if run_id is not None:
+                run = self._schedule_run_row(run_id)
+                bundle_key = cast(int | None, run["bundle_key"])
+                self._connection.execute(
+                    "UPDATE schedule_runs SET state = 'failed', revision = revision + 1, updated_at = ? "
+                    "WHERE run_id = ? AND state IN ('queued', 'due', 'dispatching', 'failed')",
+                    (self._now_text(), run_id),
+                )
+            if bundle_key is not None:
+                bundle = self._bundle_row(bundle_key)
+                deliveries = tuple(
+                    self._connection.execute(
+                        "SELECT * FROM deliveries WHERE bundle_key = ?", (bundle_key,)
+                    )
+                )
+                for delivery in deliveries:
+                    if (
+                        str(delivery["status"]) == "in_flight"
+                        and str(delivery["phase"]) == "final_dispatch_started"
+                    ):
+                        self._mark_ambiguous_locked(
+                            bundle_key,
+                            cast(Platform, delivery["platform"]),
+                            "callback_failed",
+                            "Callback interrupted final dispatch; operator evidence required.",
+                            claim_token=str(delivery["claim_token"]),
+                            attempt_count=int(delivery["attempt_count"]),
+                        )
+                    elif str(delivery["status"]) in {"pending", "in_flight"}:
+                        self._connection.execute(
+                            "UPDATE deliveries SET status = 'failed', safe_to_retry = 0, next_attempt_at = NULL, "
+                            "claim_token = NULL, error_code = 'callback_failed', error_message = 'Callback failed before publication.', "
+                            "revision = revision + 1, updated_at = ? WHERE bundle_key = ? AND platform = ?",
+                            (self._now_text(), bundle_key, str(delivery["platform"])),
+                        )
+                if str(bundle["status"]) == "active" and any(
+                    str(item["status"]) != "published" for item in deliveries
+                ):
+                    self._block_bundle_locked(bundle_key, "callback_failed")
+                self._synchronize_bundle_occurrences_locked(bundle_key)
+            self._insert_event_locked(
+                bundle_key,
+                None,
+                "callback_failed",
+                "callback_failed",
+                {"phase": phase, "run_id": run_id, "profile_id": profile_id},
+                dedupe_key=_sha256_text(
+                    f"callback:{phase}:{bundle_key}:{run_id}:{profile_id}"
+                ),
+            )
+
+    def control_events(self, *, limit: int = 100) -> tuple[Mapping[str, object], ...]:
+        if not 1 <= limit <= 500:
+            raise StateValidationError("event limit is invalid")
+        return tuple(
+            {"event_code": row[0], "details": json.loads(row[1])}
+            for row in self._connection.execute(
+                "SELECT event_code, safe_detail_json FROM events WHERE event_type = 'callback_failed' ORDER BY event_id DESC LIMIT ?",
+                (limit,),
+            )
+        )
 
     def record_warning(
         self,
@@ -3446,6 +3694,7 @@ class StateRepository:
             "JOIN schedules s ON s.schedule_key = sr.schedule_key "
             "JOIN bundles b ON b.bundle_key = sr.bundle_key "
             "WHERE sr.state IN ('dispatching', 'failed') "
+            "AND b.status IN ('active', 'archiving', 'archived') "
             "AND NOT EXISTS (SELECT 1 FROM deliveries da "
             "WHERE da.bundle_key = sr.bundle_key AND da.status = 'ambiguous') "
             "AND (b.status = 'archiving' OR NOT EXISTS ("
@@ -3735,7 +3984,15 @@ class StateRepository:
         """Resolve dead-incarnation claims before accepting new work."""
 
         _validate_identifier(current_worker_token, "worker token")
-        unsafe = {"enqueue", "run_now", "publish_now"}
+        unsafe = {
+            "enqueue",
+            "run_now",
+            "publish_now",
+            "edit_caption",
+            "edit_alt",
+            "retry",
+            "reconcile",
+        }
         recovered: list[int] = []
         with self._transaction():
             rows = tuple(
@@ -4495,6 +4752,10 @@ class StateRepository:
         else:
             raise StateValidationError("run request action is not allow-listed")
 
+        validate_action_arguments(action, arguments)
+        if action == "run_now" and bundle_key is None:
+            raise StateValidationError("run-now requires an exact bundle resource")
+
         if action in {"cancel", "delete", "retry", "reconcile"}:
             required = {"bundle_id", "fingerprint"}
             if action in {"retry", "reconcile"}:
@@ -4546,13 +4807,26 @@ class StateRepository:
             and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id
         ):
             raise ConflictError("run request bundle belongs to another profile")
-        if action in {"cancel", "delete", "retry", "reconcile"}:
+        if action in {
+            "cancel",
+            "delete",
+            "retry",
+            "reconcile",
+            "enqueue",
+            "run_now",
+            "publish_now",
+        }:
             exact_bundle = self._bundle_row(cast(int, bundle_key))
             if (
                 str(exact_bundle["bundle_id"]) != arguments["bundle_id"]
                 or str(exact_bundle["fingerprint"]) != arguments["fingerprint"]
             ):
                 raise ConflictError("run request exact bundle identity drift")
+            if (
+                "bucket" in arguments
+                and str(exact_bundle["source_bucket"]) != arguments["bucket"]
+            ):
+                raise ConflictError("run request exact bundle bucket drift")
         if (
             schedule_key is not None
             and str(self._schedule_row(schedule_key)["profile_id"]) != profile_id

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import signal
@@ -46,6 +47,9 @@ class EndpointRecord:
     @classmethod
     def read(cls, path: str | Path) -> EndpointRecord:
         source = Path(path)
+        from post_pulsar.secure_files import assert_owner_file
+
+        assert_owner_file(source)
         metadata = source.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("endpoint record is unsafe")
@@ -66,35 +70,13 @@ class EndpointRecord:
         return cls(**value)
 
     def write(self, path: str | Path) -> None:
+        from post_pulsar.secure_files import atomic_owner_write
+
         destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        destination.parent.chmod(0o700)
-        try:
-            existing = destination.lstat()
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and (
-            stat.S_ISLNK(existing.st_mode)
-            or not stat.S_ISREG(existing.st_mode)
-            or existing.st_nlink != 1
-            or existing.st_mode & 0o077
-        ):
-            raise RuntimeError("endpoint record replacement is unsafe")
-        temporary = destination.parent / f".{destination.name}.{secrets.token_hex(8)}"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            payload = (
-                json.dumps(asdict(self), sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode()
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, destination)
-        if destination.lstat().st_nlink != 1:
-            raise RuntimeError("endpoint record replacement is unsafe")
-        destination.chmod(0o600)
-        _fsync_parent(destination)
+        payload = (
+            json.dumps(asdict(self), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        atomic_owner_write(destination, payload)
 
 
 class ForegroundDaemon:
@@ -159,10 +141,11 @@ class ForegroundDaemon:
         lease = self._locks.acquire_instance()
         self._lease = lease
         try:
+            self._stop.clear()
             if self._recovery is not None:
-                self._recovery()
+                self._invoke_callback("recovery", self._recovery)
             if self._schedule_admission is not None:
-                self._schedule_admission()
+                self._invoke_callback("schedule", self._schedule_admission)
             if self._endpoint.exists():
                 existing = EndpointRecord.read(self._endpoint)
                 if _record_process_is_live(existing):
@@ -182,7 +165,6 @@ class ForegroundDaemon:
                 },
             )
             record.write(self._endpoint)
-            self._stop.clear()
             self._http_thread = threading.Thread(
                 target=self._server.serve_forever,
                 name="post-pulsar-control",
@@ -209,7 +191,8 @@ class ForegroundDaemon:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous[signum] = signal.signal(signum, request_stop)
         try:
-            stopped.wait()
+            while not stopped.wait(0.1) and not self._stop.is_set():
+                continue
         finally:
             self.stop()
             for signum, handler in previous.items():
@@ -230,10 +213,39 @@ class ForegroundDaemon:
         self._cleanup_runtime()
 
     def _worker(self) -> None:
+        try:
+            self._worker_loop()
+        except Exception:
+            logging.getLogger(__name__).error("publisher_worker_stopped")
+        finally:
+            # A persistence failure cannot leave a healthy-looking HTTP service
+            # accepting work with no publisher to process it.
+            self._stop.set()
+            if self._server is not None:
+                self._server.shutdown()
+
+    def dispatch_if_running(self, callback: Callable[[], object]) -> bool:
+        """Commit one start decision under the same gate used by shutdown."""
+        with self._claim_gate:
+            if self._stop.is_set():
+                return False
+        callback()
+        return True
+
+    def _invoke_callback(self, phase: str, callback: Callable[[], object]) -> None:
+        try:
+            self.dispatch_if_running(callback)
+        except Exception:
+            with StateRepository.open_existing(
+                self._state / "post_pulsar.sqlite3"
+            ) as repository:
+                repository.record_callback_failure(phase=phase)
+
+    def _worker_loop(self) -> None:
         database = self._state / "post_pulsar.sqlite3"
         while not self._stop.is_set():
             if self._schedule_admission is not None:
-                self._schedule_admission()
+                self._invoke_callback("schedule", self._schedule_admission)
             if self._stop.is_set():
                 break
             if self._executor is None or not database.exists():
@@ -377,11 +389,9 @@ def _record_process_is_live(record: EndpointRecord) -> bool:
 
 
 def _fsync_parent(path: Path) -> None:
-    descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    from post_pulsar.secure_files import fsync_directory
+
+    fsync_directory(path.parent)
 
 
 __all__ = ["EndpointRecord", "ForegroundDaemon"]
