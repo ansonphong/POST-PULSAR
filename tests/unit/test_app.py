@@ -359,6 +359,100 @@ def test_run_once_preflights_every_target_before_any_prepare_or_commit(
     instance.release()
 
 
+def test_scheduled_run_marks_no_content_without_changing_manual_empty_behavior(
+    tmp_path: Path,
+) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    with StateRepository.open_existing(database, clock=lambda: NOW) as repo:
+        schedule = repo.create_schedule(
+            profile_id="operator",
+            schedule_id="morning",
+            bucket="QUEUE",
+            timezone="UTC",
+            weekdays=(5,),
+            local_time="12:00",
+            misfire_grace_seconds=60,
+            enabled=True,
+        )
+        queued = repo.create_schedule_occurrence(
+            schedule.schedule_key,
+            local_date=NOW.date().isoformat(),
+            scheduled_at=NOW,
+            utc_offset_minutes=0,
+            schedule_hash=schedule.config_hash,
+        )
+        due = repo.transition_schedule_run(
+            queued.run_id, "due", expected_revision=queued.revision
+        )
+
+    app = OneRunApplication(
+        config,
+        locks=locks,
+        instance_lease=instance,
+        environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
+        clock=lambda: NOW,
+    )
+    scheduled = app.run_once(
+        RunOnceRequest("operator", "QUEUE", "scheduled", due.run_id)
+    )
+    manual = app.run_once(RunOnceRequest("operator", "QUEUE", "manual-empty"))
+
+    assert scheduled.status == "empty"
+    assert manual.status == "empty"
+    with StateRepository.open_existing(database, clock=lambda: NOW) as repo:
+        assert repo.get_schedule_run(due.run_id).state == "no_content"
+    instance.release()
+
+
+def test_scheduled_run_atomically_links_content_and_completes_after_archive(
+    tmp_path: Path,
+) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    _bundle(tmp_path, "scheduled-post")
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    with StateRepository.open_existing(database, clock=lambda: NOW) as repo:
+        schedule = repo.create_schedule(
+            profile_id="operator",
+            schedule_id="morning-publish",
+            bucket="QUEUE",
+            timezone="UTC",
+            weekdays=(5,),
+            local_time="12:00",
+            misfire_grace_seconds=60,
+            enabled=True,
+        )
+        queued = repo.create_schedule_occurrence(
+            schedule.schedule_key,
+            local_date=NOW.date().isoformat(),
+            scheduled_at=NOW,
+            utc_offset_minutes=0,
+            schedule_hash=schedule.config_hash,
+        )
+        due = repo.transition_schedule_run(
+            queued.run_id, "due", expected_revision=queued.revision
+        )
+    adapters: list[FakeAdapter] = []
+    outcome = OneRunApplication(
+        config,
+        locks=locks,
+        instance_lease=instance,
+        environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
+        clock=lambda: NOW,
+        adapter_factory=_factory(adapters),
+    ).run_once(RunOnceRequest("operator", "QUEUE", "ignored", due.run_id))
+
+    assert outcome.status == "archived"
+    with StateRepository.open_existing(database, clock=lambda: NOW) as repo:
+        completed = repo.get_schedule_run(due.run_id)
+        assert completed.state == "completed"
+        assert completed.bundle_key == outcome.bundle_key
+        bundle = repo.get_bundle(cast(int, completed.bundle_key))
+        assert bundle.claimed_by_type == "schedule"
+        assert bundle.claimed_by_id == str(due.run_id)
+    instance.release()
+
+
 def test_peer_preflight_failure_restores_resumed_remote_attempt(
     tmp_path: Path,
 ) -> None:

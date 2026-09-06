@@ -2064,6 +2064,135 @@ def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> N
     )
 
 
+def test_scheduled_admission_is_atomic_and_only_one_simultaneous_run_wins(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    schedules = tuple(
+        repository.create_schedule(
+            profile_id="ansonphong",
+            schedule_id=schedule_id,
+            bucket="QUEUE",
+            timezone="UTC",
+            weekdays=(0,),
+            local_time="09:00",
+            misfire_grace_seconds=60,
+            enabled=True,
+        )
+        for schedule_id in ("alpha", "beta")
+    )
+    runs = []
+    for schedule in schedules:
+        queued = repository.create_schedule_occurrence(
+            schedule.schedule_key,
+            local_date="2026-09-07",
+            scheduled_at=datetime(2026, 9, 7, 9, tzinfo=UTC),
+            utc_offset_minutes=0,
+            schedule_hash=schedule.config_hash,
+        )
+        runs.append(
+            repository.transition_schedule_run(
+                queued.run_id, "due", expected_revision=queued.revision
+            )
+        )
+
+    winner = repository.admit_scheduled_bundle(
+        runs[0].run_id,
+        candidates=(BundleAdmissionCandidate("post", "b" * 64, (_file(),)),),
+        targets=(_target(),),
+        expected_revision=runs[0].revision,
+    )
+    linked = repository.get_schedule_run(runs[0].run_id)
+    assert linked.state == "dispatching"
+    assert linked.bundle_key == winner.bundle_key
+    assert winner.claimed_by_type == "schedule"
+    assert winner.claimed_by_id == str(runs[0].run_id)
+
+    with pytest.raises(ConflictError, match="one active bundle"):
+        repository.admit_scheduled_bundle(
+            runs[1].run_id,
+            candidates=(
+                BundleAdmissionCandidate("other", "c" * 64, (_file("other.jpg"),)),
+            ),
+            targets=(_target(),),
+            expected_revision=runs[1].revision,
+        )
+    loser = repository.get_schedule_run(runs[1].run_id)
+    assert loser.state == "due" and loser.bundle_key is None
+    with pytest.raises(TransitionError, match="previous schedule dates"):
+        repository.create_schedule_occurrence(
+            schedules[0].schedule_key,
+            local_date="2026-08-31",
+            scheduled_at=datetime(2026, 8, 31, 9, tzinfo=UTC),
+            utc_offset_minutes=0,
+            schedule_hash=schedules[0].config_hash,
+        )
+
+
+def test_schedule_readers_and_guarded_delivery_synchronization(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    clock.value = datetime(2026, 9, 7, 9, tzinfo=UTC)
+    repository = _repository(tmp_path, clock)
+    disabled = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="disabled",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="09:00",
+        misfire_grace_seconds=60,
+        enabled=False,
+    )
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="enabled",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="09:00",
+        misfire_grace_seconds=60,
+        enabled=True,
+    )
+    assert repository.list_enabled_schedules() == (schedule,)
+    assert disabled not in repository.list_enabled_schedules()
+
+    queued = repository.create_schedule_occurrence(
+        schedule.schedule_key,
+        local_date="2026-09-07",
+        scheduled_at=clock(),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
+    )
+    due = repository.transition_schedule_run(
+        queued.run_id, "due", expected_revision=queued.revision
+    )
+    bundle = repository.admit_scheduled_bundle(
+        due.run_id,
+        candidates=(BundleAdmissionCandidate("post", "b" * 64, (_file(),)),),
+        targets=(_target(),),
+        expected_revision=due.revision,
+    )
+    delivery = repository.claim_delivery(bundle.bundle_key, "x", "safe-failure")
+    repository.fail_delivery(
+        bundle.bundle_key,
+        "x",
+        error_code="temporary",
+        error_message="Try later.",
+        retry_at=clock(),
+        claim_token="safe-failure",
+        attempt_count=delivery.attempt_count,
+    )
+    failed = repository.synchronize_schedule_run(due.run_id)
+    assert failed.state == "failed"
+    assert repository.list_recoverable_schedule_runs(clock()) == (failed,)
+    with pytest.raises(TransitionError, match="illegal schedule run transition"):
+        repository.transition_schedule_run(
+            failed.run_id, "completed", expected_revision=failed.revision
+        )
+
+
 @pytest.mark.parametrize(
     "tamper",
     [

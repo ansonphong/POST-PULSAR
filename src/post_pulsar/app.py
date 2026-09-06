@@ -81,6 +81,7 @@ class RunOnceRequest:
     profile_id: str
     bucket: SourceBucket
     trigger_id: str
+    schedule_run_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +159,23 @@ class OneRunApplication:
                 self._repository_opener(database, self._clock),
             )
             self._inject("after_state_open")
+            schedule_run = None
+            if request.schedule_run_id is not None:
+                schedule_run = repository.get_schedule_run(request.schedule_run_id)
+                schedule = repository.get_schedule(schedule_run.schedule_key)
+                if (
+                    schedule.profile_id != request.profile_id
+                    or schedule.bucket != request.bucket
+                ):
+                    return RunOutcome("invalid", code="schedule_run_conflict")
+                if schedule_run.state == "ambiguous":
+                    return RunOutcome("blocked", code="ambiguous_delivery")
+                if schedule_run.state not in {"due", "dispatching", "failed"}:
+                    return RunOutcome("invalid", code="schedule_run_not_dispatchable")
+                resources.callback(
+                    repository.synchronize_schedule_run,
+                    request.schedule_run_id,
+                )
             stored_profile = repository.get_profile(request.profile_id)
             if stored_profile.account_root != profile.account_root.resolve(
                 strict=False,
@@ -173,8 +191,12 @@ class OneRunApplication:
             self._inject("after_stale_recovery")
             try:
                 triggered = repository.get_triggered_bundle(
-                    trigger_type="run_once",
-                    trigger_id=request.trigger_id,
+                    trigger_type=("run_once" if schedule_run is None else "schedule"),
+                    trigger_id=(
+                        request.trigger_id
+                        if schedule_run is None
+                        else str(schedule_run.run_id)
+                    ),
                     profile_id=request.profile_id,
                     source_bucket=request.bucket,
                 )
@@ -183,7 +205,14 @@ class OneRunApplication:
             if triggered is not None and triggered.status == "archived":
                 return _outcome("archived", triggered)
             protected = repository.list_protected_bundles(request.profile_id)
-            bundle = protected[0] if protected else None
+            if schedule_run is not None and schedule_run.bundle_key is not None:
+                bundle = repository.get_bundle(schedule_run.bundle_key)
+            elif schedule_run is not None:
+                bundle = None
+                if protected:
+                    return RunOutcome("deferred", code="profile_has_recoverable_work")
+            else:
+                bundle = protected[0] if protected else None
             selected: PublishableBundle | None = None
             media: PreparedMedia | None = None
 
@@ -209,6 +238,12 @@ class OneRunApplication:
                     return RunOutcome("invalid", code=scan.issues[0].code)
                 candidates = scan.for_bucket(request.bucket)
                 if not candidates:
+                    if schedule_run is not None:
+                        repository.transition_schedule_run(
+                            schedule_run.run_id,
+                            "no_content",
+                            expected_revision=schedule_run.revision,
+                        )
                     return RunOutcome("empty")
                 global_scan = scan_account_root(profile.account_root)
                 candidate_ids = {item.bundle_id.casefold() for item in candidates}
@@ -267,15 +302,25 @@ class OneRunApplication:
                 except Exception:
                     return RunOutcome("invalid", code="media_validation_failed")
                 try:
-                    admitted = repository.admit_selected_bundle(
-                        profile_id=request.profile_id,
-                        source_bucket=request.bucket,
-                        candidates=admission_candidates,
-                        targets=target_snapshots,
-                        trigger_id=request.trigger_id,
-                        expected_bundle_id=preview.bundle_id,
-                        expected_fingerprint=preview.fingerprint,
-                    )
+                    if schedule_run is None:
+                        admitted = repository.admit_selected_bundle(
+                            profile_id=request.profile_id,
+                            source_bucket=request.bucket,
+                            candidates=admission_candidates,
+                            targets=target_snapshots,
+                            trigger_id=request.trigger_id,
+                            expected_bundle_id=preview.bundle_id,
+                            expected_fingerprint=preview.fingerprint,
+                        )
+                    else:
+                        admitted = repository.admit_scheduled_bundle(
+                            schedule_run.run_id,
+                            candidates=admission_candidates,
+                            targets=target_snapshots,
+                            expected_revision=schedule_run.revision,
+                            expected_bundle_id=preview.bundle_id,
+                            expected_fingerprint=preview.fingerprint,
+                        )
                 except (ConflictError, StateValidationError):
                     _cleanup_media(
                         media,

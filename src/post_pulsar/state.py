@@ -2861,6 +2861,12 @@ class StateRepository:
         if not _SCHEDULE_RE.fullmatch(schedule_id):
             raise StateValidationError("schedule ID is invalid")
         bucket = _validate_bucket(bucket)
+        if isinstance(weekdays, (str, bytes)) or any(
+            isinstance(day, bool) or not isinstance(day, int) for day in weekdays
+        ):
+            raise StateValidationError(
+                "schedule weekdays must be integers from 0 through 6"
+            )
         weekdays_tuple = tuple(sorted(set(weekdays)))
         if not weekdays_tuple or any(day < 0 or day > 6 for day in weekdays_tuple):
             raise StateValidationError(
@@ -2868,7 +2874,11 @@ class StateRepository:
             )
         _validate_timezone(timezone)
         _validate_local_time(local_time)
-        if not 0 <= misfire_grace_seconds <= 86400:
+        if (
+            isinstance(misfire_grace_seconds, bool)
+            or not isinstance(misfire_grace_seconds, int)
+            or not 0 <= misfire_grace_seconds <= 86400
+        ):
             raise StateValidationError("schedule misfire grace is out of range")
         settings = {
             "bucket": bucket,
@@ -2939,6 +2949,15 @@ class StateRepository:
             raise StateValidationError("unknown schedule")
         return self._schedule_from_row(row)
 
+    def list_enabled_schedules(self) -> tuple[ScheduleRecord, ...]:
+        """Return enabled schedules in stable profile/schedule identity order."""
+
+        rows = self._connection.execute(
+            "SELECT * FROM schedules WHERE enabled = 1 "
+            "ORDER BY profile_id, schedule_id COLLATE NOCASE, schedule_id"
+        )
+        return tuple(self._schedule_from_row(row) for row in rows)
+
     def set_schedule_enabled(
         self, schedule_key: int, enabled: bool, *, expected_revision: int
     ) -> ScheduleRecord:
@@ -3008,6 +3027,12 @@ class StateRepository:
                         "schedule occurrence already has a different claim"
                     )
                 return self._schedule_run_from_row(existing)
+            latest = self._connection.execute(
+                "SELECT MAX(local_date) FROM schedule_runs WHERE schedule_key = ?",
+                (schedule_key,),
+            ).fetchone()[0]
+            if latest is not None and local_date < str(latest):
+                raise TransitionError("previous schedule dates cannot be replayed")
             schedule = self._schedule_row(schedule_key)
             if not bool(schedule["enabled"]):
                 raise TransitionError("disabled schedule cannot claim an occurrence")
@@ -3075,6 +3100,102 @@ class StateRepository:
                 raise ConflictError("bundle schedule claim became stale")
         return self.get_schedule_run(run_id)
 
+    def admit_scheduled_bundle(
+        self,
+        run_id: int,
+        *,
+        candidates: Sequence[BundleAdmissionCandidate],
+        targets: Sequence[TargetSnapshot],
+        expected_revision: int,
+        expected_bundle_id: str | None = None,
+        expected_fingerprint: str | None = None,
+    ) -> BundleRecord:
+        """Select, admit, and link new scheduled content in one transaction."""
+
+        if not candidates:
+            raise StateValidationError("at least one admission candidate is required")
+        if not targets:
+            raise StateValidationError("at least one target snapshot is required")
+        normalized_targets = self._normalize_target_snapshots(targets)
+        normalized: list[
+            tuple[BundleAdmissionCandidate, tuple[tuple[object, ...], ...]]
+        ] = []
+        identities: set[str] = set()
+        for candidate in candidates:
+            _validate_bundle_id(candidate.bundle_id)
+            _validate_sha256(candidate.fingerprint, "bundle fingerprint")
+            identity = candidate.bundle_id.casefold()
+            if identity in identities:
+                raise StateValidationError("admission candidate IDs collide")
+            identities.add(identity)
+            if not candidate.files:
+                raise StateValidationError(
+                    "admission candidate requires exact bundle files"
+                )
+            normalized.append(
+                (candidate, self._normalize_bundle_files(candidate.files))
+            )
+        with self._transaction():
+            run = self._schedule_run_row(run_id)
+            self._require_revision(run, expected_revision, "schedule run")
+            if str(run["state"]) != "due" or run["bundle_key"] is not None:
+                raise TransitionError("only an unclaimed due schedule run can admit")
+            schedule = self._schedule_row(int(run["schedule_key"]))
+            profile_id = str(schedule["profile_id"])
+            bucket = _validate_bucket(str(schedule["bucket"]))
+            counter = self._selection_counter_locked(profile_id)
+            if bucket == "RANDOM":
+                selected, normalized_files = min(
+                    normalized,
+                    key=lambda item: (
+                        _random_selection_score(profile_id, counter, item[0]),
+                        item[0].bundle_id.casefold(),
+                        item[0].bundle_id,
+                    ),
+                )
+            else:
+                selected, normalized_files = min(
+                    normalized,
+                    key=lambda item: (
+                        item[0].bundle_id.casefold(),
+                        item[0].bundle_id,
+                    ),
+                )
+            if expected_bundle_id is not None:
+                _validate_bundle_id(expected_bundle_id)
+                if expected_fingerprint is None:
+                    raise StateValidationError(
+                        "expected admission fingerprint is required"
+                    )
+                _validate_sha256(expected_fingerprint, "expected bundle fingerprint")
+                if (
+                    selected.bundle_id != expected_bundle_id
+                    or selected.fingerprint != expected_fingerprint
+                ):
+                    raise ConflictError("admission selection changed before commit")
+            bundle_key = self._insert_bundle_locked(
+                profile_id=profile_id,
+                bundle_id=selected.bundle_id,
+                fingerprint=selected.fingerprint,
+                source_bucket=bucket,
+                normalized_files=normalized_files,
+                normalized_targets=normalized_targets,
+                claimed_by_type="schedule",
+                claimed_by_id=str(run_id),
+            )
+            if bucket == "RANDOM":
+                self._write_selection_counter_locked(profile_id, counter + 1)
+            now = self._now_text()
+            updated = self._connection.execute(
+                "UPDATE schedule_runs SET bundle_key = ?, state = 'dispatching', "
+                "revision = revision + 1, updated_at = ? WHERE run_id = ? "
+                "AND state = 'due' AND bundle_key IS NULL AND revision = ?",
+                (bundle_key, now, run_id, expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("schedule admission became stale")
+        return self.get_bundle(bundle_key)
+
     def claim_schedule_occurrence(
         self,
         schedule_key: int,
@@ -3108,6 +3229,81 @@ class StateRepository:
 
     def get_schedule_run(self, run_id: int) -> ScheduleRunRecord:
         return self._schedule_run_from_row(self._schedule_run_row(run_id))
+
+    def latest_schedule_local_date(self, schedule_key: int) -> date | None:
+        """Return the persisted local-date high-water mark for one schedule."""
+
+        self._schedule_row(schedule_key)
+        value = self._connection.execute(
+            "SELECT MAX(local_date) FROM schedule_runs WHERE schedule_key = ?",
+            (schedule_key,),
+        ).fetchone()[0]
+        return None if value is None else date.fromisoformat(str(value))
+
+    def list_recoverable_schedule_runs(
+        self, now: datetime
+    ) -> tuple[ScheduleRunRecord, ...]:
+        """Return linked work safe for automatic resume, never ambiguity."""
+
+        now_text = _timestamp(now)
+        rows = self._connection.execute(
+            "SELECT sr.* FROM schedule_runs sr "
+            "JOIN schedules s ON s.schedule_key = sr.schedule_key "
+            "JOIN bundles b ON b.bundle_key = sr.bundle_key "
+            "WHERE sr.state IN ('dispatching', 'failed') "
+            "AND NOT EXISTS (SELECT 1 FROM deliveries da "
+            "WHERE da.bundle_key = sr.bundle_key AND da.status = 'ambiguous') "
+            "AND (b.status = 'archiving' OR NOT EXISTS ("
+            "SELECT 1 FROM deliveries dn WHERE dn.bundle_key = sr.bundle_key "
+            "AND dn.status != 'published') OR EXISTS ("
+            "SELECT 1 FROM deliveries dr WHERE dr.bundle_key = sr.bundle_key "
+            "AND (dr.status IN ('pending', 'in_flight') OR (dr.status = 'failed' "
+            "AND dr.safe_to_retry = 1 AND dr.next_attempt_at <= ? "
+            "AND dr.error_code != 'reconciled_not_published')))) "
+            "ORDER BY sr.scheduled_at, s.profile_id, s.schedule_id COLLATE NOCASE, "
+            "s.schedule_id, sr.run_id",
+            (now_text,),
+        )
+        return tuple(self._schedule_run_from_row(row) for row in rows)
+
+    def synchronize_schedule_run(self, run_id: int) -> ScheduleRunRecord:
+        """Guard schedule recovery state against linked delivery/archive facts."""
+
+        with self._transaction():
+            run = self._schedule_run_row(run_id)
+            current = str(run["state"])
+            if current not in {"dispatching", "failed"}:
+                return self._schedule_run_from_row(run)
+            bundle_key = cast(int | None, run["bundle_key"])
+            if bundle_key is None:
+                raise TransitionError("recoverable schedule run has no linked bundle")
+            bundle = self._bundle_row(bundle_key)
+            deliveries = tuple(
+                self._connection.execute(
+                    "SELECT status FROM deliveries WHERE bundle_key = ?",
+                    (bundle_key,),
+                )
+            )
+            if not deliveries:
+                raise TransitionError("linked schedule bundle has no deliveries")
+            statuses = {str(row["status"]) for row in deliveries}
+            target = current
+            if "ambiguous" in statuses:
+                target = "ambiguous"
+            elif str(bundle["status"]) == "archived" and statuses == {"published"}:
+                target = "completed"
+            elif "failed" in statuses:
+                target = "failed"
+            if target == current:
+                return self._schedule_run_from_row(run)
+            updated = self._connection.execute(
+                "UPDATE schedule_runs SET state = ?, revision = revision + 1, "
+                "updated_at = ? WHERE run_id = ? AND state = ? AND revision = ?",
+                (target, self._now_text(), run_id, current, int(run["revision"])),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("schedule synchronization became stale")
+        return self.get_schedule_run(run_id)
 
     def transition_schedule_run(
         self,
