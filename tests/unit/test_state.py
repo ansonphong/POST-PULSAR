@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -265,6 +266,13 @@ def test_profile_identity_and_active_root_snapshot_are_immutable(
         bundle_key, "x", remote_id="tweet-archive", **claim  # type: ignore[arg-type]
     )
     repository.begin_archiving(bundle_key, expected_revision=1)
+    repository.checkpoint_archive_member(
+        bundle_key, "post.jpg", sha256="a" * 64
+    )
+    repository.checkpoint_archive_member(
+        bundle_key, ".ready", sha256=hashlib.sha256(b"").hexdigest()
+    )
+    assert repository.list_archive_checkpoints(bundle_key) == ("post.jpg", ".ready")
     repository.mark_archived(bundle_key, "POSTED/QUEUE/post", expected_revision=2)
     updated = repository.register_profile(
         "ansonphong",

@@ -205,6 +205,7 @@ class BundleFileSnapshot:
     mime_type: str | None
     size_bytes: int
     sha256: str
+    archived: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +227,8 @@ class BundleRecord:
     status: BundleStatus
     revision: int
     archive_path: str | None
+    ready_marker_name: str
+    ready_marker_archived: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +379,7 @@ CREATE TABLE IF NOT EXISTS bundles (
     source_bucket TEXT NOT NULL CHECK (source_bucket IN ('QUEUE', 'RANDOM', 'REELS')),
     profile_root_snapshot TEXT NOT NULL,
     ready_marker_name TEXT NOT NULL DEFAULT '.ready',
+    ready_marker_archived INTEGER NOT NULL DEFAULT 0 CHECK (ready_marker_archived IN (0, 1)),
     status TEXT NOT NULL CHECK (status IN ('active', 'blocked', 'archiving', 'archived')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     archive_path TEXT,
@@ -575,8 +579,21 @@ CREATE TRIGGER IF NOT EXISTS target_snapshots_no_update
 BEFORE UPDATE ON target_snapshots BEGIN SELECT RAISE(ABORT, 'immutable target snapshot'); END;
 CREATE TRIGGER IF NOT EXISTS target_snapshots_no_delete
 BEFORE DELETE ON target_snapshots BEGIN SELECT RAISE(ABORT, 'immutable target snapshot'); END;
-CREATE TRIGGER IF NOT EXISTS bundle_files_no_update
-BEFORE UPDATE ON bundle_files BEGIN SELECT RAISE(ABORT, 'immutable bundle file'); END;
+DROP TRIGGER IF EXISTS bundle_files_no_update;
+CREATE TRIGGER bundle_files_no_update
+BEFORE UPDATE ON bundle_files
+WHEN NOT (
+    NEW.bundle_key IS OLD.bundle_key
+    AND NEW.relative_name IS OLD.relative_name
+    AND NEW.role IS OLD.role
+    AND NEW.ordinal IS OLD.ordinal
+    AND NEW.media_kind IS OLD.media_kind
+    AND NEW.mime_type IS OLD.mime_type
+    AND NEW.size_bytes IS OLD.size_bytes
+    AND NEW.sha256 IS OLD.sha256
+    AND NEW.archived >= OLD.archived
+)
+BEGIN SELECT RAISE(ABORT, 'immutable bundle file'); END;
 CREATE TRIGGER IF NOT EXISTS bundle_files_no_delete
 BEFORE DELETE ON bundle_files BEGIN SELECT RAISE(ABORT, 'immutable bundle file'); END;
 CREATE TRIGGER IF NOT EXISTS admission_members_identity_no_update
@@ -1343,6 +1360,63 @@ class StateRepository:
             )
         return self.get_bundle(bundle_key)
 
+    def checkpoint_archive_member(
+        self,
+        bundle_key: int,
+        relative_name: str,
+        *,
+        sha256: str,
+    ) -> None:
+        """Durably mark one exact hash-verified content member or ready sentinel."""
+
+        relative_name = _relative_path_text(relative_name, "archive member path")
+        _validate_sha256(sha256, "archive member hash")
+        with self._transaction():
+            bundle = self._bundle_row(bundle_key)
+            if str(bundle["status"]) != "archiving":
+                raise TransitionError(
+                    "archive members can checkpoint only while archiving"
+                )
+            if relative_name == str(bundle["ready_marker_name"]):
+                if sha256 != hashlib.sha256(b"").hexdigest():
+                    raise ConflictError("ready marker archive hash does not match")
+                self._connection.execute(
+                    "UPDATE bundles SET ready_marker_archived = 1, updated_at = ? "
+                    "WHERE bundle_key = ?",
+                    (self._now_text(), bundle_key),
+                )
+                return
+            member = self._connection.execute(
+                "SELECT sha256 FROM bundle_files WHERE bundle_key = ? "
+                "AND relative_name = ?",
+                (bundle_key, relative_name),
+            ).fetchone()
+            if member is None:
+                raise StateValidationError("archive member is not in the exact manifest")
+            if str(member["sha256"]) != sha256:
+                raise ConflictError("archive member hash does not match snapshot")
+            self._connection.execute(
+                "UPDATE bundle_files SET archived = 1 WHERE bundle_key = ? "
+                "AND relative_name = ?",
+                (bundle_key, relative_name),
+            )
+
+    def list_archive_checkpoints(self, bundle_key: int) -> tuple[str, ...]:
+        """Return exact archive-member checkpoints, including the ready sentinel."""
+
+        bundle = self._bundle_row(bundle_key)
+        names = [
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT relative_name FROM bundle_files WHERE bundle_key = ? "
+                "AND archived = 1 ORDER BY relative_name COLLATE NOCASE, relative_name",
+                (bundle_key,),
+            )
+        ]
+        if bool(bundle["ready_marker_archived"]):
+            names.append(str(bundle["ready_marker_name"]))
+        return tuple(names)
+
     def mark_archived(
         self, bundle_key: int, archive_path: str, *, expected_revision: int
     ) -> BundleRecord:
@@ -1352,6 +1426,14 @@ class StateRepository:
             self._require_revision(row, expected_revision, "bundle")
             if str(row["status"]) != "archiving":
                 raise TransitionError("only an archiving bundle can become archived")
+            incomplete = self._connection.execute(
+                "SELECT 1 FROM bundle_files WHERE bundle_key = ? AND archived = 0",
+                (bundle_key,),
+            ).fetchone()
+            if incomplete is not None or not bool(row["ready_marker_archived"]):
+                raise TransitionError(
+                    "every exact archive member must be checkpointed before completion"
+                )
             now = self._now_text()
             self._connection.execute(
                 "UPDATE bundles SET status = 'archived', archive_path = ?, "
@@ -3200,6 +3282,8 @@ class StateRepository:
             status=cast(BundleStatus, str(row["status"])),
             revision=int(row["revision"]),
             archive_path=cast(str | None, row["archive_path"]),
+            ready_marker_name=str(row["ready_marker_name"]),
+            ready_marker_archived=bool(row["ready_marker_archived"]),
         )
 
     def _bundle_file_from_row(self, row: sqlite3.Row) -> BundleFileSnapshot:
@@ -3211,6 +3295,7 @@ class StateRepository:
             mime_type=cast(str | None, row["mime_type"]),
             size_bytes=int(row["size_bytes"]),
             sha256=str(row["sha256"]),
+            archived=bool(row["archived"]),
         )
 
     def _target_snapshot_from_row(self, row: sqlite3.Row) -> TargetSnapshot:
