@@ -49,7 +49,7 @@ _PHASE_ORDER: Final = {
 _SCHEDULE_RUN_TRANSITIONS: Final = {
     "queued": frozenset({"due", "missed"}),
     "due": frozenset({"dispatching", "no_content"}),
-    "dispatching": frozenset({"completed", "failed", "ambiguous"}),
+    "dispatching": frozenset({"completed", "no_content", "failed", "ambiguous"}),
     "missed": frozenset(),
     "no_content": frozenset(),
     "completed": frozenset(),
@@ -115,6 +115,33 @@ _ADMISSION_PHASES: Final = (
     "rolled_back",
 )
 _ADMISSION_MEMBER_PHASES: Final = frozenset({"planned", "copied", "verified"})
+_ADMISSION_MEMBER_PHASE_ORDER: Final = {
+    "planned": 0,
+    "copied": 1,
+    "verified": 2,
+}
+_BUNDLE_REQUEST_ACTIONS: Final = frozenset(
+    {"enqueue", "publish_now", "cancel", "delete", "retry", "reconcile"}
+)
+_SCHEDULE_REQUEST_ACTIONS: Final = frozenset(
+    {"schedule_update", "schedule_enable", "schedule_disable"}
+)
+_PROFILE_REQUEST_ACTIONS: Final = frozenset(
+    {"admit_draft", "pause", "resume", "schedule_create"}
+)
+_ALWAYS_CONFIRMED_ACTIONS: Final = frozenset(
+    {
+        "admit_draft",
+        "enqueue",
+        "run_now",
+        "publish_now",
+        "schedule_enable",
+        "cancel",
+        "delete",
+        "retry",
+        "reconcile",
+    }
+)
 _IDENTIFIER_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -220,6 +247,7 @@ class DeliveryRecord:
 class ArtifactRecord:
     bundle_key: int
     platform: Platform
+    attempt_count: int
     kind: str
     ordinal: int
     external_id: str | None
@@ -285,6 +313,8 @@ class ConfirmationIntentRecord:
     action: str
     arguments: Mapping[str, object]
     profile_id: str
+    bundle_key: int | None
+    schedule_key: int | None
     resource_revision: int
     fingerprint: str | None
     consequence: str
@@ -405,7 +435,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE TABLE IF NOT EXISTS delivery_artifacts (
     bundle_key INTEGER NOT NULL,
     platform TEXT NOT NULL,
-    kind TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL CHECK (attempt_count > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('x_media_id', 'instagram_child_container', 'instagram_parent_container', 'staged_private', 'staged_public')),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     external_id TEXT,
     relative_path TEXT,
@@ -414,9 +445,19 @@ CREATE TABLE IF NOT EXISTS delivery_artifacts (
     processing_metadata_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (bundle_key, platform, kind, ordinal),
+    CHECK (
+        (kind = 'x_media_id' AND platform = 'x' AND external_id IS NOT NULL AND relative_path IS NULL AND sha256 IS NULL AND expires_at IS NOT NULL)
+        OR (kind IN ('instagram_child_container', 'instagram_parent_container') AND platform = 'instagram' AND external_id IS NOT NULL AND relative_path IS NULL AND sha256 IS NULL AND expires_at IS NOT NULL)
+        OR (kind = 'staged_private' AND external_id IS NULL AND relative_path IS NOT NULL AND sha256 IS NOT NULL)
+        OR (kind = 'staged_public' AND platform = 'instagram' AND external_id IS NULL AND relative_path IS NOT NULL AND sha256 IS NOT NULL)
+    ),
+    PRIMARY KEY (bundle_key, platform, attempt_count, kind, ordinal),
     FOREIGN KEY (bundle_key, platform) REFERENCES deliveries(bundle_key, platform)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS delivery_artifact_external_identity
+ON delivery_artifacts(platform, external_id) WHERE external_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS delivery_remote_identity
+ON deliveries(platform, remote_id) WHERE remote_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
@@ -487,6 +528,8 @@ CREATE TABLE IF NOT EXISTS confirmation_intents (
     arguments_json TEXT NOT NULL,
     binding_sha256 TEXT NOT NULL,
     profile_id TEXT NOT NULL REFERENCES profiles(profile_id),
+    bundle_key INTEGER REFERENCES bundles(bundle_key),
+    schedule_key INTEGER REFERENCES schedules(schedule_key),
     resource_revision INTEGER NOT NULL,
     fingerprint TEXT,
     consequence TEXT NOT NULL,
@@ -535,6 +578,23 @@ CREATE TRIGGER IF NOT EXISTS bundle_files_no_update
 BEFORE UPDATE ON bundle_files BEGIN SELECT RAISE(ABORT, 'immutable bundle file'); END;
 CREATE TRIGGER IF NOT EXISTS bundle_files_no_delete
 BEFORE DELETE ON bundle_files BEGIN SELECT RAISE(ABORT, 'immutable bundle file'); END;
+CREATE TRIGGER IF NOT EXISTS admission_members_identity_no_update
+BEFORE UPDATE ON admission_members
+WHEN NEW.journal_id != OLD.journal_id
+ OR NEW.relative_name != OLD.relative_name
+ OR NEW.sha256 != OLD.sha256
+ OR NEW.size_bytes != OLD.size_bytes
+BEGIN SELECT RAISE(ABORT, 'immutable admission member identity'); END;
+CREATE TRIGGER IF NOT EXISTS admission_members_phase_monotonic
+BEFORE UPDATE OF phase ON admission_members
+WHEN NOT (
+    (OLD.phase = 'planned' AND NEW.phase = 'copied')
+ OR (OLD.phase = 'copied' AND NEW.phase = 'verified')
+)
+BEGIN SELECT RAISE(ABORT, 'illegal admission member transition'); END;
+CREATE TRIGGER IF NOT EXISTS admission_members_no_delete
+BEFORE DELETE ON admission_members
+BEGIN SELECT RAISE(ABORT, 'immutable admission member'); END;
 """
 
 _REQUIRED_TABLES: Final = frozenset(
@@ -557,6 +617,37 @@ _REQUIRED_TABLES: Final = frozenset(
         "selection_counters",
     }
 )
+
+
+def _schema_manifest_digest(connection: sqlite3.Connection) -> str:
+    """Return a canonical digest covering tables, constraints, indexes, and triggers."""
+
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger') "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    )
+    manifest = [
+        (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            " ".join(str(row[3] or "").split()),
+        )
+        for row in rows
+    ]
+    return hashlib.sha256(
+        json.dumps(manifest, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _expected_schema_manifest_digest() -> str:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(_SCHEMA)
+        return _schema_manifest_digest(connection)
+    finally:
+        connection.close()
 
 
 class StateRepository:
@@ -620,34 +711,47 @@ class StateRepository:
         return str(self._connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
 
     def _initialize_schema(self) -> None:
-        version = self.schema_version
-        application_id = int(
-            self._connection.execute("PRAGMA application_id").fetchone()[0]
-        )
-        tables = {
-            str(row[0])
-            for row in self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name NOT LIKE 'sqlite_%'"
+        try:
+            version = self.schema_version
+            application_id = int(
+                self._connection.execute("PRAGMA application_id").fetchone()[0]
             )
-        }
-        if version == 0 and tables:
-            raise MigrationRequiredError(
-                "migration required: existing unversioned database is unsupported"
-            )
-        if version not in {0, SCHEMA_VERSION}:
-            raise MigrationRequiredError(
-                f"migration required: unsupported database schema version {version}"
-            )
-        if version == SCHEMA_VERSION and application_id != _APPLICATION_ID:
-            raise MigrationRequiredError(
-                "migration required: database application identity is unsupported"
-            )
-        if version == SCHEMA_VERSION and not _REQUIRED_TABLES.issubset(tables):
-            raise MigrationRequiredError(
-                "migration required: current-version database schema is incomplete"
-            )
-        if version == 0:
+            tables = {
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if version == 0 and tables:
+                raise MigrationRequiredError(
+                    "migration required: existing unversioned database is unsupported"
+                )
+            if version not in {0, SCHEMA_VERSION}:
+                raise MigrationRequiredError(
+                    f"migration required: unsupported database schema version {version}"
+                )
+            if application_id not in {0, _APPLICATION_ID}:
+                raise MigrationRequiredError(
+                    "migration required: database application identity is unsupported"
+                )
+            if version == SCHEMA_VERSION:
+                if application_id != _APPLICATION_ID:
+                    raise MigrationRequiredError(
+                        "migration required: database application identity is unsupported"
+                    )
+                if not _REQUIRED_TABLES.issubset(tables):
+                    raise MigrationRequiredError(
+                        "migration required: current-version database schema is incomplete"
+                    )
+                if _schema_manifest_digest(
+                    self._connection
+                ) != _expected_schema_manifest_digest():
+                    raise MigrationRequiredError(
+                        "migration required: current-version database schema is not canonical"
+                    )
+                return
+
             self._connection.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
             now = self._now_text()
             self._connection.execute(
@@ -658,8 +762,16 @@ class StateRepository:
             self._connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._connection.execute("COMMIT")
-        else:
-            self._connection.executescript(_SCHEMA)
+            if _schema_manifest_digest(
+                self._connection
+            ) != _expected_schema_manifest_digest():
+                raise StateError("new database schema failed canonical validation")
+        except (MigrationRequiredError, StateError):
+            raise
+        except sqlite3.DatabaseError:
+            raise MigrationRequiredError(
+                "migration required: database schema could not be validated safely"
+            ) from None
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -694,6 +806,9 @@ class StateRepository:
                     "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
                 ).fetchone()
                 if existing is None:
+                    self._assert_target_ownership_available(
+                        profile_id, normalized_targets
+                    )
                     self._connection.execute(
                         "INSERT INTO profiles(profile_id, account_root, config_hash, "
                         "created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -702,18 +817,29 @@ class StateRepository:
                     self._replace_profile_targets(profile_id, normalized_targets)
                 else:
                     current_root = str(existing["account_root"])
-                    changed = current_root != str(root) or str(existing["config_hash"]) != config_hash
-                    changed = changed or self._stored_profile_targets(profile_id) != normalized_targets
+                    stored_targets = self._stored_profile_targets(profile_id)
+                    targets_changed = stored_targets != normalized_targets
+                    changed = (
+                        current_root != str(root)
+                        or str(existing["config_hash"]) != config_hash
+                        or targets_changed
+                    )
                     if not changed:
                         return self._profile_from_row(existing)
-                    if current_root != str(root) and self._profile_has_protected_work(
-                        profile_id
-                    ):
+                    protected_work = self._profile_has_protected_work(profile_id)
+                    if current_root != str(root) and protected_work:
                         raise ConflictError(
                             "profile root drift is blocked while durable work references it"
                         )
+                    if targets_changed and protected_work:
+                        raise ConflictError(
+                            "profile targets cannot change while durable work references them"
+                        )
                     if expected_revision != int(existing["revision"]):
                         raise ConflictError("profile revision conflict")
+                    self._assert_target_ownership_available(
+                        profile_id, normalized_targets
+                    )
                     self._connection.execute(
                         "UPDATE profiles SET account_root = ?, config_hash = ?, "
                         "revision = revision + 1, updated_at = ? WHERE profile_id = ?",
@@ -812,6 +938,28 @@ class StateRepository:
             (profile_id,),
         ).fetchone()
         return row is not None
+
+    def _assert_target_ownership_available(
+        self,
+        profile_id: str,
+        targets: tuple[tuple[str, str, str, str, str, str], ...],
+    ) -> None:
+        for platform, remote_id, *_rest in targets:
+            protected = self._connection.execute(
+                "SELECT 1 FROM target_snapshots ts "
+                "JOIN bundles b ON b.bundle_key = ts.bundle_key "
+                "LEFT JOIN deliveries d ON d.bundle_key = ts.bundle_key "
+                "AND d.platform = ts.platform "
+                "WHERE ts.platform = ? AND ts.expected_remote_user_id = ? "
+                "AND ts.profile_id != ? "
+                "AND (b.status IN ('active', 'blocked', 'archiving') "
+                "OR d.status = 'ambiguous') LIMIT 1",
+                (platform, remote_id, profile_id),
+            ).fetchone()
+            if protected is not None:
+                raise ConflictError(
+                    "remote identity is retained by unfinished durable work"
+                )
 
     def add_bundle(
         self,
@@ -1156,24 +1304,39 @@ class StateRepository:
         return self.get_delivery(bundle_key, platform)
 
     def advance_delivery_phase(
-        self, bundle_key: int, platform: Platform, phase: DeliveryPhase
+        self,
+        bundle_key: int,
+        platform: Platform,
+        phase: DeliveryPhase,
+        *,
+        claim_token: str,
+        attempt_count: int,
     ) -> DeliveryRecord:
         platform = _validate_platform(platform)
         if phase not in _PHASE_ORDER:
             raise StateValidationError("unsupported delivery phase")
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
-            if str(row["status"]) != "in_flight":
-                raise TransitionError("only an in-flight delivery has a phase")
+            self._require_delivery_claim(row, claim_token, attempt_count)
             current = cast(str, row["phase"])
             if _PHASE_ORDER[phase] < _PHASE_ORDER[current]:
                 raise TransitionError("delivery phase cannot move backward")
             if phase != current:
-                self._connection.execute(
+                updated = self._connection.execute(
                     "UPDATE deliveries SET phase = ?, revision = revision + 1, "
-                    "updated_at = ? WHERE bundle_key = ? AND platform = ?",
-                    (phase, self._now_text(), bundle_key, platform),
+                    "updated_at = ? WHERE bundle_key = ? AND platform = ? "
+                    "AND status = 'in_flight' AND claim_token = ? AND attempt_count = ?",
+                    (
+                        phase,
+                        self._now_text(),
+                        bundle_key,
+                        platform,
+                        claim_token,
+                        attempt_count,
+                    ),
                 )
+                if updated.rowcount != 1:
+                    raise ConflictError("delivery claim became stale")
         return self.get_delivery(bundle_key, platform)
 
     def checkpoint_artifact(
@@ -1188,26 +1351,46 @@ class StateRepository:
         sha256: str | None = None,
         expires_at: datetime | None = None,
         processing_metadata: Mapping[str, object] | None = None,
+        claim_token: str,
+        attempt_count: int,
     ) -> ArtifactRecord:
         platform = _validate_platform(platform)
         if kind not in _ARTIFACT_KINDS:
             raise StateValidationError("unsupported artifact checkpoint kind")
         if ordinal < 0:
             raise StateValidationError("artifact ordinal must be non-negative")
+        if kind == "instagram_parent_container" and ordinal != 0:
+            raise StateValidationError(
+                "Instagram parent container ordinal must be zero"
+            )
         if kind.startswith("x_") and platform != "x":
             raise StateValidationError("artifact checkpoint platform mismatch")
         if kind.startswith("instagram_") and platform != "instagram":
             raise StateValidationError("artifact checkpoint platform mismatch")
-        if kind in {"x_media_id", "instagram_child_container", "instagram_parent_container"}:
+        remote_kinds = {
+            "x_media_id",
+            "instagram_child_container",
+            "instagram_parent_container",
+        }
+        if kind in remote_kinds:
             if external_id is None:
                 raise StateValidationError("remote artifact checkpoint requires an ID")
             _validate_identifier(external_id, "remote artifact ID")
+            if relative_path is not None or sha256 is not None:
+                raise StateValidationError("remote artifact cannot contain a staging path")
+            if expires_at is None:
+                raise StateValidationError("remote artifact checkpoint requires an expiry")
         if kind in {"staged_private", "staged_public"}:
             if relative_path is None or sha256 is None:
                 raise StateValidationError("staged checkpoint requires path and hash")
-            relative_path = _relative_path_text(relative_path, "staged artifact path")
             _validate_sha256(sha256, "staged artifact hash")
+            if external_id is not None:
+                raise StateValidationError("staged artifact cannot contain a remote ID")
+        if kind == "staged_public" and platform != "instagram":
+            raise StateValidationError("public staging is only supported for Instagram")
         expiry = _timestamp(expires_at) if expires_at is not None else None
+        if expires_at is not None and expires_at.astimezone(UTC) <= self._now():
+            raise StateValidationError("artifact expiry must be in the future")
         metadata_json = self._processing_metadata_json(processing_metadata or {})
         now = self._now_text()
         values = (
@@ -1219,12 +1402,23 @@ class StateRepository:
         )
         with self._transaction():
             delivery = self._delivery_row(bundle_key, platform)
-            if str(delivery["status"]) != "in_flight":
-                raise TransitionError("artifacts checkpoint only for in-flight delivery")
+            self._require_delivery_claim(delivery, claim_token, attempt_count)
+            bundle = self._bundle_row(bundle_key)
+            if kind in {"staged_private", "staged_public"}:
+                relative_path = self._validated_staged_artifact_path(
+                    cast(str, relative_path), kind, bundle
+                )
+                values = (
+                    external_id,
+                    relative_path,
+                    sha256,
+                    expiry,
+                    metadata_json,
+                )
             existing = self._connection.execute(
                 "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ? "
-                "AND kind = ? AND ordinal = ?",
-                (bundle_key, platform, kind, ordinal),
+                "AND attempt_count = ? AND kind = ? AND ordinal = ?",
+                (bundle_key, platform, attempt_count, kind, ordinal),
             ).fetchone()
             if existing is not None:
                 stored = tuple(
@@ -1240,30 +1434,40 @@ class StateRepository:
                 if stored != values:
                     raise ConflictError("artifact checkpoint is immutable")
             else:
-                self._connection.execute(
-                    "INSERT INTO delivery_artifacts(bundle_key, platform, kind, ordinal, "
-                    "external_id, relative_path, sha256, expires_at, "
-                    "processing_metadata_json, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        bundle_key,
-                        platform,
-                        kind,
-                        ordinal,
-                        *values,
-                        now,
-                        now,
-                    ),
-                )
-                self._connection.execute(
+                try:
+                    self._connection.execute(
+                        "INSERT INTO delivery_artifacts(bundle_key, platform, attempt_count, "
+                        "kind, ordinal, "
+                        "external_id, relative_path, sha256, expires_at, "
+                        "processing_metadata_json, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            bundle_key,
+                            platform,
+                            attempt_count,
+                            kind,
+                            ordinal,
+                            *values,
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ConflictError(
+                        "artifact identity conflicts with durable state"
+                    ) from None
+                updated = self._connection.execute(
                     "UPDATE deliveries SET revision = revision + 1, updated_at = ? "
-                    "WHERE bundle_key = ? AND platform = ?",
-                    (now, bundle_key, platform),
+                    "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                    "AND claim_token = ? AND attempt_count = ?",
+                    (now, bundle_key, platform, claim_token, attempt_count),
                 )
+                if updated.rowcount != 1:
+                    raise ConflictError("delivery claim became stale")
         row = self._connection.execute(
             "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ? "
-            "AND kind = ? AND ordinal = ?",
-            (bundle_key, platform, kind, ordinal),
+            "AND attempt_count = ? AND kind = ? AND ordinal = ?",
+            (bundle_key, platform, attempt_count, kind, ordinal),
         ).fetchone()
         return self._artifact_from_row(cast(sqlite3.Row, row))
 
@@ -1276,26 +1480,40 @@ class StateRepository:
         error_message: str,
         retry_at: datetime | None,
         permanent: bool = False,
+        claim_token: str,
+        attempt_count: int,
     ) -> DeliveryRecord:
         platform = _validate_platform(platform)
         error_code = self._safe_text(error_code, "delivery error code", maximum=64)
         error_message = self._safe_text(error_message, "delivery error message")
-        if not permanent and retry_at is None:
-            raise StateValidationError("retryable failure requires an absolute retry time")
         retry_timestamp = _timestamp(retry_at) if retry_at is not None else None
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
-            if str(row["status"]) != "in_flight":
-                raise TransitionError("only an in-flight delivery can fail")
+            self._require_delivery_claim(row, claim_token, attempt_count)
+            if str(row["phase"]) == "final_dispatch_started":
+                self._mark_ambiguous_locked(
+                    bundle_key,
+                    platform,
+                    error_code,
+                    error_message,
+                    claim_token=claim_token,
+                    attempt_count=attempt_count,
+                )
+                return self.get_delivery(bundle_key, platform)
+            if not permanent and retry_at is None:
+                raise StateValidationError(
+                    "retryable failure requires an absolute retry time"
+                )
             failures = int(row["consecutive_failures"]) + 1
             retryable = not permanent and failures < 5
             now = self._now_text()
-            self._connection.execute(
+            updated = self._connection.execute(
                 "UPDATE deliveries SET status = 'failed', phase = NULL, "
                 "consecutive_failures = ?, safe_to_retry = ?, next_attempt_at = ?, "
                 "claim_token = NULL, error_code = ?, error_message = ?, "
                 "revision = revision + 1, updated_at = ? "
-                "WHERE bundle_key = ? AND platform = ?",
+                "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                "AND claim_token = ? AND attempt_count = ?",
                 (
                     failures,
                     int(retryable),
@@ -1305,8 +1523,12 @@ class StateRepository:
                     now,
                     bundle_key,
                     platform,
+                    claim_token,
+                    attempt_count,
                 ),
             )
+            if updated.rowcount != 1:
+                raise ConflictError("delivery claim became stale")
             if not retryable:
                 self._block_bundle_locked(bundle_key, error_code)
             self._insert_event_locked(
@@ -1319,24 +1541,46 @@ class StateRepository:
         return self.get_delivery(bundle_key, platform)
 
     def publish_delivery(
-        self, bundle_key: int, platform: Platform, *, remote_id: str
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        remote_id: str,
+        claim_token: str,
+        attempt_count: int,
     ) -> DeliveryRecord:
         platform = _validate_platform(platform)
         _validate_identifier(remote_id, "remote post ID")
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(row, claim_token, attempt_count)
             if str(row["status"]) != "in_flight" or str(row["phase"]) != "final_dispatch_started":
                 raise TransitionError(
                     "publication result requires a durable final-dispatch phase"
                 )
-            self._connection.execute(
-                "UPDATE deliveries SET status = 'published', phase = NULL, "
-                "consecutive_failures = 0, safe_to_retry = 0, next_attempt_at = NULL, "
-                "claim_token = NULL, remote_id = ?, error_code = NULL, "
-                "error_message = NULL, revision = revision + 1, updated_at = ? "
-                "WHERE bundle_key = ? AND platform = ?",
-                (remote_id, self._now_text(), bundle_key, platform),
-            )
+            try:
+                updated = self._connection.execute(
+                    "UPDATE deliveries SET status = 'published', phase = NULL, "
+                    "consecutive_failures = 0, safe_to_retry = 0, next_attempt_at = NULL, "
+                    "claim_token = NULL, remote_id = ?, error_code = NULL, "
+                    "error_message = NULL, revision = revision + 1, updated_at = ? "
+                    "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                    "AND claim_token = ? AND attempt_count = ?",
+                    (
+                        remote_id,
+                        self._now_text(),
+                        bundle_key,
+                        platform,
+                        claim_token,
+                        attempt_count,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError(
+                    "remote publication identity conflicts with durable state"
+                ) from None
+            if updated.rowcount != 1:
+                raise ConflictError("delivery claim became stale")
         return self.get_delivery(bundle_key, platform)
 
     def mark_delivery_ambiguous(
@@ -1346,6 +1590,8 @@ class StateRepository:
         *,
         error_code: str,
         error_message: str,
+        claim_token: str,
+        attempt_count: int,
     ) -> DeliveryRecord:
         """Persist an uncertain final-create result without permitting a retry."""
 
@@ -1354,6 +1600,7 @@ class StateRepository:
         error_message = self._safe_text(error_message, "delivery error message")
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(row, claim_token, attempt_count)
             if (
                 str(row["status"]) != "in_flight"
                 or str(row["phase"]) != "final_dispatch_started"
@@ -1362,7 +1609,12 @@ class StateRepository:
                     "only an uncertain final-dispatch result can become ambiguous"
                 )
             self._mark_ambiguous_locked(
-                bundle_key, platform, error_code, error_message
+                bundle_key,
+                platform,
+                error_code,
+                error_message,
+                claim_token=claim_token,
+                attempt_count=attempt_count,
             )
         return self.get_delivery(bundle_key, platform)
 
@@ -1388,19 +1640,22 @@ class StateRepository:
                         platform,
                         "stale_final_dispatch",
                         "Final dispatch outcome is unknown.",
+                        claim_token=str(row["claim_token"]),
+                        attempt_count=int(row["attempt_count"]),
                     )
                     recovered.append((bundle_key, platform, "ambiguous"))
                     continue
                 failures = int(row["consecutive_failures"]) + 1
                 retryable = failures < 5
                 now = self._now_text()
-                self._connection.execute(
+                updated = self._connection.execute(
                     "UPDATE deliveries SET status = 'failed', phase = NULL, "
                     "consecutive_failures = ?, safe_to_retry = ?, next_attempt_at = ?, "
                     "claim_token = NULL, error_code = 'stale_pre_final', "
                     "error_message = 'Interrupted before final dispatch; safe to retry.', "
                     "revision = revision + 1, updated_at = ? "
-                    "WHERE bundle_key = ? AND platform = ?",
+                    "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                    "AND claim_token = ? AND attempt_count = ?",
                     (
                         failures,
                         int(retryable),
@@ -1408,8 +1663,12 @@ class StateRepository:
                         now,
                         bundle_key,
                         platform,
+                        str(row["claim_token"]),
+                        int(row["attempt_count"]),
                     ),
                 )
+                if updated.rowcount != 1:
+                    raise ConflictError("stale delivery recovery lost its claim")
                 if not retryable:
                     self._block_bundle_locked(bundle_key, "stale_pre_final")
                 recovered.append((bundle_key, platform, "failed"))
@@ -1627,7 +1886,7 @@ class StateRepository:
             )
         return self.get_schedule(schedule_key)
 
-    def claim_schedule_occurrence(
+    def create_schedule_occurrence(
         self,
         schedule_key: int,
         *,
@@ -1635,8 +1894,9 @@ class StateRepository:
         scheduled_at: datetime,
         utc_offset_minutes: int,
         schedule_hash: str,
-        bundle_key: int,
     ) -> ScheduleRunRecord:
+        """Persist a recoverable queued occurrence before it becomes due."""
+
         try:
             date.fromisoformat(local_date)
         except ValueError:
@@ -1652,7 +1912,6 @@ class StateRepository:
             ).fetchone()
             if existing is not None:
                 expected = (
-                    bundle_key,
                     scheduled_text,
                     utc_offset_minutes,
                     schedule_hash,
@@ -1660,7 +1919,6 @@ class StateRepository:
                 stored = tuple(
                     existing[name]
                     for name in (
-                        "bundle_key",
                         "scheduled_at",
                         "utc_offset_minutes",
                         "schedule_hash",
@@ -1674,23 +1932,13 @@ class StateRepository:
                 raise TransitionError("disabled schedule cannot claim an occurrence")
             if str(schedule["config_hash"]) != schedule_hash:
                 raise ConflictError("schedule hash drift")
-            bundle = self._bundle_row(bundle_key)
-            if (
-                str(bundle["profile_id"]) != str(schedule["profile_id"])
-                or str(bundle["source_bucket"]) != str(schedule["bucket"])
-                or str(bundle["status"]) != "active"
-            ):
-                raise ConflictError("schedule content claim does not match profile and bucket")
-            if bundle["claimed_by_id"] is not None:
-                raise ConflictError("bundle is already transactionally claimed")
             now = self._now_text()
             cursor = self._connection.execute(
-                "INSERT INTO schedule_runs(schedule_key, bundle_key, local_date, "
+                "INSERT INTO schedule_runs(schedule_key, local_date, "
                 "scheduled_at, utc_offset_minutes, schedule_hash, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
                 (
                     schedule_key,
-                    bundle_key,
                     local_date,
                     scheduled_text,
                     utc_offset_minutes,
@@ -1700,20 +1948,85 @@ class StateRepository:
                 ),
             )
             run_id = _lastrowid(cursor)
-            self._connection.execute(
-                "UPDATE bundles SET claimed_by_type = 'schedule', claimed_by_id = ?, "
-                "updated_at = ? WHERE bundle_key = ?",
-                (str(run_id), now, bundle_key),
-            )
         return self.get_schedule_run(run_id)
 
+    def claim_schedule_content(
+        self,
+        run_id: int,
+        bundle_key: int,
+        *,
+        expected_revision: int,
+    ) -> ScheduleRunRecord:
+        """Atomically bind due work to exact profile content and start dispatch."""
+
+        with self._transaction():
+            run = self._schedule_run_row(run_id)
+            self._require_revision(run, expected_revision, "schedule run")
+            if str(run["state"]) != "due" or run["bundle_key"] is not None:
+                raise TransitionError("only an unclaimed due schedule run can dispatch")
+            schedule = self._schedule_row(int(run["schedule_key"]))
+            bundle = self._bundle_row(bundle_key)
+            if (
+                str(bundle["profile_id"]) != str(schedule["profile_id"])
+                or str(bundle["source_bucket"]) != str(schedule["bucket"])
+                or str(bundle["status"]) != "active"
+            ):
+                raise ConflictError(
+                    "schedule content claim does not match profile and bucket"
+                )
+            if bundle["claimed_by_id"] is not None:
+                raise ConflictError("bundle is already transactionally claimed")
+            now = self._now_text()
+            updated_run = self._connection.execute(
+                "UPDATE schedule_runs SET bundle_key = ?, state = 'dispatching', "
+                "revision = revision + 1, updated_at = ? WHERE run_id = ? "
+                "AND state = 'due' AND bundle_key IS NULL AND revision = ?",
+                (bundle_key, now, run_id, expected_revision),
+            )
+            if updated_run.rowcount != 1:
+                raise ConflictError("schedule run claim became stale")
+            updated_bundle = self._connection.execute(
+                "UPDATE bundles SET claimed_by_type = 'schedule', claimed_by_id = ?, "
+                "updated_at = ? WHERE bundle_key = ? AND claimed_by_id IS NULL",
+                (str(run_id), now, bundle_key),
+            )
+            if updated_bundle.rowcount != 1:
+                raise ConflictError("bundle schedule claim became stale")
+        return self.get_schedule_run(run_id)
+
+    def claim_schedule_occurrence(
+        self,
+        schedule_key: int,
+        *,
+        local_date: str,
+        scheduled_at: datetime,
+        utc_offset_minutes: int,
+        schedule_hash: str,
+        bundle_key: int,
+    ) -> ScheduleRunRecord:
+        """Resume the queued→due→dispatching graph while claiming exact content."""
+
+        run = self.create_schedule_occurrence(
+            schedule_key,
+            local_date=local_date,
+            scheduled_at=scheduled_at,
+            utc_offset_minutes=utc_offset_minutes,
+            schedule_hash=schedule_hash,
+        )
+        if run.state == "queued":
+            run = self.transition_schedule_run(
+                run.run_id, "due", expected_revision=run.revision
+            )
+        if run.state == "due":
+            return self.claim_schedule_content(
+                run.run_id, bundle_key, expected_revision=run.revision
+            )
+        if run.state == "dispatching" and run.bundle_key == bundle_key:
+            return run
+        raise ConflictError("schedule occurrence cannot claim different content")
+
     def get_schedule_run(self, run_id: int) -> ScheduleRunRecord:
-        row = self._connection.execute(
-            "SELECT * FROM schedule_runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if row is None:
-            raise StateValidationError("unknown schedule run")
-        return self._schedule_run_from_row(row)
+        return self._schedule_run_from_row(self._schedule_run_row(run_id))
 
     def transition_schedule_run(
         self,
@@ -1727,20 +2040,18 @@ class StateRepository:
         if state not in _SCHEDULE_RUN_TRANSITIONS:
             raise StateValidationError("unknown schedule run state")
         with self._transaction():
-            row = self._connection.execute(
-                "SELECT * FROM schedule_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise StateValidationError("unknown schedule run")
+            row = self._schedule_run_row(run_id)
             self._require_revision(row, expected_revision, "schedule run")
             current = str(row["state"])
             if state not in _SCHEDULE_RUN_TRANSITIONS[current]:
                 raise TransitionError("illegal schedule run transition")
-            self._connection.execute(
+            updated = self._connection.execute(
                 "UPDATE schedule_runs SET state = ?, revision = revision + 1, "
-                "updated_at = ? WHERE run_id = ?",
-                (state, self._now_text(), run_id),
+                "updated_at = ? WHERE run_id = ? AND state = ? AND revision = ?",
+                (state, self._now_text(), run_id, current, expected_revision),
             )
+            if updated.rowcount != 1:
+                raise ConflictError("schedule run transition became stale")
         return self.get_schedule_run(run_id)
 
     def next_selection_counter(self, profile_id: str) -> int:
@@ -1806,6 +2117,7 @@ class StateRepository:
                 bundle_key=bundle_key,
                 schedule_key=schedule_key,
                 intent_id=intent_id,
+                approved_intent_id=None,
             )
 
     def _create_run_request_locked(
@@ -1819,6 +2131,7 @@ class StateRepository:
         bundle_key: int | None,
         schedule_key: int | None,
         intent_id: str | None,
+        approved_intent_id: str | None,
     ) -> RunRequestRecord:
         if action not in _REQUEST_ACTIONS:
             raise StateValidationError("run request action is not allow-listed")
@@ -1826,11 +2139,14 @@ class StateRepository:
         if expected_revision < 0:
             raise StateValidationError("expected revision must be non-negative")
         self._require_profile(profile_id)
-        if bundle_key is not None and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id:
-            raise ConflictError("run request bundle belongs to another profile")
-        if schedule_key is not None and str(self._schedule_row(schedule_key)["profile_id"]) != profile_id:
-            raise ConflictError("run request schedule belongs to another profile")
         arguments_json = self._safe_json(arguments)
+        confirmation_required = self._validate_request_action_locked(
+            action,
+            json.loads(arguments_json),
+            profile_id,
+            bundle_key,
+            schedule_key,
+        )
         binding = self._safe_json(
             {
                 "profile_id": profile_id,
@@ -1850,6 +2166,14 @@ class StateRepository:
             if str(existing["request_sha256"]) != request_hash:
                 raise ConflictError("idempotency key was used for a different request")
             return self._request_from_row(existing)
+        if confirmation_required and (
+            approved_intent_id is None or approved_intent_id != intent_id
+        ):
+            raise TransitionError("run request requires an approved confirmation intent")
+        if not confirmation_required and intent_id is not None:
+            raise StateValidationError(
+                "run request action does not accept a confirmation intent"
+            )
         now = self._now_text()
         cursor = self._connection.execute(
             "INSERT INTO run_requests(profile_id, action, arguments_json, request_sha256, "
@@ -1937,10 +2261,11 @@ class StateRepository:
         fingerprint: str | None,
         consequence: str,
         expires_at: datetime,
+        bundle_key: int | None = None,
+        schedule_key: int | None = None,
     ) -> ConfirmationIntentRecord:
         if action not in _REQUEST_ACTIONS:
             raise StateValidationError("confirmation action is not allow-listed")
-        self._require_profile(profile_id)
         if resource_revision < 0:
             raise StateValidationError("resource revision must be non-negative")
         if fingerprint is not None:
@@ -1950,28 +2275,52 @@ class StateRepository:
         if _parse_timestamp(expires_text) <= self._now():
             raise StateValidationError("confirmation intent expiry must be in the future")
         arguments_json = self._safe_json(arguments)
-        binding = self._intent_binding(
-            action,
-            arguments_json,
-            profile_id,
-            resource_revision,
-            fingerprint,
-        )
         intent_id = secrets.token_hex(16)
         nonce = secrets.token_hex(32)
         now = self._now_text()
         with self._transaction():
+            self._require_profile(profile_id)
+            confirmation_required = self._validate_request_action_locked(
+                action,
+                json.loads(arguments_json),
+                profile_id,
+                bundle_key,
+                schedule_key,
+            )
+            if not confirmation_required:
+                raise StateValidationError(
+                    "confirmation intent is not valid for this action"
+                )
+            self._assert_confirmation_resource_locked(
+                action=action,
+                profile_id=profile_id,
+                bundle_key=bundle_key,
+                schedule_key=schedule_key,
+                resource_revision=resource_revision,
+                fingerprint=fingerprint,
+            )
+            binding = self._intent_binding(
+                action,
+                arguments_json,
+                profile_id,
+                bundle_key,
+                schedule_key,
+                resource_revision,
+                fingerprint,
+            )
             self._connection.execute(
                 "INSERT INTO confirmation_intents(intent_id, action, arguments_json, "
-                "binding_sha256, profile_id, resource_revision, fingerprint, consequence, "
-                "nonce, expires_at, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "binding_sha256, profile_id, bundle_key, schedule_key, resource_revision, "
+                "fingerprint, consequence, nonce, expires_at, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     intent_id,
                     action,
                     arguments_json,
                     binding,
                     profile_id,
+                    bundle_key,
+                    schedule_key,
                     resource_revision,
                     fingerprint,
                     consequence,
@@ -2026,6 +2375,8 @@ class StateRepository:
                 action,
                 arguments_json,
                 profile_id,
+                bundle_key,
+                schedule_key,
                 resource_revision,
                 fingerprint,
             )
@@ -2043,6 +2394,7 @@ class StateRepository:
                     bundle_key=bundle_key,
                     schedule_key=schedule_key,
                     intent_id=intent_id,
+                    approved_intent_id=intent_id,
                 )
             else:
                 row = self._intent_row(intent_id)
@@ -2053,7 +2405,20 @@ class StateRepository:
                     raise TransitionError("confirmation intent is not approved")
                 elif str(row["binding_sha256"]) != binding:
                     raise ConflictError("confirmation intent binding drift")
+                elif (
+                    cast(int | None, row["bundle_key"]) != bundle_key
+                    or cast(int | None, row["schedule_key"]) != schedule_key
+                ):
+                    raise ConflictError("confirmation intent resource drift")
                 else:
+                    self._assert_confirmation_resource_locked(
+                        action=action,
+                        profile_id=profile_id,
+                        bundle_key=bundle_key,
+                        schedule_key=schedule_key,
+                        resource_revision=resource_revision,
+                        fingerprint=fingerprint,
+                    )
                     result = self._create_run_request_locked(
                         profile_id=profile_id,
                         action=action,
@@ -2063,12 +2428,21 @@ class StateRepository:
                         bundle_key=bundle_key,
                         schedule_key=schedule_key,
                         intent_id=intent_id,
+                        approved_intent_id=intent_id,
                     )
-                    self._connection.execute(
+                    consumed = self._connection.execute(
                         "UPDATE confirmation_intents SET state = 'consumed', "
-                        "revision = revision + 1, updated_at = ? WHERE intent_id = ?",
-                        (self._now_text(), intent_id),
+                        "revision = revision + 1, updated_at = ? WHERE intent_id = ? "
+                        "AND state = 'approved' AND binding_sha256 = ? AND revision = ?",
+                        (
+                            self._now_text(),
+                            intent_id,
+                            binding,
+                            int(row["revision"]),
+                        ),
                     )
+                    if consumed.rowcount != 1:
+                        raise ConflictError("confirmation intent consumption became stale")
         if expired:
             raise TransitionError("confirmation intent expired")
         return cast(RunRequestRecord, result)
@@ -2162,18 +2536,50 @@ class StateRepository:
             raise StateValidationError("admission member phase is invalid")
         with self._transaction():
             journal = self._admission_row(journal_id)
-            if str(journal["phase"]) in {"installed", "rolled_back"}:
-                raise TransitionError("terminal admission journal cannot checkpoint members")
+            if str(journal["phase"]) in {
+                "ready_installed",
+                "installed",
+                "rolled_back",
+            }:
+                raise TransitionError(
+                    "sealed admission journal cannot checkpoint members"
+                )
             existing = self._connection.execute(
                 "SELECT * FROM admission_members WHERE journal_id = ? AND relative_name = ?",
                 (journal_id, relative_name),
             ).fetchone()
-            expected = (sha256, size_bytes, phase)
             if existing is not None:
-                stored = tuple(existing[name] for name in ("sha256", "size_bytes", "phase"))
-                if stored != expected:
-                    raise ConflictError("admission member checkpoint is immutable")
+                if (str(existing["sha256"]), int(existing["size_bytes"])) != (
+                    sha256,
+                    size_bytes,
+                ):
+                    raise ConflictError("admission member identity is immutable")
+                current_phase = str(existing["phase"])
+                if phase == current_phase:
+                    return self._admission_member_from_row(existing)
+                if (
+                    _ADMISSION_MEMBER_PHASE_ORDER[phase]
+                    != _ADMISSION_MEMBER_PHASE_ORDER[current_phase] + 1
+                ):
+                    raise TransitionError(
+                        "admission member phase must advance one checkpoint at a time"
+                    )
+                now = self._now_text()
+                self._connection.execute(
+                    "UPDATE admission_members SET phase = ?, updated_at = ? "
+                    "WHERE journal_id = ? AND relative_name = ? AND phase = ?",
+                    (phase, now, journal_id, relative_name, current_phase),
+                )
+                self._connection.execute(
+                    "UPDATE admission_journals SET phase = 'copying', "
+                    "revision = revision + 1, updated_at = ? WHERE journal_id = ?",
+                    (now, journal_id),
+                )
             else:
+                if phase != "planned":
+                    raise TransitionError(
+                        "admission member must begin with a planned checkpoint"
+                    )
                 now = self._now_text()
                 self._connection.execute(
                     "INSERT INTO admission_members(journal_id, relative_name, sha256, "
@@ -2200,14 +2606,35 @@ class StateRepository:
             row = self._admission_row(journal_id)
             self._require_revision(row, expected_revision, "admission journal")
             current = str(row["phase"])
+            if phase == current:
+                return self._admission_from_row(row)
             if current in {"installed", "rolled_back"} or phase == "started":
                 raise TransitionError("illegal admission journal transition")
             if phase == "rolled_back":
                 allowed = True
             else:
-                allowed = _ADMISSION_PHASES.index(phase) >= _ADMISSION_PHASES.index(current)
+                allowed = (
+                    (current, phase)
+                    in {("copying", "ready_installed"), ("ready_installed", "installed")}
+                )
             if not allowed:
                 raise TransitionError("admission phase cannot move backward")
+            if phase == "ready_installed":
+                incomplete = self._connection.execute(
+                    "SELECT 1 FROM admission_members WHERE journal_id = ? "
+                    "AND phase != 'verified' LIMIT 1",
+                    (journal_id,),
+                ).fetchone()
+                member_count = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM admission_members WHERE journal_id = ?",
+                        (journal_id,),
+                    ).fetchone()[0]
+                )
+                if member_count == 0 or incomplete is not None:
+                    raise TransitionError(
+                        "all admission members must be verified before ready install"
+                    )
             if phase != current:
                 self._connection.execute(
                     "UPDATE admission_journals SET phase = ?, revision = revision + 1, "
@@ -2235,16 +2662,30 @@ class StateRepository:
         platform: Platform,
         error_code: str,
         error_message: str,
+        *,
+        claim_token: str,
+        attempt_count: int,
     ) -> None:
         now = self._now_text()
-        self._connection.execute(
+        updated = self._connection.execute(
             "UPDATE deliveries SET status = 'ambiguous', phase = NULL, "
             "safe_to_retry = 0, next_attempt_at = NULL, claim_token = NULL, "
             "error_code = ?, error_message = ?, "
             "revision = revision + 1, updated_at = ? "
-            "WHERE bundle_key = ? AND platform = ?",
-            (error_code, error_message, now, bundle_key, platform),
+            "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+            "AND claim_token = ? AND attempt_count = ?",
+            (
+                error_code,
+                error_message,
+                now,
+                bundle_key,
+                platform,
+                claim_token,
+                attempt_count,
+            ),
         )
+        if updated.rowcount != 1:
+            raise ConflictError("delivery claim became stale")
         self._block_bundle_locked(bundle_key, error_code)
         self._insert_event_locked(
             bundle_key,
@@ -2347,6 +2788,8 @@ class StateRepository:
         action: str,
         arguments_json: str,
         profile_id: str,
+        bundle_key: int | None,
+        schedule_key: int | None,
         resource_revision: int,
         fingerprint: str | None,
     ) -> str:
@@ -2356,11 +2799,132 @@ class StateRepository:
                     "action": action,
                     "arguments": json.loads(arguments_json),
                     "profile_id": profile_id,
+                    "bundle_key": bundle_key,
+                    "schedule_key": schedule_key,
                     "resource_revision": resource_revision,
                     "fingerprint": fingerprint,
                 }
             )
         )
+
+    def _validate_request_action_locked(
+        self,
+        action: str,
+        arguments: object,
+        profile_id: str,
+        bundle_key: int | None,
+        schedule_key: int | None,
+    ) -> bool:
+        if not isinstance(arguments, dict):
+            raise StateValidationError("run request arguments must be an object")
+        if action in _BUNDLE_REQUEST_ACTIONS:
+            if bundle_key is None or schedule_key is not None:
+                raise StateValidationError(
+                    "run request action requires exactly one bundle resource"
+                )
+        elif action in _SCHEDULE_REQUEST_ACTIONS:
+            if schedule_key is None or bundle_key is not None:
+                raise StateValidationError(
+                    "run request action requires exactly one schedule resource"
+                )
+        elif action in _PROFILE_REQUEST_ACTIONS:
+            if bundle_key is not None or schedule_key is not None:
+                raise StateValidationError(
+                    "run request action is bound only to its profile"
+                )
+        elif action == "run_now":
+            if schedule_key is not None:
+                raise StateValidationError("run-now cannot bind a schedule resource")
+        else:
+            raise StateValidationError("run request action is not allow-listed")
+
+        if bundle_key is not None and str(
+            self._bundle_row(bundle_key)["profile_id"]
+        ) != profile_id:
+            raise ConflictError("run request bundle belongs to another profile")
+        if schedule_key is not None and str(
+            self._schedule_row(schedule_key)["profile_id"]
+        ) != profile_id:
+            raise ConflictError("run request schedule belongs to another profile")
+
+        if action in _ALWAYS_CONFIRMED_ACTIONS:
+            return True
+        if action == "schedule_create":
+            return arguments.get("enabled") is True
+        if action == "schedule_update":
+            schedule = self._schedule_row(cast(int, schedule_key))
+            due = self._connection.execute(
+                "SELECT 1 FROM schedule_runs WHERE schedule_key = ? "
+                "AND state IN ('queued', 'due', 'dispatching') LIMIT 1",
+                (schedule_key,),
+            ).fetchone()
+            return bool(schedule["enabled"]) or due is not None or arguments.get(
+                "enabled"
+            ) is True
+        if action == "resume":
+            due = self._connection.execute(
+                "SELECT 1 FROM schedule_runs sr JOIN schedules s "
+                "ON s.schedule_key = sr.schedule_key WHERE s.profile_id = ? "
+                "AND sr.state IN ('due', 'dispatching') LIMIT 1",
+                (profile_id,),
+            ).fetchone()
+            return due is not None
+        return False
+
+    def _assert_confirmation_resource_locked(
+        self,
+        *,
+        action: str,
+        profile_id: str,
+        bundle_key: int | None,
+        schedule_key: int | None,
+        resource_revision: int,
+        fingerprint: str | None,
+    ) -> None:
+        if bundle_key is not None:
+            bundle = self._bundle_row(bundle_key)
+            if str(bundle["profile_id"]) != profile_id:
+                raise ConflictError("confirmation bundle belongs to another profile")
+            self._require_revision(bundle, resource_revision, "confirmation bundle")
+            if fingerprint is None or str(bundle["fingerprint"]) != fingerprint:
+                raise ConflictError("confirmation bundle fingerprint drift")
+            return
+        if schedule_key is not None:
+            schedule = self._schedule_row(schedule_key)
+            if str(schedule["profile_id"]) != profile_id:
+                raise ConflictError("confirmation schedule belongs to another profile")
+            self._require_revision(
+                schedule, resource_revision, "confirmation schedule"
+            )
+            if fingerprint is None or str(schedule["config_hash"]) != fingerprint:
+                raise ConflictError("confirmation schedule fingerprint drift")
+            return
+        if action in {"pause", "resume"}:
+            pause = cast(
+                sqlite3.Row,
+                self._connection.execute(
+                    "SELECT * FROM pause_state WHERE singleton = 1"
+                ).fetchone(),
+            )
+            self._require_revision(pause, resource_revision, "confirmation pause state")
+        else:
+            profile = self._connection.execute(
+                "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
+            self._require_revision(
+                cast(sqlite3.Row, profile),
+                resource_revision,
+                "confirmation profile",
+            )
+        if action == "admit_draft":
+            if fingerprint is None:
+                raise StateValidationError(
+                    "draft admission confirmation requires a fingerprint"
+                )
+        elif fingerprint is not None:
+            raise StateValidationError(
+                "profile confirmation cannot bind a bundle fingerprint"
+            )
 
     def _expire_intent_locked(self, intent_id: str) -> None:
         self._connection.execute(
@@ -2394,6 +2958,14 @@ class StateRepository:
             raise StateValidationError("unknown schedule")
         return cast(sqlite3.Row, row)
 
+    def _schedule_run_row(self, run_id: int) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM schedule_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateValidationError("unknown schedule run")
+        return cast(sqlite3.Row, row)
+
     def _request_row(self, request_id: int) -> sqlite3.Row:
         row = self._connection.execute(
             "SELECT * FROM run_requests WHERE request_id = ?", (request_id,)
@@ -2423,6 +2995,46 @@ class StateRepository:
             "SELECT 1 FROM profiles WHERE profile_id = ?", (profile_id,)
         ).fetchone() is None:
             raise StateValidationError("unknown profile")
+
+    @staticmethod
+    def _require_delivery_claim(
+        row: sqlite3.Row, claim_token: str, attempt_count: int
+    ) -> None:
+        _validate_identifier(claim_token, "claim token")
+        if attempt_count <= 0:
+            raise StateValidationError("delivery attempt identity is invalid")
+        if (
+            str(row["status"]) != "in_flight"
+            or str(row["claim_token"]) != claim_token
+            or int(row["attempt_count"]) != attempt_count
+        ):
+            raise ConflictError("delivery claim is stale")
+
+    @staticmethod
+    def _validated_staged_artifact_path(
+        relative_path: str, kind: str, bundle: sqlite3.Row
+    ) -> str:
+        normalized = _relative_path_text(relative_path, "staged artifact path")
+        path = PurePosixPath(normalized)
+        profile_id = str(bundle["profile_id"])
+        bucket = str(bundle["source_bucket"])
+        fingerprint = str(bundle["fingerprint"])
+        if kind == "staged_private":
+            if len(path.parts) != 4 or path.parts[:3] != (
+                profile_id,
+                bucket,
+                fingerprint,
+            ):
+                raise StateValidationError(
+                    "private staged artifact path does not match bundle identity"
+                )
+        else:
+            prefix = f"{profile_id}-{bucket}-{fingerprint}-"
+            if len(path.parts) != 1 or not path.name.startswith(prefix):
+                raise StateValidationError(
+                    "public staged artifact path does not match bundle identity"
+                )
+        return normalized
 
     @staticmethod
     def _require_revision(
@@ -2472,6 +3084,7 @@ class StateRepository:
         return ArtifactRecord(
             bundle_key=int(row["bundle_key"]),
             platform=cast(Platform, str(row["platform"])),
+            attempt_count=int(row["attempt_count"]),
             kind=str(row["kind"]),
             ordinal=int(row["ordinal"]),
             external_id=cast(str | None, row["external_id"]),
@@ -2538,6 +3151,8 @@ class StateRepository:
             action=str(row["action"]),
             arguments=cast(Mapping[str, object], json.loads(str(row["arguments_json"]))),
             profile_id=str(row["profile_id"]),
+            bundle_key=cast(int | None, row["bundle_key"]),
+            schedule_key=cast(int | None, row["schedule_key"]),
             resource_revision=int(row["resource_revision"]),
             fingerprint=cast(str | None, row["fingerprint"]),
             consequence=str(row["consequence"]),

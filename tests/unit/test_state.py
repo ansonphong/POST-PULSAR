@@ -118,6 +118,16 @@ def _bundle(repository: StateRepository, bundle_id: str = "post") -> int:
     )
 
 
+def _claim(
+    repository: StateRepository,
+    bundle_key: int,
+    platform: str,
+    token: str,
+) -> dict[str, object]:
+    delivery = repository.claim_delivery(bundle_key, platform, token)  # type: ignore[arg-type]
+    return {"claim_token": token, "attempt_count": delivery.attempt_count}
+
+
 def test_schema_initialization_reopen_and_pragmas_are_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -177,9 +187,13 @@ def test_profile_identity_and_active_root_snapshot_are_immutable(
             config_hash="1" * 64,
         )
 
-    repository.claim_delivery(bundle_key, "x", "archive-claim")
-    repository.advance_delivery_phase(bundle_key, "x", "final_dispatch_started")
-    repository.publish_delivery(bundle_key, "x", remote_id="tweet-archive")
+    claim = _claim(repository, bundle_key, "x", "archive-claim")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+    )
+    repository.publish_delivery(
+        bundle_key, "x", remote_id="tweet-archive", **claim  # type: ignore[arg-type]
+    )
     repository.begin_archiving(bundle_key, expected_revision=1)
     repository.mark_archived(bundle_key, "POSTED/QUEUE/post", expected_revision=2)
     updated = repository.register_profile(
@@ -301,19 +315,35 @@ def test_delivery_checkpoints_attempt_and_failure_counters_block_on_fifth(
             bundle_key,
             "x",
             kind="x_media_id",
-            ordinal=attempt,
+            ordinal=0,
             external_id=f"media-{attempt}",
             expires_at=clock() + timedelta(hours=1),
             processing_metadata={"state": "pending", "progress_percent": 25},
+            claim_token=f"claim-{attempt}",
+            attempt_count=delivery.attempt_count,
         )
-        repository.advance_delivery_phase(bundle_key, "x", "processing")
-        repository.advance_delivery_phase(bundle_key, "x", "ready")
+        repository.advance_delivery_phase(
+            bundle_key,
+            "x",
+            "processing",
+            claim_token=f"claim-{attempt}",
+            attempt_count=delivery.attempt_count,
+        )
+        repository.advance_delivery_phase(
+            bundle_key,
+            "x",
+            "ready",
+            claim_token=f"claim-{attempt}",
+            attempt_count=delivery.attempt_count,
+        )
         failed = repository.fail_delivery(
             bundle_key,
             "x",
             error_code="platform_busy",
             error_message="Platform asked to retry later.",
             retry_at=clock(),
+            claim_token=f"claim-{attempt}",
+            attempt_count=delivery.attempt_count,
         )
         assert failed.consecutive_failures == attempt
         if attempt < 5:
@@ -328,14 +358,15 @@ def test_artifact_checkpoint_is_idempotent_but_not_mutable(tmp_path: Path) -> No
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "claim")
+    claim = _claim(repository, bundle_key, "x", "claim")
     values = {
         "kind": "staged_private",
         "ordinal": 0,
-        "relative_path": "ansonphong/abc/media.jpg",
+        "relative_path": f"ansonphong/QUEUE/{'b' * 64}/media.jpg",
         "sha256": "d" * 64,
         "expires_at": clock() + timedelta(hours=1),
         "processing_metadata": {"state": "ready", "check_after_seconds": 2},
+        **claim,
     }
     first = repository.checkpoint_artifact(bundle_key, "x", **values)
     replay = repository.checkpoint_artifact(bundle_key, "x", **values)
@@ -362,7 +393,7 @@ def test_instagram_container_and_public_staging_checkpoints_are_durable(
         files=(_file("instagram-post.jpg"),),
         targets=(_instagram_target(),),
     )
-    repository.claim_delivery(bundle_key, "instagram", "claim")
+    claim = _claim(repository, bundle_key, "instagram", "claim")
     expiry = clock() + timedelta(hours=24)
 
     child = repository.checkpoint_artifact(
@@ -373,7 +404,18 @@ def test_instagram_container_and_public_staging_checkpoints_are_durable(
         external_id="child-1",
         expires_at=expiry,
         processing_metadata={"state": "IN_PROGRESS"},
+        **claim,  # type: ignore[arg-type]
     )
+    with pytest.raises(StateValidationError, match="ordinal"):
+        repository.checkpoint_artifact(
+            bundle_key,
+            "instagram",
+            kind="instagram_parent_container",
+            ordinal=1,
+            external_id="parent-wrong-ordinal",
+            expires_at=expiry,
+            **claim,  # type: ignore[arg-type]
+        )
     parent = repository.checkpoint_artifact(
         bundle_key,
         "instagram",
@@ -382,20 +424,22 @@ def test_instagram_container_and_public_staging_checkpoints_are_durable(
         external_id="parent-1",
         expires_at=expiry,
         processing_metadata={"state": "FINISHED"},
+        **claim,  # type: ignore[arg-type]
     )
     staged = repository.checkpoint_artifact(
         bundle_key,
         "instagram",
         kind="staged_public",
         ordinal=0,
-        relative_path="ansonphong/hash/media.jpg",
+        relative_path=f"ansonphong-QUEUE-{'b' * 64}-01-{'e' * 64}.jpg",
         sha256="e" * 64,
         expires_at=expiry,
+        **claim,  # type: ignore[arg-type]
     )
 
     assert child.external_id == "child-1"
     assert parent.external_id == "parent-1"
-    assert staged.relative_path == "ansonphong/hash/media.jpg"
+    assert staged.relative_path == f"ansonphong-QUEUE-{'b' * 64}-01-{'e' * 64}.jpg"
     assert staged.expires_at == expiry
 
 
@@ -405,17 +449,22 @@ def test_published_resets_consecutive_failures_and_preserves_lifetime_attempts(
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "one")
+    first_claim = _claim(repository, bundle_key, "x", "one")
     repository.fail_delivery(
         bundle_key,
         "x",
         error_code="retryable",
         error_message="Try later.",
         retry_at=clock(),
+        **first_claim,  # type: ignore[arg-type]
     )
-    repository.claim_delivery(bundle_key, "x", "two")
-    repository.advance_delivery_phase(bundle_key, "x", "final_dispatch_started")
-    delivery = repository.publish_delivery(bundle_key, "x", remote_id="tweet-1")
+    second_claim = _claim(repository, bundle_key, "x", "two")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **second_claim  # type: ignore[arg-type]
+    )
+    delivery = repository.publish_delivery(
+        bundle_key, "x", remote_id="tweet-1", **second_claim  # type: ignore[arg-type]
+    )
 
     assert delivery.status == "published"
     assert delivery.attempt_count == 2
@@ -428,8 +477,10 @@ def test_stale_final_dispatch_is_ambiguous_and_never_auto_retried(
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "claim")
-    repository.advance_delivery_phase(bundle_key, "x", "final_dispatch_started")
+    claim = _claim(repository, bundle_key, "x", "claim")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+    )
     clock.advance(hours=1)
 
     recovered = repository.recover_stale(clock() - timedelta(minutes=30))
@@ -447,14 +498,17 @@ def test_uncertain_final_result_can_be_marked_ambiguous_transactionally(
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "claim")
-    repository.advance_delivery_phase(bundle_key, "x", "final_dispatch_started")
+    claim = _claim(repository, bundle_key, "x", "claim")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+    )
 
     delivery = repository.mark_delivery_ambiguous(
         bundle_key,
         "x",
         error_code="dispatch_timeout",
         error_message="Final request timed out; outcome is unknown.",
+        **claim,  # type: ignore[arg-type]
     )
 
     assert delivery.status == "ambiguous"
@@ -469,9 +523,11 @@ def test_stale_pre_final_attempt_becomes_safely_retryable_failure(
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "claim")
+    claim = _claim(repository, bundle_key, "x", "claim")
     if phase != "preparing":
-        repository.advance_delivery_phase(bundle_key, "x", phase)  # type: ignore[arg-type]
+        repository.advance_delivery_phase(
+            bundle_key, "x", phase, **claim  # type: ignore[arg-type]
+        )
     clock.advance(hours=1)
 
     recovered = repository.recover_stale(clock() - timedelta(minutes=30))
@@ -488,7 +544,7 @@ def test_operator_retry_is_guarded_and_resets_only_consecutive_failures(
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
-    repository.claim_delivery(bundle_key, "x", "claim")
+    claim = _claim(repository, bundle_key, "x", "claim")
     repository.fail_delivery(
         bundle_key,
         "x",
@@ -496,6 +552,7 @@ def test_operator_retry_is_guarded_and_resets_only_consecutive_failures(
         error_message="Permission denied.",
         retry_at=None,
         permanent=True,
+        **claim,  # type: ignore[arg-type]
     )
     before = repository.get_delivery(bundle_key, "x")
 
@@ -577,12 +634,12 @@ def test_schedule_occurrence_content_claim_and_random_counter_are_atomic(
     assert replay == run
     assert run.state == "dispatching"
     completed = repository.transition_schedule_run(
-        run.run_id, "completed", expected_revision=1
+        run.run_id, "completed", expected_revision=run.revision
     )
     assert completed.state == "completed"
     with pytest.raises(TransitionError, match="schedule run"):
         repository.transition_schedule_run(
-            run.run_id, "failed", expected_revision=2
+            run.run_id, "failed", expected_revision=completed.revision
         )
     assert repository.next_selection_counter("ansonphong") == 0
     assert repository.next_selection_counter("ansonphong") == 1
@@ -621,25 +678,23 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     bundle_key = _bundle(repository)
     request = repository.create_run_request(
         profile_id="ansonphong",
-        action="run_now",
-        arguments={"bucket": "QUEUE"},
+        action="pause",
+        arguments={},
         idempotency_key="request-1",
         expected_revision=1,
-        bundle_key=bundle_key,
     )
     assert repository.create_run_request(
         profile_id="ansonphong",
-        action="run_now",
-        arguments={"bucket": "QUEUE"},
+        action="pause",
+        arguments={},
         idempotency_key="request-1",
         expected_revision=1,
-        bundle_key=bundle_key,
     ) == request
     with pytest.raises(ConflictError, match="idempotency"):
         repository.create_run_request(
             profile_id="ansonphong",
-            action="run_now",
-            arguments={"bucket": "RANDOM"},
+            action="pause",
+            arguments={"unexpected": True},
             idempotency_key="request-1",
             expected_revision=1,
         )
@@ -652,11 +707,10 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     )
     replay = repository.create_run_request(
         profile_id="ansonphong",
-        action="run_now",
-        arguments={"bucket": "QUEUE"},
+        action="pause",
+        arguments={},
         idempotency_key="request-1",
         expected_revision=1,
-        bundle_key=bundle_key,
     )
     assert replay.status == "completed"
     assert replay.result == completed.result
@@ -676,6 +730,7 @@ def test_approved_intent_is_consumed_once_with_idempotent_request(
         fingerprint="b" * 64,
         consequence="Publish bundle post to X.",
         expires_at=clock() + timedelta(minutes=5),
+        bundle_key=bundle_key,
     )
     approved = repository.approve_confirmation_intent(
         intent.intent_id, expected_revision=1
@@ -708,14 +763,16 @@ def test_approved_intent_is_consumed_once_with_idempotent_request(
 def test_expired_or_drifted_intent_cannot_create_request(tmp_path: Path) -> None:
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
     intent = repository.create_confirmation_intent(
         action="retry",
-        arguments={"bundle": "post"},
+        arguments={"bundle_key": bundle_key},
         profile_id="ansonphong",
-        resource_revision=4,
+        resource_revision=1,
         fingerprint="b" * 64,
         consequence="Retry a blocked delivery.",
         expires_at=clock() + timedelta(seconds=1),
+        bundle_key=bundle_key,
     )
     repository.approve_confirmation_intent(intent.intent_id, expected_revision=1)
     clock.advance(seconds=2)
@@ -723,11 +780,12 @@ def test_expired_or_drifted_intent_cannot_create_request(tmp_path: Path) -> None
         repository.consume_intent_with_request(
             intent_id=intent.intent_id,
             action="retry",
-            arguments={"bundle": "post"},
+            arguments={"bundle_key": bundle_key},
             profile_id="ansonphong",
-            resource_revision=4,
+            resource_revision=1,
             fingerprint="b" * 64,
             idempotency_key="expired",
+            bundle_key=bundle_key,
         )
     assert repository.get_confirmation_intent(intent.intent_id).state == "expired"
 
@@ -743,27 +801,474 @@ def test_admission_journal_and_members_checkpoint_idempotently(tmp_path: Path) -
         destination_path="QUEUE/draft-one",
         intent_id=None,
     )
-    repository.checkpoint_admission_member(
-        journal.journal_id,
-        relative_name="draft-one.jpg",
-        sha256="a" * 64,
-        size_bytes=5,
-        phase="copied",
-    )
-    repository.checkpoint_admission_member(
-        journal.journal_id,
-        relative_name="draft-one.jpg",
-        sha256="a" * 64,
-        size_bytes=5,
-        phase="copied",
-    )
+    for phase in ("planned", "copied", "verified"):
+        repository.checkpoint_admission_member(
+            journal.journal_id,
+            relative_name="draft-one.jpg",
+            sha256="a" * 64,
+            size_bytes=5,
+            phase=phase,
+        )
+    revision = repository.get_admission(journal.journal_id).revision
     ready = repository.advance_admission(
-        journal.journal_id, "ready_installed", expected_revision=2
+        journal.journal_id, "ready_installed", expected_revision=revision
     )
     installed = repository.advance_admission(
-        journal.journal_id, "installed", expected_revision=3
+        journal.journal_id, "installed", expected_revision=ready.revision
     )
 
     assert ready.phase == "ready_installed"
     assert installed.phase == "installed"
-    assert repository.list_admission_members(journal.journal_id)[0].phase == "copied"
+    assert repository.list_admission_members(journal.journal_id)[0].phase == "verified"
+
+
+def test_final_dispatch_failure_is_always_ambiguous_and_nonretryable(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    claim = _claim(repository, bundle_key, "x", "final-failure")
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
+    )
+
+    delivery = repository.fail_delivery(
+        bundle_key,
+        "x",
+        error_code="transport_timeout",
+        error_message="The final response was not received.",
+        retry_at=clock() + timedelta(minutes=1),
+        **claim,  # type: ignore[arg-type]
+    )
+
+    assert delivery.status == "ambiguous"
+    assert not delivery.safe_to_retry
+    assert delivery.next_attempt_at is None
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
+def test_stale_delivery_worker_cannot_mutate_a_new_attempt(tmp_path: Path) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    stale = _claim(repository, bundle_key, "x", "worker-old")
+    repository.fail_delivery(
+        bundle_key,
+        "x",
+        error_code="retry",
+        error_message="Retry safely.",
+        retry_at=clock(),
+        **stale,  # type: ignore[arg-type]
+    )
+    current = _claim(repository, bundle_key, "x", "worker-new")
+
+    with pytest.raises(ConflictError, match="claim"):
+        repository.advance_delivery_phase(
+            bundle_key, "x", "processing", **stale  # type: ignore[arg-type]
+        )
+    with pytest.raises(ConflictError, match="claim"):
+        repository.checkpoint_artifact(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="stale-media",
+            expires_at=clock() + timedelta(hours=1),
+            **stale,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ConflictError, match="claim"):
+        repository.fail_delivery(
+            bundle_key,
+            "x",
+            error_code="stale",
+            error_message="Stale worker.",
+            retry_at=clock(),
+            **stale,  # type: ignore[arg-type]
+        )
+
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **current,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ConflictError, match="claim"):
+        repository.publish_delivery(
+            bundle_key,
+            "x",
+            remote_id="stale-post",
+            **stale,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ConflictError, match="claim"):
+        repository.mark_delivery_ambiguous(
+            bundle_key,
+            "x",
+            error_code="stale",
+            error_message="Stale worker.",
+            **stale,  # type: ignore[arg-type]
+        )
+
+
+def test_run_request_matrix_and_intent_resource_drift_fail_closed(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    with pytest.raises(TransitionError, match="confirmation"):
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="run_now",
+            arguments={"bundle_key": bundle_key},
+            idempotency_key="unconfirmed-run",
+            expected_revision=1,
+            bundle_key=bundle_key,
+        )
+    with pytest.raises(StateValidationError, match="bundle resource"):
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="retry",
+            arguments={},
+            idempotency_key="missing-bundle",
+            expected_revision=1,
+        )
+    assert repository.create_run_request(
+        profile_id="ansonphong",
+        action="pause",
+        arguments={},
+        idempotency_key="safe-pause",
+        expected_revision=1,
+    ).status == "queued"
+
+    intent = repository.create_confirmation_intent(
+        action="run_now",
+        arguments={"bundle_key": bundle_key},
+        profile_id="ansonphong",
+        resource_revision=1,
+        fingerprint="b" * 64,
+        consequence="Publish the exact bundle.",
+        expires_at=clock() + timedelta(minutes=5),
+        bundle_key=bundle_key,
+    )
+    repository.approve_confirmation_intent(intent.intent_id, expected_revision=1)
+    repository.block_bundle(bundle_key, "operator_hold", expected_revision=1)
+    with pytest.raises(ConflictError, match="revision"):
+        repository.consume_intent_with_request(
+            intent_id=intent.intent_id,
+            action="run_now",
+            arguments={"bundle_key": bundle_key},
+            profile_id="ansonphong",
+            resource_revision=1,
+            fingerprint="b" * 64,
+            idempotency_key="drifted-intent",
+            bundle_key=bundle_key,
+        )
+    assert repository.get_confirmation_intent(intent.intent_id).state == "approved"
+
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="intent-schedule",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="10:00",
+        misfire_grace_seconds=60,
+        enabled=False,
+    )
+    schedule_intent = repository.create_confirmation_intent(
+        action="schedule_enable",
+        arguments={"enabled": True},
+        profile_id="ansonphong",
+        resource_revision=schedule.revision,
+        fingerprint=schedule.config_hash,
+        consequence="Enable this exact schedule.",
+        expires_at=clock() + timedelta(minutes=5),
+        schedule_key=schedule.schedule_key,
+    )
+    repository.approve_confirmation_intent(
+        schedule_intent.intent_id, expected_revision=schedule_intent.revision
+    )
+    schedule_request = repository.consume_intent_with_request(
+        intent_id=schedule_intent.intent_id,
+        action="schedule_enable",
+        arguments={"enabled": True},
+        profile_id="ansonphong",
+        resource_revision=schedule.revision,
+        fingerprint=schedule.config_hash,
+        idempotency_key="enable-schedule",
+        schedule_key=schedule.schedule_key,
+    )
+    assert schedule_request.schedule_key == schedule.schedule_key
+
+
+def test_unfinished_snapshot_prevents_target_removal_or_reassignment(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    _bundle(repository)
+
+    with pytest.raises(ConflictError, match="targets cannot change"):
+        repository.register_profile(
+            "ansonphong",
+            tmp_path / "accounts/ansonphong",
+            (_instagram_profile_target(),),
+            config_hash="2" * 64,
+            expected_revision=1,
+        )
+    with pytest.raises(ConflictError, match="remote identity"):
+        repository.register_profile(
+            "second",
+            tmp_path / "accounts/second",
+            (
+                ProfileTargetSnapshot(
+                    platform="x",
+                    expected_remote_user_id="10001",
+                    expected_username="second",
+                    token_env_var="POST_PULSAR_X_SECOND_USER_ACCESS_TOKEN",
+                    request_settings={},
+                ),
+            ),
+            config_hash="3" * 64,
+        )
+
+
+def test_admission_members_are_immutable_monotonic_and_verified_before_ready(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    journal = repository.start_admission(
+        profile_id="ansonphong",
+        bucket="QUEUE",
+        bundle_id="strict-draft",
+        fingerprint="f" * 64,
+        source_path="DRAFTS/QUEUE/strict-draft",
+        destination_path="QUEUE/strict-draft",
+        intent_id=None,
+    )
+    checkpoint = {
+        "relative_name": "strict-draft.jpg",
+        "sha256": "a" * 64,
+        "size_bytes": 5,
+    }
+    with pytest.raises(TransitionError, match="planned"):
+        repository.checkpoint_admission_member(
+            journal.journal_id, phase="copied", **checkpoint
+        )
+    repository.checkpoint_admission_member(
+        journal.journal_id, phase="planned", **checkpoint
+    )
+    with pytest.raises(ConflictError, match="identity"):
+        repository.checkpoint_admission_member(
+            journal.journal_id,
+            phase="copied",
+            **{**checkpoint, "sha256": "c" * 64},
+        )
+    with pytest.raises(TransitionError, match="one checkpoint"):
+        repository.checkpoint_admission_member(
+            journal.journal_id, phase="verified", **checkpoint
+        )
+    with pytest.raises(TransitionError, match="verified"):
+        repository.advance_admission(
+            journal.journal_id,
+            "ready_installed",
+            expected_revision=repository.get_admission(journal.journal_id).revision,
+        )
+    repository.checkpoint_admission_member(
+        journal.journal_id, phase="copied", **checkpoint
+    )
+    repository.checkpoint_admission_member(
+        journal.journal_id, phase="verified", **checkpoint
+    )
+    ready = repository.advance_admission(
+        journal.journal_id,
+        "ready_installed",
+        expected_revision=repository.get_admission(journal.journal_id).revision,
+    )
+    assert repository.advance_admission(
+        journal.journal_id, "installed", expected_revision=ready.revision
+    ).phase == "installed"
+
+
+def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository)
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="graph",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="09:00",
+        misfire_grace_seconds=60,
+        enabled=True,
+    )
+    first = repository.create_schedule_occurrence(
+        schedule.schedule_key,
+        local_date="2026-09-07",
+        scheduled_at=datetime(2026, 9, 7, 9, tzinfo=UTC),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
+    )
+    assert first.state == "queued" and first.bundle_key is None
+    due = repository.transition_schedule_run(
+        first.run_id, "due", expected_revision=first.revision
+    )
+    no_content = repository.transition_schedule_run(
+        due.run_id, "no_content", expected_revision=due.revision
+    )
+    assert no_content.state == "no_content"
+
+    second = repository.create_schedule_occurrence(
+        schedule.schedule_key,
+        local_date="2026-09-14",
+        scheduled_at=datetime(2026, 9, 14, 9, tzinfo=UTC),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
+    )
+    assert repository.transition_schedule_run(
+        second.run_id, "missed", expected_revision=second.revision
+    ).state == "missed"
+
+    third = repository.create_schedule_occurrence(
+        schedule.schedule_key,
+        local_date="2026-09-21",
+        scheduled_at=datetime(2026, 9, 21, 9, tzinfo=UTC),
+        utc_offset_minutes=0,
+        schedule_hash=schedule.config_hash,
+    )
+    third_due = repository.transition_schedule_run(
+        third.run_id, "due", expected_revision=third.revision
+    )
+    dispatching = repository.claim_schedule_content(
+        third.run_id, bundle_key, expected_revision=third_due.revision
+    )
+    assert repository.transition_schedule_run(
+        third.run_id, "failed", expected_revision=dispatching.revision
+    ).state == "failed"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "DROP INDEX delivery_remote_identity",
+        "DROP TRIGGER bundle_files_no_update",
+        "ALTER TABLE profiles ADD COLUMN injected TEXT",
+    ],
+)
+def test_current_schema_manifest_rejects_structural_drift(
+    tmp_path: Path, tamper: str
+) -> None:
+    path = tmp_path / "manifest.sqlite3"
+    StateRepository(path).close()
+    connection = sqlite3.connect(path)
+    connection.execute(tamper)
+    connection.close()
+
+    with pytest.raises(MigrationRequiredError, match="migration required"):
+        StateRepository(path)
+
+
+def test_conflicting_application_identity_is_rejected_safely(tmp_path: Path) -> None:
+    path = tmp_path / "foreign.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA application_id = 12345")
+    connection.close()
+
+    with pytest.raises(MigrationRequiredError, match="application identity"):
+        StateRepository(path)
+
+
+def test_artifact_kind_path_expiry_and_global_external_identity_invariants(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    first_bundle = _bundle(repository)
+    first_claim = _claim(repository, first_bundle, "x", "first-artifacts")
+
+    with pytest.raises(StateValidationError, match="expiry"):
+        repository.checkpoint_artifact(
+            first_bundle,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="shared-media",
+            **first_claim,  # type: ignore[arg-type]
+        )
+    with pytest.raises(StateValidationError, match="bundle identity"):
+        repository.checkpoint_artifact(
+            first_bundle,
+            "x",
+            kind="staged_private",
+            ordinal=0,
+            relative_path=f"other/QUEUE/{'b' * 64}/media.jpg",
+            sha256="d" * 64,
+            **first_claim,  # type: ignore[arg-type]
+        )
+    with pytest.raises(StateValidationError, match="bundle identity"):
+        repository.checkpoint_artifact(
+            first_bundle,
+            "x",
+            kind="staged_private",
+            ordinal=0,
+            relative_path=f"ansonphong/RANDOM/{'b' * 64}/media.jpg",
+            sha256="d" * 64,
+            **first_claim,  # type: ignore[arg-type]
+        )
+    repository.checkpoint_artifact(
+        first_bundle,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="shared-media",
+        expires_at=clock() + timedelta(hours=1),
+        **first_claim,  # type: ignore[arg-type]
+    )
+
+    repository.register_profile(
+        "second",
+        tmp_path / "accounts/second",
+        (
+            ProfileTargetSnapshot(
+                platform="x",
+                expected_remote_user_id="10002",
+                expected_username="second",
+                token_env_var="POST_PULSAR_X_SECOND_USER_ACCESS_TOKEN",
+                request_settings={},
+            ),
+        ),
+        config_hash="2" * 64,
+    )
+    second_bundle = repository.add_bundle(
+        profile_id="second",
+        bundle_id="other",
+        fingerprint="c" * 64,
+        source_bucket="QUEUE",
+        files=(_file("other.jpg"),),
+        targets=(
+            TargetSnapshot(
+                platform="x",
+                expected_remote_user_id="10002",
+                expected_username="second",
+                token_env_var="POST_PULSAR_X_SECOND_USER_ACCESS_TOKEN",
+                api_version="2",
+                adapter_version=1,
+                request_settings={},
+            ),
+        ),
+    )
+    second_claim = _claim(repository, second_bundle, "x", "second-artifacts")
+    with pytest.raises(ConflictError, match="artifact identity"):
+        repository.checkpoint_artifact(
+            second_bundle,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="shared-media",
+            expires_at=clock() + timedelta(hours=1),
+            **second_claim,  # type: ignore[arg-type]
+        )
