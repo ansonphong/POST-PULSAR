@@ -3,3 +3,8 @@
 {"event":"commit","sha":"3683b63","message":"chore(dev): complete Stage 3 — plan POST PULSAR modernization","time":"2026-09-06T01:39:44Z"}
 {"event":"commit","sha":"e270a5b","message":"harden(plan): close POST PULSAR execution gaps","time":"2026-09-06T02:00:47Z"}
 {"event":"commit","sha":"05020d3","message":"chore(dev): complete Stage 4 — harden POST PULSAR plan","time":"2026-09-06T02:01:06Z"}
+{"event":"commit","sha":"7f90ba7","message":"chore(dev): begin Stage 5 — execute POST PULSAR plan","time":"2026-09-06T02:02:13Z"}
+{"event":"commit","sha":"7f90ba7","message":"chore(dev): begin Stage 5 — execute POST PULSAR plan","time":"2026-09-06T02:05:47Z"}
+{"event":"commit","sha":"eaa7830","message":"feat: establish post-pulsar package baseline","time":"2026-09-06T02:05:58Z"}
+{"event":"commit","sha":"a1433dc","message":"fix(packaging): declare supported dependencies","time":"2026-09-06T02:10:54Z"}
+{"event":"commit","sha":"a1433dc","message":"fix(packaging): declare supported dependencies","time":"2026-09-06T02:11:20Z"}
