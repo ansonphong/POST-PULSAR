@@ -280,10 +280,11 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
     issues: list[InboxIssue] = []
     candidates: list[PublishableBundle] = []
     misplaced_ready = root / ".ready"
+    misplaced_ready_exists = False
     try:
         os.lstat(misplaced_ready)
     except FileNotFoundError:
-        pass
+        misplaced_ready_exists = False
     except OSError:
         issues.append(
             _bucket_issue(
@@ -294,6 +295,8 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
             )
         )
     else:
+        misplaced_ready_exists = True
+    if misplaced_ready_exists:
         issues.append(
             _bucket_issue(
                 "misplaced_ready_marker",
