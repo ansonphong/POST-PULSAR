@@ -29,7 +29,7 @@ from post_pulsar.platforms.base import (
     PublicationRequest,
     PublicationSnapshot,
 )
-from post_pulsar.platforms.http import PlatformHTTPClient
+from post_pulsar.platforms.http import HTTPPolicy, PlatformHTTPClient
 from post_pulsar.platforms.instagram import (
     GRAPH_API_VERSION,
     GRAPH_BASE_URL,
@@ -38,7 +38,14 @@ from post_pulsar.platforms.instagram import (
     InstagramAdapterError,
     PublicMediaCleaner,
 )
-from post_pulsar.state import ArtifactRecord, DeliveryRecord, TargetSnapshot
+from post_pulsar.state import (
+    ArtifactRecord,
+    BundleFileSnapshot,
+    DeliveryRecord,
+    ProfileTargetSnapshot,
+    StateRepository,
+    TargetSnapshot,
+)
 
 GRAPH = GRAPH_BASE_URL
 NOW = datetime(2026, 9, 5, 12, tzinfo=UTC)
@@ -194,6 +201,7 @@ class _Writer:
     def __init__(self) -> None:
         self.phases: list[str] = []
         self.artifacts: list[ArtifactRecord] = []
+        self.transitions: list[tuple[str, int, str]] = []
         self.warnings: list[tuple[str, dict[str, object]]] = []
 
     def advance_phase(self, phase: str) -> DeliveryRecord:
@@ -216,8 +224,82 @@ class _Writer:
         self.artifacts.append(artifact)
         return artifact
 
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        assert checkpoint.external_id == current.external_id
+        updated = replace(current, processing_metadata=checkpoint.processing_metadata)
+        self.transitions.append(
+            (
+                current.kind,
+                current.ordinal,
+                str(checkpoint.processing_metadata["state"]),
+            )
+        )
+        for index, artifact in enumerate(self.artifacts):
+            if artifact == current:
+                self.artifacts[index] = updated
+                break
+        else:
+            self.artifacts.append(updated)
+        return updated
+
     def record_warning(self, code: str, details: dict[str, object]) -> None:
         self.warnings.append((code, details))
+
+
+class _RepositoryWriter:
+    def __init__(
+        self,
+        repository: StateRepository,
+        bundle_key: int,
+        claim_token: str,
+        attempt_count: int,
+    ) -> None:
+        self.repository = repository
+        self.bundle_key = bundle_key
+        self.claim_token = claim_token
+        self.attempt_count = attempt_count
+
+    def advance_phase(self, phase: str) -> DeliveryRecord:
+        return self.repository.advance_delivery_phase(
+            self.bundle_key,
+            "instagram",
+            phase,  # type: ignore[arg-type]
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
+
+    def checkpoint_artifact(self, checkpoint: ArtifactCheckpoint) -> ArtifactRecord:
+        return self.repository.checkpoint_artifact(
+            self.bundle_key,
+            "instagram",
+            kind=checkpoint.kind,
+            ordinal=checkpoint.ordinal,
+            external_id=checkpoint.external_id,
+            relative_path=checkpoint.relative_path,
+            sha256=checkpoint.sha256,
+            expires_at=checkpoint.expires_at,
+            processing_metadata=checkpoint.processing_metadata,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
+
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        assert checkpoint.external_id is not None
+        return self.repository.transition_artifact_processing(
+            self.bundle_key,
+            "instagram",
+            kind=checkpoint.kind,
+            ordinal=checkpoint.ordinal,
+            external_id=checkpoint.external_id,
+            expected_processing_metadata=current.processing_metadata,
+            processing_metadata=checkpoint.processing_metadata,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
 
 
 def _client(
@@ -535,6 +617,7 @@ def test_single_image_checkpoints_staging_container_expiry_and_publishes_once() 
         ("instagram_parent_container", 0),
     ]
     assert writer.artifacts[-1].expires_at == NOW + timedelta(hours=23, minutes=45)
+    assert writer.transitions == [("instagram_parent_container", 0, "FINISHED")]
     assert cleanup == [("post-0.jpg", "published")]
 
 
@@ -604,9 +687,6 @@ def test_durable_prior_containers_resume_without_duplicate_creation() -> None:
     with respx.mock(assert_all_called=True) as router:
         _identity(router, snapshot)
         _quota(router, snapshot)
-        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18111").mock(
-            return_value=httpx.Response(200, json={"status_code": "FINISHED"})
-        )
         resumed_adapter = _adapter(snapshot, _client(snapshot))
         resumed = resumed_adapter.prepare(
             publication, prior=first, checkpoints=resumed_writer
@@ -615,7 +695,7 @@ def test_durable_prior_containers_resume_without_duplicate_creation() -> None:
 
     assert resumed.artifacts == first.artifacts
     assert resumed_writer.artifacts == []
-    assert status.call_count == 1
+    assert all("/18111" not in call.request.url.path for call in router.calls)
 
 
 def test_reel_uses_public_video_reels_and_share_to_feed_true() -> None:
@@ -682,7 +762,8 @@ def test_prepare_maps_container_statuses_without_publish(
 
     assert caught.value.retry_classification == classification
     assert all("media_publish" not in call.request.url.path for call in router.calls)
-    assert cleanup == ([] if classification == "ambiguous" else ["failed"])
+    expected_cleanup = ["failed"] if status_code in {"ERROR", "EXPIRED"} else []
+    assert cleanup == expected_cleanup
 
 
 def test_in_progress_polling_is_bounded_and_resumable() -> None:
@@ -1224,7 +1305,7 @@ def test_processing_poll_uses_frozen_timeout_and_bounds_final_sleep() -> None:
 
     assert caught.value.code == "instagram_container_timeout"
     assert sleeps == [60.0, 30.0]
-    assert status.call_count == 3
+    assert status.call_count == 2
 
 
 def test_resume_does_not_reset_frozen_container_processing_deadline() -> None:
@@ -1257,9 +1338,6 @@ def test_resume_does_not_reset_frozen_container_processing_deadline() -> None:
     with respx.mock(assert_all_called=True) as router:
         _identity(router, snapshot)
         _quota(router, snapshot)
-        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18841").mock(
-            return_value=httpx.Response(200, json={"status_code": "IN_PROGRESS"})
-        )
         resumed = InstagramAdapter(
             snapshot,
             _client(snapshot),
@@ -1274,5 +1352,389 @@ def test_resume_does_not_reset_frozen_container_processing_deadline() -> None:
         resumed.close()
 
     assert caught.value.code == "instagram_container_timeout"
-    assert status.call_count == 1
+    assert all("/18841" not in call.request.url.path for call in router.calls)
     assert sleeps == []
+
+
+def test_timeout_retains_real_staging_and_restart_reuses_container(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(media_directory=str(tmp_path))
+    publication = _request(snapshot=snapshot)
+    staged = publication.media.items[0].public
+    assert staged is not None
+    payload = b"public-timeout-stage"
+    staged = replace(
+        staged, sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload)
+    )
+    publication = _with_public_staging(publication, staged)
+    staged_path = tmp_path / staged.relative_path
+    staged_path.write_bytes(payload)
+    first_writer = _Writer()
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        create = router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18851"}))
+        router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18851").mock(
+            return_value=httpx.Response(200, json={"status_code": "IN_PROGRESS"})
+        )
+        first = InstagramAdapter(
+            snapshot,
+            _client(snapshot),
+            public_verifier=_proof,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+            max_status_polls=1,
+        )
+        with pytest.raises(InstagramAdapterError, match="did not become ready"):
+            first.prepare(publication, prior=None, checkpoints=first_writer)
+        first.close()
+    assert create.call_count == 1
+    assert staged_path.read_bytes() == payload
+
+    prior = PreparedPublication(
+        publication,
+        1,
+        tuple(
+            sorted(first_writer.artifacts, key=lambda item: (item.kind, item.ordinal))
+        ),
+    )
+    resumed_writer = _Writer()
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18851").mock(
+            return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+        )
+        publish = router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media_publish"
+        ).mock(return_value=httpx.Response(200, json={"id": "19851"}))
+        resumed = InstagramAdapter(
+            snapshot,
+            _client(snapshot),
+            public_verifier=_proof,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+        )
+        prepared = resumed.prepare(publication, prior=prior, checkpoints=resumed_writer)
+        result = resumed.commit(prepared, delivery=_delivery("final_dispatch_started"))
+        resumed.close()
+
+    assert status.call_count == 1
+    assert publish.call_count == 1
+    assert result.outcome == "published"
+    assert not staged_path.exists()
+
+
+def test_network_uncertainty_after_container_creation_retains_real_staging(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(media_directory=str(tmp_path))
+    publication = _request(snapshot=snapshot)
+    staged = publication.media.items[0].public
+    assert staged is not None
+    payload = b"public-network-stage"
+    staged = replace(
+        staged, sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload)
+    )
+    publication = _with_public_staging(publication, staged)
+    staged_path = tmp_path / staged.relative_path
+    staged_path.write_bytes(payload)
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18861"}))
+        router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18861").mock(
+            side_effect=httpx.ConnectError("offline")
+        )
+        client = PlatformHTTPClient(
+            snapshot,
+            SecretValue("instagram-token"),
+            base_url=GRAPH,
+            policy=HTTPPolicy(max_pre_final_attempts=1),
+        )
+        adapter = InstagramAdapter(
+            snapshot,
+            client,
+            public_verifier=_proof,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+        )
+        with pytest.raises(AdapterContractError, match="network request failed"):
+            adapter.prepare(publication, prior=None, checkpoints=_Writer())
+        adapter.close()
+
+    assert staged_path.read_bytes() == payload
+
+
+def test_uncertain_container_creation_response_retains_real_staging(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(media_directory=str(tmp_path))
+    publication = _request(snapshot=snapshot)
+    staged = publication.media.items[0].public
+    assert staged is not None
+    payload = b"public-create-uncertain"
+    staged = replace(
+        staged, sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload)
+    )
+    publication = _with_public_staging(publication, staged)
+    staged_path = tmp_path / staged.relative_path
+    staged_path.write_bytes(payload)
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={}))
+        adapter = InstagramAdapter(
+            snapshot,
+            _client(snapshot),
+            public_verifier=_proof,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+        )
+        with pytest.raises(AdapterContractError):
+            adapter.prepare(publication, prior=None, checkpoints=_Writer())
+        adapter.close()
+
+    assert staged_path.read_bytes() == payload
+
+
+def test_finished_transition_survives_crash_and_restart_skips_status() -> None:
+    class CrashAfterFinished(_Writer):
+        def transition_artifact_processing(
+            self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+        ) -> ArtifactRecord:
+            updated = super().transition_artifact_processing(current, checkpoint)
+            if checkpoint.processing_metadata["state"] == "FINISHED":
+                raise RuntimeError("crash after durable transition")
+            return updated
+
+    snapshot = _snapshot()
+    publication = _request(snapshot=snapshot)
+    writer = CrashAfterFinished()
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18871"}))
+        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18871").mock(
+            return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+        )
+        adapter = _adapter(snapshot, _client(snapshot))
+        with pytest.raises(RuntimeError, match="crash after durable transition"):
+            adapter.prepare(publication, prior=None, checkpoints=writer)
+        adapter.close()
+    assert status.call_count == 1
+
+    prior = PreparedPublication(
+        publication,
+        1,
+        tuple(sorted(writer.artifacts, key=lambda item: (item.kind, item.ordinal))),
+    )
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        resumed = _adapter(snapshot, _client(snapshot))
+        prepared = resumed.prepare(publication, prior=prior, checkpoints=_Writer())
+        resumed.close()
+    assert _artifact_state(prepared, "instagram_parent_container") == "FINISHED"
+    assert all("/18871" not in call.request.url.path for call in router.calls)
+
+
+def test_real_state_repository_accepts_instagram_processing_transitions(
+    tmp_path: Path,
+) -> None:
+    original = _snapshot(media_directory=str(tmp_path / "public"))
+    repository = StateRepository(tmp_path / "state.sqlite3", clock=lambda: NOW)
+    stored_target = replace(
+        original.target, request_settings=dict(original.target.request_settings)
+    )
+    repository.register_profile(
+        original.profile_id,
+        tmp_path / "accounts" / original.profile_id,
+        (
+            ProfileTargetSnapshot(
+                "instagram",
+                original.target.expected_remote_user_id,
+                original.target.expected_username,
+                original.target.token_env_var,
+                dict(original.target.request_settings),
+            ),
+        ),
+        config_hash="c" * 64,
+    )
+    bundle_key = repository.add_bundle(
+        profile_id=original.profile_id,
+        bundle_id=original.bundle_id,
+        fingerprint=original.bundle_fingerprint,
+        source_bucket=original.source_bucket,
+        files=(
+            BundleFileSnapshot(
+                "post-0.jpg", "media", 0, "image", "image/jpeg", 100, "a" * 64
+            ),
+        ),
+        targets=(stored_target,),
+    )
+    snapshot = replace(original, bundle_key=bundle_key)
+    claimed = repository.claim_delivery(bundle_key, "instagram", "claim-instagram")
+    writer = _RepositoryWriter(
+        repository, bundle_key, "claim-instagram", claimed.attempt_count
+    )
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18881"}))
+        router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18881").mock(
+            side_effect=[
+                httpx.Response(200, json={"status_code": "IN_PROGRESS"}),
+                httpx.Response(200, json={"status_code": "FINISHED"}),
+            ]
+        )
+        adapter = _adapter(snapshot, _client(snapshot))
+        prepared = adapter.prepare(
+            _request(snapshot=snapshot), prior=None, checkpoints=writer
+        )
+        adapter.close()
+
+    assert _artifact_state(prepared, "instagram_parent_container") == "FINISHED"
+    durable = repository.list_delivery_artifacts(
+        bundle_key, "instagram", attempt_count=claimed.attempt_count
+    )
+    assert (
+        next(
+            item for item in durable if item.kind == "instagram_parent_container"
+        ).processing_metadata["state"]
+        == "FINISHED"
+    )
+    assert repository.get_delivery(bundle_key, "instagram").phase == "ready"
+
+
+def test_prepare_status_retry_after_cannot_overrun_monotonic_deadline() -> None:
+    snapshot = _snapshot(processing_timeout_seconds=5.0)
+    elapsed = 0.0
+
+    def monotonic() -> float:
+        return elapsed
+
+    def sleep(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18891"}))
+        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18891").mock(
+            return_value=httpx.Response(429, headers={"Retry-After": "60"})
+        )
+        client = PlatformHTTPClient(
+            snapshot,
+            SecretValue("instagram-token"),
+            base_url=GRAPH,
+            policy=HTTPPolicy(max_pre_final_attempts=3, max_retry_after_seconds=60),
+            sleeper=sleep,
+        )
+        adapter = InstagramAdapter(
+            snapshot,
+            client,
+            public_verifier=_proof,
+            public_cleaner=_ignore_cleanup,
+            clock=lambda: NOW,
+            monotonic=monotonic,
+            sleeper=sleep,
+        )
+        with pytest.raises(InstagramAdapterError) as caught:
+            adapter.prepare(
+                _request(snapshot=snapshot), prior=None, checkpoints=_Writer()
+            )
+        adapter.close()
+
+    assert caught.value.code == "instagram_container_timeout"
+    assert caught.value.retry_classification == "safe_pre_final"
+    assert elapsed == 5.0
+    assert status.call_count == 1
+
+
+def test_uncertain_publish_retry_after_cannot_overrun_monotonic_deadline() -> None:
+    snapshot = _snapshot(processing_timeout_seconds=5.0)
+    elapsed = 0.0
+
+    def monotonic() -> float:
+        return elapsed
+
+    def sleep(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18901"}))
+        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18901").mock(
+            side_effect=[
+                httpx.Response(200, json={"status_code": "FINISHED"}),
+                httpx.Response(429, headers={"Retry-After": "60"}),
+            ]
+        )
+        publish = router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media_publish"
+        ).mock(return_value=httpx.Response(503))
+        client = PlatformHTTPClient(
+            snapshot,
+            SecretValue("instagram-token"),
+            base_url=GRAPH,
+            policy=HTTPPolicy(max_pre_final_attempts=3, max_retry_after_seconds=60),
+            sleeper=sleep,
+        )
+        adapter = InstagramAdapter(
+            snapshot,
+            client,
+            public_verifier=_proof,
+            public_cleaner=_ignore_cleanup,
+            clock=lambda: NOW,
+            monotonic=monotonic,
+            sleeper=sleep,
+        )
+        prepared = adapter.prepare(
+            _request(snapshot=snapshot), prior=None, checkpoints=_Writer()
+        )
+        result = adapter.commit(prepared, delivery=_delivery("final_dispatch_started"))
+        adapter.close()
+
+    assert result.outcome == "ambiguous"
+    assert result.error_code == "instagram_publish_status_timeout"
+    assert elapsed == 5.0
+    assert status.call_count == 2
+    assert publish.call_count == 1
+
+
+def _artifact_state(prepared: PreparedPublication, kind: str) -> object:
+    return next(
+        artifact for artifact in prepared.artifacts if artifact.kind == kind
+    ).processing_metadata["state"]

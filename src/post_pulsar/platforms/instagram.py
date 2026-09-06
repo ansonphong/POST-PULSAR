@@ -70,6 +70,14 @@ class WarningCheckpointWriter(Protocol):
     def record_warning(self, code: str, details: Mapping[str, object]) -> None: ...
 
 
+class InstagramProcessingCheckpointWriter(Protocol):
+    """State-owned CAS seam for durable container processing transitions."""
+
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PublishingQuota:
     """The protected-edge quota values returned by Meta for this account."""
@@ -236,6 +244,14 @@ class InstagramAdapter(BasePlatformAdapter):
         if blocking is not None:
             raise InstagramAdapterError(blocking.code, blocking.message, "permanent")
         staged_items = self._owned_staging(publication)
+        artifacts: dict[tuple[str, int], ArtifactRecord] = {
+            (item.kind, item.ordinal): item
+            for item in (() if prior is None else prior.artifacts)
+        }
+        container_mutation_started = any(
+            kind in {"instagram_child_container", "instagram_parent_container"}
+            for kind, _ordinal in artifacts
+        )
         try:
             # A direct prepare call cannot bypass the read-only validation barrier.
             if any(staged not in self._preflight_verified for staged in staged_items):
@@ -254,10 +270,6 @@ class InstagramAdapter(BasePlatformAdapter):
                 raise AdapterContractError(
                     "prior Instagram preparation attempt is stale"
                 )
-            artifacts: dict[tuple[str, int], ArtifactRecord] = {
-                (item.kind, item.ordinal): item
-                for item in (() if prior is None else prior.artifacts)
-            }
             self._checkpoint_warnings(publication, checkpoints)
 
             for ordinal, staged in enumerate(staged_items):
@@ -279,8 +291,9 @@ class InstagramAdapter(BasePlatformAdapter):
             metadata_kinds = tuple(
                 item.metadata.kind for item in publication.media.items
             )
+            container_mutation_started = True
             if len(staged_items) > 1:
-                child_ids = [
+                children = [
                     self._ensure_child_container(
                         ordinal,
                         staged,
@@ -289,6 +302,9 @@ class InstagramAdapter(BasePlatformAdapter):
                         artifacts=artifacts,
                     )
                     for ordinal, staged in enumerate(staged_items)
+                ]
+                child_ids = [
+                    _unexpired_external_id(child, self._clock()) for child in children
                 ]
                 parent = self._ensure_parent_container(
                     {
@@ -322,16 +338,21 @@ class InstagramAdapter(BasePlatformAdapter):
                     checkpoints=checkpoints,
                     artifacts=artifacts,
                 )
-            self._wait_until_ready(parent)
+            parent = self._wait_until_ready(parent, checkpoints)
+            artifacts[(parent.kind, parent.ordinal)] = parent
             checkpoints.advance_phase("ready")
             canonical = tuple(artifacts[key] for key in sorted(artifacts))
             return PreparedPublication(publication, delivery.attempt_count, canonical)
         except InstagramAdapterError as exc:
-            if exc.retry_classification != "ambiguous":
+            if self._prepare_failure_allows_cleanup(
+                exc, artifacts, container_mutation_started=container_mutation_started
+            ):
                 self._cleanup_staging(staged_items, "failed")
             raise
         except PlatformHTTPError as exc:
-            if exc.retry_classification != "ambiguous":
+            if self._prepare_failure_allows_cleanup(
+                exc, artifacts, container_mutation_started=container_mutation_started
+            ):
                 self._cleanup_staging(staged_items, "failed")
             raise
 
@@ -403,7 +424,7 @@ class InstagramAdapter(BasePlatformAdapter):
         prior: ArtifactRecord | None,
         checkpoints: CheckpointWriter,
         artifacts: dict[tuple[str, int], ArtifactRecord],
-    ) -> str:
+    ) -> ArtifactRecord:
         if prior is not None:
             artifact = prior
         else:
@@ -421,8 +442,9 @@ class InstagramAdapter(BasePlatformAdapter):
                 )
             )
             artifacts[("instagram_child_container", ordinal)] = artifact
-        self._wait_until_ready(artifact)
-        return _unexpired_external_id(artifact, self._clock())
+        artifact = self._wait_until_ready(artifact, checkpoints)
+        artifacts[(artifact.kind, artifact.ordinal)] = artifact
+        return artifact
 
     def _ensure_parent_container(
         self,
@@ -455,13 +477,56 @@ class InstagramAdapter(BasePlatformAdapter):
         ).json()
         return _response_id(payload, classification="safe_pre_final")
 
-    def _wait_until_ready(self, artifact: ArtifactRecord) -> None:
+    def _wait_until_ready(
+        self, artifact: ArtifactRecord, checkpoints: CheckpointWriter
+    ) -> ArtifactRecord:
         container_id = _unexpired_external_id(artifact, self._clock())
         deadline = self._container_processing_deadline(artifact)
+        prior_state = artifact.processing_metadata.get("state")
+        if prior_state == _READY_STATUS:
+            return artifact
+        if prior_state in {"ERROR", "EXPIRED"}:
+            raise self._terminal_container_error(prior_state)
+        if prior_state == "PUBLISHED":
+            raise InstagramAdapterError(
+                "instagram_container_already_published",
+                "Instagram media container publication requires reconciliation",
+                "ambiguous",
+            )
+        if prior_state not in {"created", "IN_PROGRESS"}:
+            raise AdapterContractError(
+                "prior Instagram container processing state is invalid"
+            )
+        durable = self._processing_writer(checkpoints)
         for attempt in range(self._max_status_polls):
-            status = self._read_container_status(container_id)
+            if deadline - self._monotonic() <= 0:
+                break
+            try:
+                status = self._read_container_status(
+                    container_id,
+                    retry_budget_seconds=lambda: max(0.0, deadline - self._monotonic()),
+                )
+            except PlatformHTTPError as exc:
+                if exc.code == "retry_budget_exhausted":
+                    break
+                raise
+            if status not in {
+                _READY_STATUS,
+                "IN_PROGRESS",
+                "ERROR",
+                "EXPIRED",
+                "PUBLISHED",
+            }:
+                raise InstagramAdapterError(
+                    "instagram_container_status_invalid",
+                    "Instagram media container status is invalid",
+                    "safe_pre_final",
+                )
+            artifact = self._checkpoint_container_state(durable, artifact, status)
+            if deadline - self._monotonic() <= 0:
+                break
             if status == _READY_STATUS:
-                return
+                return artifact
             if status == "IN_PROGRESS":
                 remaining = deadline - self._monotonic()
                 if remaining <= 0 or attempt + 1 >= self._max_status_polls:
@@ -469,35 +534,33 @@ class InstagramAdapter(BasePlatformAdapter):
                 self._sleeper(min(self._status_poll_seconds, remaining))
                 continue
             if status in {"ERROR", "EXPIRED"}:
-                raise InstagramAdapterError(
-                    f"instagram_container_{status.casefold()}",
-                    "Instagram media container cannot be published",
-                    "safe_pre_final",
-                )
+                raise self._terminal_container_error(status)
             if status == "PUBLISHED":
                 raise InstagramAdapterError(
                     "instagram_container_already_published",
                     "Instagram media container publication requires reconciliation",
                     "ambiguous",
                 )
-            raise InstagramAdapterError(
-                "instagram_container_status_invalid",
-                "Instagram media container status is invalid",
-                "safe_pre_final",
-            )
+            raise AdapterContractError("Instagram container status was not handled")
         raise InstagramAdapterError(
             "instagram_container_timeout",
             "Instagram media container did not become ready in time",
             "safe_pre_final",
         )
 
-    def _read_container_status(self, container_id: str) -> str:
+    def _read_container_status(
+        self,
+        container_id: str,
+        *,
+        retry_budget_seconds: Callable[[], float] | None = None,
+    ) -> str:
         if not _REMOTE_ID_RE.fullmatch(container_id):
             raise AdapterContractError("Instagram container identity is invalid")
         payload = self._client.read_only_request(
             "GET",
             f"/{GRAPH_API_VERSION}/{container_id}",
             params={"fields": "status_code,status"},
+            retry_budget_seconds=retry_budget_seconds,
         ).json()
         body = _mapping(payload, "Instagram container status response is invalid")
         status = body.get("status_code")
@@ -512,13 +575,30 @@ class InstagramAdapter(BasePlatformAdapter):
     def _resolve_uncertain_publish(self, container_id: str) -> PublishResult:
         deadline = self._monotonic() + self._processing_timeout
         for attempt in range(self._max_status_polls):
+            if deadline - self._monotonic() <= 0:
+                break
             try:
-                status = self._read_container_status(container_id)
-            except (InstagramAdapterError, PlatformHTTPError):
+                status = self._read_container_status(
+                    container_id,
+                    retry_budget_seconds=lambda: max(0.0, deadline - self._monotonic()),
+                )
+            except PlatformHTTPError as exc:
+                code = (
+                    "instagram_publish_status_timeout"
+                    if exc.code == "retry_budget_exhausted"
+                    else "instagram_publish_status_unavailable"
+                )
+                return PublishResult.ambiguous(
+                    code,
+                    "Instagram publication status could not be confirmed.",
+                )
+            except InstagramAdapterError:
                 return PublishResult.ambiguous(
                     "instagram_publish_status_unavailable",
                     "Instagram publication status could not be confirmed.",
                 )
+            if deadline - self._monotonic() <= 0:
+                break
             if status == "IN_PROGRESS":
                 remaining = deadline - self._monotonic()
                 if remaining <= 0 or attempt + 1 >= self._max_status_polls:
@@ -539,6 +619,83 @@ class InstagramAdapter(BasePlatformAdapter):
             "instagram_publish_status_timeout",
             "Instagram publication status remained uncertain.",
         )
+
+    @staticmethod
+    def _processing_writer(
+        checkpoints: CheckpointWriter,
+    ) -> InstagramProcessingCheckpointWriter:
+        if not callable(getattr(checkpoints, "transition_artifact_processing", None)):
+            raise AdapterContractError(
+                "Instagram processing checkpoint writer is missing"
+            )
+        return cast(InstagramProcessingCheckpointWriter, checkpoints)
+
+    def _checkpoint_container_state(
+        self,
+        checkpoints: InstagramProcessingCheckpointWriter,
+        current: ArtifactRecord,
+        state: str,
+    ) -> ArtifactRecord:
+        if current.processing_metadata.get("state") == state:
+            return current
+        checkpoint = ArtifactCheckpoint(
+            kind=current.kind,
+            ordinal=current.ordinal,
+            external_id=current.external_id,
+            relative_path=current.relative_path,
+            sha256=current.sha256,
+            expires_at=current.expires_at,
+            processing_metadata={"state": state},
+        )
+        updated = checkpoints.transition_artifact_processing(current, checkpoint)
+        if (
+            updated.bundle_key != current.bundle_key
+            or updated.platform != current.platform
+            or updated.attempt_count != current.attempt_count
+            or updated.kind != current.kind
+            or updated.ordinal != current.ordinal
+            or updated.external_id != current.external_id
+            or updated.relative_path != current.relative_path
+            or updated.sha256 != current.sha256
+            or updated.expires_at != current.expires_at
+            or dict(updated.processing_metadata) != {"state": state}
+        ):
+            raise AdapterContractError(
+                "Instagram processing checkpoint changed artifact identity"
+            )
+        return updated
+
+    @staticmethod
+    def _terminal_container_error(status: str) -> InstagramAdapterError:
+        return InstagramAdapterError(
+            f"instagram_container_{status.casefold()}",
+            "Instagram media container cannot be published",
+            "safe_pre_final",
+        )
+
+    @staticmethod
+    def _prepare_failure_allows_cleanup(
+        error: InstagramAdapterError | PlatformHTTPError,
+        artifacts: Mapping[tuple[str, int], ArtifactRecord],
+        *,
+        container_mutation_started: bool,
+    ) -> bool:
+        if isinstance(error, InstagramAdapterError):
+            if error.code in {
+                "instagram_container_error",
+                "instagram_container_expired",
+            }:
+                return True
+            if error.code.startswith("instagram_container_"):
+                return False
+            return not container_mutation_started
+        has_remote_container = any(
+            kind in {"instagram_child_container", "instagram_parent_container"}
+            for kind, _ordinal in artifacts
+        )
+        if has_remote_container:
+            return False
+        return error.retry_classification == "permanent"
 
     def _owned_staging(
         self, publication: PublicationRequest
