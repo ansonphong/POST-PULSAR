@@ -10,23 +10,35 @@ xposter.log
 instagramposter.log
 instagram_session.json
 
-#Python
+# POST PULSAR runtime state and media
+post-pulsar.toml
+.post-pulsar/
+*.sqlite3
+post_pulsar.log
+prepared-media/
+public-media/
+
+# Credentials and tokens
+*.token
+*.tokens
+
+# Python
 __pycache__/
+*.py[cod]
+.venv/
 
 # macOS system files
 .DS_Store
 .AppleDouble
 .LSOverride
 
-# macOS resource forks and files
+# macOS resource forks
 *.swp
 *.swo
-.DS_Store?
 ._*
 
 # macOS Finder settings
 Icon?
-._*
 
 # macOS Tags
 .VolumeIcon.icns

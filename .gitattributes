@@ -1,0 +1,10 @@
+* text=auto
+
+# Keep source, configuration, and documentation deterministic across platforms.
+*.py text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+
