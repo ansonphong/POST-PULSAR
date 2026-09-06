@@ -34,13 +34,11 @@ from post_pulsar.state import ArtifactRecord, DeliveryRecord
 _REMOTE_ID_RE: Final = re.compile(r"[0-9]{1,32}\Z")
 _URL_RE: Final = re.compile(
     r"(?i)(?<![@\w])(?:"
-    r"(?:https?://|www\.)[^\s<>\]\[{}]+"
+    r"(?:https?://|www\.)[^\s<>\]\[{}\u202a-\u202e\u2066-\u2069]+"
     r"|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"(?:xn--[a-z0-9-]{2,59}|[a-z]{2,63})(?:/[^\s<>\]\[{}]*)?"
+    r"(?:xn--[a-z0-9-]{2,59}|[a-z]{2,63})"
+    r"(?:/[^\s<>\]\[{}\u202a-\u202e\u2066-\u2069]*)?"
     r")"
-)
-_URL_DIRECTIONAL_CONTROLS: Final = frozenset(
-    chr(codepoint) for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
 )
 _WEIGHT_ONE_RANGES: Final = (
     (0, 4351),
@@ -953,8 +951,6 @@ def _weighted_text_length(value: str) -> int:
     cursor = 0
     for match in _URL_RE.finditer(normalized):
         raw_url = match.group(0)
-        if any(character in _URL_DIRECTIONAL_CONTROLS for character in raw_url):
-            continue
         url = raw_url.rstrip(".,!?;:")
         if not url:
             continue

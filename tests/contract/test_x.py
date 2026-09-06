@@ -369,12 +369,25 @@ def test_weighted_text_and_alt_text_preflight_boundaries(tmp_path: Path) -> None
     # Canonical twitter-text UnicodeDirectionalMarkerCounterTest fixture: this
     # visually contains a URL, but the directional controls/domain make its
     # official weighted length 31 rather than the transformed URL length 23.
-    directional = "\u2066\u202a http://foobar.پاکستان/\u202c\u2069"
+    directional = "\u2066\u202ahttp://foobar.پاکستان/\u202c\u2069"
     assert target.preflight(request(tmp_path, (), text=directional)) == ()
     assert [
         issue.code
         for issue in target.preflight(
             request(tmp_path, (), text="a" * 250 + directional)
+        )
+    ] == ["x_text_too_long"]
+    directional_punctuation = "http://test.co\u202c,"
+    assert (
+        target.preflight(
+            request(tmp_path, (), text="a" * 253 + " " + directional_punctuation)
+        )
+        == ()
+    )
+    assert [
+        issue.code
+        for issue in target.preflight(
+            request(tmp_path, (), text="a" * 254 + " " + directional_punctuation)
         )
     ] == ["x_text_too_long"]
     assert target.preflight(request(tmp_path, (), text="\r\n" * 141)) == ()
