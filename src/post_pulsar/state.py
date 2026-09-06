@@ -772,7 +772,17 @@ class StateRepository:
             "FROM profile_targets WHERE profile_id = ? ORDER BY platform",
             (profile_id,),
         )
-        return tuple(tuple(str(value) for value in row) for row in rows)
+        return tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[5]),
+            )
+            for row in rows
+        )
 
     def _profile_has_protected_work(self, profile_id: str) -> bool:
         row = self._connection.execute(
@@ -845,7 +855,7 @@ class StateRepository:
                     now,
                 ),
             )
-            bundle_key = int(cursor.lastrowid)
+            bundle_key = _lastrowid(cursor)
             self._connection.executemany(
                 "INSERT INTO bundle_files(bundle_key, relative_name, role, ordinal, "
                 "media_kind, mime_type, size_bytes, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1000,7 +1010,9 @@ class StateRepository:
             if str(row["status"]) != "archived":
                 self._block_bundle_locked(bundle_key, code)
                 self._insert_event_locked(bundle_key, None, code, code, {})
-        raise ConflictError(cast(str, drift_message))
+        if drift_message is None:  # Defensive exhaustiveness for static analysis.
+            raise StateError("bundle source validation failed without a drift reason")
+        raise ConflictError(drift_message)
 
     def assert_target_snapshot(
         self, bundle_key: int, snapshot: TargetSnapshot
@@ -1496,7 +1508,7 @@ class StateRepository:
                         now,
                     ),
                 )
-                schedule_key = int(cursor.lastrowid)
+                schedule_key = _lastrowid(cursor)
             else:
                 schedule_key = int(existing["schedule_key"])
                 if str(existing["config_hash"]) == config_hash:
@@ -1627,7 +1639,7 @@ class StateRepository:
                     now,
                 ),
             )
-            run_id = int(cursor.lastrowid)
+            run_id = _lastrowid(cursor)
             self._connection.execute(
                 "UPDATE bundles SET claimed_by_type = 'schedule', claimed_by_id = ?, "
                 "updated_at = ? WHERE bundle_key = ?",
@@ -1774,7 +1786,7 @@ class StateRepository:
                 sqlite3.Row,
                 self._connection.execute(
                     "SELECT * FROM run_requests WHERE request_id = ?",
-                    (int(cursor.lastrowid),),
+                    (_lastrowid(cursor),),
                 ).fetchone(),
             )
         )
@@ -2042,7 +2054,7 @@ class StateRepository:
                 raise ConflictError(
                     "admission fingerprint or destination was already used"
                 ) from None
-            journal_id = int(cursor.lastrowid)
+            journal_id = _lastrowid(cursor)
         return self.get_admission(journal_id)
 
     def checkpoint_admission_member(
@@ -2271,7 +2283,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown bundle")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _delivery_row(self, bundle_key: int, platform: Platform) -> sqlite3.Row:
         row = self._connection.execute(
@@ -2280,7 +2292,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown delivery")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _schedule_row(self, schedule_key: int) -> sqlite3.Row:
         row = self._connection.execute(
@@ -2288,7 +2300,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown schedule")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _request_row(self, request_id: int) -> sqlite3.Row:
         row = self._connection.execute(
@@ -2296,7 +2308,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown run request")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _intent_row(self, intent_id: str) -> sqlite3.Row:
         row = self._connection.execute(
@@ -2304,7 +2316,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown confirmation intent")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _admission_row(self, journal_id: int) -> sqlite3.Row:
         row = self._connection.execute(
@@ -2312,7 +2324,7 @@ class StateRepository:
         ).fetchone()
         if row is None:
             raise StateValidationError("unknown admission journal")
-        return row
+        return cast(sqlite3.Row, row)
 
     def _require_profile(self, profile_id: str) -> None:
         if self._connection.execute(
@@ -2559,6 +2571,13 @@ def _parse_timestamp(value: str) -> datetime:
 
 def _optional_datetime(value: object) -> datetime | None:
     return None if value is None else _parse_timestamp(str(value))
+
+
+def _lastrowid(cursor: sqlite3.Cursor) -> int:
+    value = cursor.lastrowid
+    if value is None:
+        raise StateError("database insert did not return an identifier")
+    return value
 
 
 def _sha256_text(value: str) -> str:
