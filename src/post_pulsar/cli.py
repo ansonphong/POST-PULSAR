@@ -1231,9 +1231,14 @@ def _daemon_foreground(
     def admit_schedules() -> None:
         from post_pulsar.scheduler import DeterministicScheduler
 
-        with StateRepository.open_existing(database, clock=clock) as repository:
-            work = DeterministicScheduler(repository, wall_clock=clock).tick()
         daemon = holder["daemon"]
+        with StateRepository.open_existing(database, clock=clock) as repository:
+            work = DeterministicScheduler(repository, wall_clock=clock).tick(
+                dispatch_gate=daemon.dispatch_if_running,
+                failure_handler=lambda schedule: repository.record_callback_failure(
+                    phase="schedule", profile_id=schedule.profile_id
+                ),
+            )
         lease = daemon._lease
         if lease is None:
             raise StateError("daemon instance lease is unavailable")
@@ -1781,23 +1786,18 @@ def _secret_input(stream: IO[str]) -> IO[str] | _GetpassInput:
 
 def _assert_owner_file(path: Path, label: str) -> None:
     from post_pulsar.control import ControlSecurityError
+    from post_pulsar.secure_files import SecureFileError, assert_owner_file
 
     try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        raise ControlSecurityError(f"{label} is missing") from None
-    if not path.is_file() or path.is_symlink() or metadata.st_nlink != 1:
-        raise ControlSecurityError(f"{label} file is unsafe")
-    if os.name != "nt" and metadata.st_mode & 0o077:
-        raise ControlSecurityError(f"{label} file permissions are too broad")
+        assert_owner_file(path)
+    except (OSError, SecureFileError):
+        raise ControlSecurityError(f"{label} file is unsafe or missing") from None
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    from post_pulsar.secure_files import fsync_directory
+
+    fsync_directory(path)
 
 
 def _run(

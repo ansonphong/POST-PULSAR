@@ -152,14 +152,28 @@ def _setup(root: Path, *, enabled: bool = True) -> tuple[Path, Path]:
     return config, database
 
 
-def _seed_bundle(database: Path, *, state: str) -> int:
+def _seed_bundle(database: Path, *, state: str, real_source: bool = False) -> int:
     with StateRepository.open_existing(database) as repository:
+        source = None
+        if real_source:
+            directory = (
+                repository.get_profile("operator").account_root
+                / "QUEUE"
+                / f"post-{state}"
+            )
+            directory.mkdir(parents=True)
+            Image.new("RGB", (8, 8)).save(directory / f"post-{state}.jpg")
+            (directory / f"post-{state}.txt").write_text("caption")
+            (directory / ".ready").write_bytes(b"")
+            source = scan_inbox(directory).bundles[0]
         bundle_key = repository.add_bundle(
             profile_id="operator",
             bundle_id=f"post-{state}",
-            fingerprint="b" * 64,
+            fingerprint="b" * 64 if source is None else source.fingerprint,
             source_bucket="QUEUE",
-            files=(
+            files=source.member_snapshots
+            if source is not None
+            else (
                 BundleFileSnapshot(
                     f"post-{state}.jpg",
                     "image",
@@ -538,7 +552,7 @@ def test_durable_retry_does_not_render_credentials_and_package_exports_main(
 
 def test_daemon_retry_executor_revalidates_remote_identity(tmp_path: Path) -> None:
     config, database = _setup(tmp_path)
-    bundle_key = _seed_bundle(database, state="failed")
+    bundle_key = _seed_bundle(database, state="failed", real_source=True)
     intent_id, revision = _approved_delivery_intent(
         database, action="retry", bundle_key=bundle_key
     )
@@ -575,20 +589,21 @@ def test_daemon_retry_executor_revalidates_remote_identity(tmp_path: Path) -> No
             request,
             daemon=daemon,
             environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
-            adapter_factory=None,
+            adapter_factory=lambda snapshot, *_args: CLIAdapter(snapshot),
             identity_verifier=verify,
             clock=lambda: datetime.now(UTC),
         )
 
     assert verified == ["10001"]
-    assert result["safe_to_retry"] is True
+    assert result["status"] == "archived"
     with StateRepository.open_existing(database) as repository:
-        assert repository.get_bundle(bundle_key).status == "active"
+        assert repository.get_bundle(bundle_key).status == "archived"
+        assert repository.get_delivery(bundle_key, "x").attempt_count == 2
 
 
 def test_daemon_reconcile_executor_is_offline(tmp_path: Path) -> None:
     config, database = _setup(tmp_path)
-    bundle_key = _seed_bundle(database, state="ambiguous")
+    bundle_key = _seed_bundle(database, state="ambiguous", real_source=True)
     intent_id, revision = _approved_delivery_intent(
         database,
         action="reconcile",
@@ -625,8 +640,10 @@ def test_daemon_reconcile_executor_is_offline(tmp_path: Path) -> None:
             clock=lambda: datetime.now(UTC),
         )
 
-    assert result["status"] == "published"
-    assert result["remote_id"] == "96001"
+    assert result["status"] == "archived"
+    with StateRepository.open_existing(database) as repository:
+        assert repository.get_bundle(bundle_key).status == "archived"
+        assert repository.get_delivery(bundle_key, "x").remote_id == "96001"
 
 
 @pytest.mark.parametrize("action", ["cancel", "delete"])

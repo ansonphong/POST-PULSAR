@@ -3703,7 +3703,7 @@ class StateRepository:
             "SELECT 1 FROM deliveries dr WHERE dr.bundle_key = sr.bundle_key "
             "AND (dr.status IN ('pending', 'in_flight') OR (dr.status = 'failed' "
             "AND dr.safe_to_retry = 1 AND dr.next_attempt_at <= ? "
-            "AND dr.error_code != 'reconciled_not_published')))) "
+            "AND (dr.error_code IS NULL OR dr.error_code != 'reconciled_not_published'))))) "
             "ORDER BY sr.scheduled_at, s.profile_id, s.schedule_id COLLATE NOCASE, "
             "s.schedule_id, sr.run_id",
             (now_text,),

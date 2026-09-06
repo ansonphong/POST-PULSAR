@@ -1554,8 +1554,8 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     with pytest.raises(ConflictError, match="idempotency"):
         repository.create_run_request(
             profile_id="ansonphong",
-            action="pause",
-            arguments={"unexpected": True},
+            action="resume",
+            arguments={},
             idempotency_key="request-1",
             expected_revision=1,
         )

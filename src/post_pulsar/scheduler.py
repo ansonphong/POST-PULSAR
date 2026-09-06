@@ -144,7 +144,12 @@ class DeterministicScheduler:
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._sleeper = sleeper or time.sleep
 
-    def tick(self) -> tuple[ScheduledWork, ...]:
+    def tick(
+        self,
+        *,
+        dispatch_gate: Callable[[Callable[[], object]], bool] | None = None,
+        failure_handler: Callable[[ScheduleRecord], None] | None = None,
+    ) -> tuple[ScheduledWork, ...]:
         """Re-read wall time, persist today's occurrences, and return due work."""
 
         now = _aware_utc(self._wall_clock())
@@ -157,31 +162,47 @@ class DeterministicScheduler:
         )
         new_work: list[ScheduledWork] = []
         for schedule in self._repository.list_enabled_schedules():
-            evaluation = evaluate_schedule(schedule, now)
-            if evaluation is None:
-                continue
-            occurrence = evaluation.occurrence
-            latest = self._repository.latest_schedule_local_date(schedule.schedule_key)
-            if latest is not None and occurrence.local_date < latest:
-                continue
-            run = self._repository.create_schedule_occurrence(
-                schedule.schedule_key,
-                local_date=occurrence.local_date.isoformat(),
-                scheduled_at=occurrence.scheduled_at,
-                utc_offset_minutes=occurrence.utc_offset_minutes,
-                schedule_hash=schedule.config_hash,
-            )
-            if run.state == "queued" and evaluation.state in {"due", "missed"}:
-                run = self._repository.transition_schedule_run(
-                    run.run_id,
-                    evaluation.state,
-                    expected_revision=run.revision,
-                )
-            if run.state == "due":
-                new_work.append(self._work(run, schedule, False))
+
+            def admit_occurrence() -> None:
+                try:
+                    work = self._admit_occurrence(schedule, now)
+                    if work is not None:
+                        new_work.append(work)
+                except Exception:
+                    if failure_handler is None:
+                        raise
+                    failure_handler(schedule)
+
+            if dispatch_gate is None:
+                admit_occurrence()
+            elif not dispatch_gate(admit_occurrence):
+                break
         return tuple(sorted(retries, key=_work_order)) + tuple(
             sorted(new_work, key=_work_order)
         )
+
+    def _admit_occurrence(
+        self, schedule: ScheduleRecord, now: datetime
+    ) -> ScheduledWork | None:
+        evaluation = evaluate_schedule(schedule, now)
+        if evaluation is None:
+            return None
+        occurrence = evaluation.occurrence
+        latest = self._repository.latest_schedule_local_date(schedule.schedule_key)
+        if latest is not None and occurrence.local_date < latest:
+            return None
+        run = self._repository.create_schedule_occurrence(
+            schedule.schedule_key,
+            local_date=occurrence.local_date.isoformat(),
+            scheduled_at=occurrence.scheduled_at,
+            utc_offset_minutes=occurrence.utc_offset_minutes,
+            schedule_hash=schedule.config_hash,
+        )
+        if run.state == "queued" and evaluation.state in {"due", "missed"}:
+            run = self._repository.transition_schedule_run(
+                run.run_id, evaluation.state, expected_revision=run.revision
+            )
+        return self._work(run, schedule, False) if run.state == "due" else None
 
     def wait(self, seconds: float) -> None:
         """Wait using only monotonic elapsed time; wall time is read by `tick`."""

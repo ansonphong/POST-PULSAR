@@ -213,4 +213,37 @@ def test_paused_scheduler_does_not_admit_or_recover_work() -> None:
         wall_clock=lambda: datetime(2026, 9, 7, 9, 5, tzinfo=UTC),
     )
     assert scheduler.tick() == ()
+
+
+def test_occurrence_gate_stops_later_admission_and_failure_isolates_profiles() -> None:
+    repository = _Repository()
+    scheduler = DeterministicScheduler(
+        repository, wall_clock=lambda: datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
+    )
+    started = 0
+
+    def gate(callback):
+        nonlocal started
+        if started:
+            return False
+        started += 1
+        callback()
+        return True
+
+    scheduler.tick(dispatch_gate=gate)
+    assert len(repository.runs) == 1
+    repository = _Repository()
+    repository.schedules = (
+        replace(repository.schedules[0], timezone="Invalid/Zone"),
+        *repository.schedules[1:],
+    )
+    failures = []
+    scheduler = DeterministicScheduler(
+        repository, wall_clock=lambda: datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
+    )
+    scheduler.tick(
+        failure_handler=lambda schedule: failures.append(schedule.profile_id)
+    )
+    assert failures == ["zulu"]
+    assert len(repository.runs) == 2
     assert repository.runs == {}
