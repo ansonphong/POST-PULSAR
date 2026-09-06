@@ -75,3 +75,8 @@
 {"event":"commit","sha":"1aa342b","message":"feat(scheduler): add deterministic profile scheduling","time":"2026-09-06T08:33:42Z"}
 {"event":"commit","sha":"30d8f24","message":"chore(plan): mark T4.4 DONE","time":"2026-09-06T08:34:36Z"}
 {"event":"commit","sha":"590b029","message":"feat(control): add authenticated foreground daemon","time":"2026-09-06T08:54:04Z"}
+{"event":"commit","sha":"bc83743","message":"chore(plan): mark T4.5 DONE","time":"2026-09-06T08:54:46Z"}
+{"event":"commit","sha":"3c43dc9","message":"feat(cli): add durable control commands","time":"2026-09-06T09:11:53Z"}
+{"event":"commit","sha":"75f6067","message":"style(cli): keep stub scan unambiguous","time":"2026-09-06T09:12:14Z"}
+{"event":"commit","sha":"ab5c1c1","message":"docs(plan): repair T4.6 control scope","time":"2026-09-06T09:17:59Z"}
+{"event":"commit","sha":"46ad023","message":"fix(control): complete durable control actions","time":"2026-09-06T09:33:45Z"}
