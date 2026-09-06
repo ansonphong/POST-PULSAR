@@ -1,0 +1,91 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "POST PULSAR Local Control API",
+    "version": "1.0.0",
+    "description": "Authoritative loopback-only post-pulsar.control/v1 contract. Unknown fields are rejected. No operation accepts filesystem paths, SQL, shell text, platform credentials, media bytes, or platform response bodies."
+  },
+  "servers": [{"url": "http://127.0.0.1:{port}/control/v1", "variables": {"port": {"default": "8765"}}}],
+  "security": [{"agentCapability": []}],
+  "paths": {
+    "/health": {"get": {"operationId": "health", "responses": {"200": {"$ref": "#/components/responses/Success"}, "401": {"$ref": "#/components/responses/Error"}}}},
+    "/capabilities": {"get": {"operationId": "capabilities", "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/status": {"get": {"operationId": "status", "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/dashboard": {"get": {"operationId": "dashboard", "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/profiles": {"get": {"operationId": "profiles", "parameters": [{"$ref": "#/components/parameters/Cursor"}, {"$ref": "#/components/parameters/Limit"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/profiles/{profile_id}/buckets": {"get": {"operationId": "buckets", "parameters": [{"$ref": "#/components/parameters/ProfileId"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/profiles/{profile_id}/buckets/{bucket}/bundles/{bundle_id}": {"get": {"operationId": "inspectBundle", "parameters": [{"$ref": "#/components/parameters/ProfileId"}, {"$ref": "#/components/parameters/Bucket"}, {"$ref": "#/components/parameters/BundleId"}], "responses": {"200": {"$ref": "#/components/responses/Success"}, "422": {"$ref": "#/components/responses/Error"}}}},
+    "/profiles/{profile_id}/buckets/{bucket}/bundles/{bundle_id}/preview": {"get": {"operationId": "previewBundle", "parameters": [{"$ref": "#/components/parameters/ProfileId"}, {"$ref": "#/components/parameters/Bucket"}, {"$ref": "#/components/parameters/BundleId"}], "responses": {"200": {"$ref": "#/components/responses/Success"}, "409": {"$ref": "#/components/responses/Ambiguity"}}}},
+    "/profiles/{profile_id}/buckets/DRAFTS/bundles/{bundle_id}/caption": {"patch": {"operationId": "editCaption", "x-confirmation-required": false, "parameters": [{"$ref": "#/components/parameters/ProfileId"}, {"$ref": "#/components/parameters/BundleId"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/TextEdit"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "428": {"$ref": "#/components/responses/Error"}}}},
+    "/profiles/{profile_id}/buckets/DRAFTS/bundles/{bundle_id}/alt": {"patch": {"operationId": "editAlt", "x-confirmation-required": false, "parameters": [{"$ref": "#/components/parameters/ProfileId"}, {"$ref": "#/components/parameters/BundleId"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/TextEdit"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/profiles/{profile_id}/buckets/DRAFTS/bundles/{bundle_id}/ready": {"post": {"operationId": "readyBundle", "x-confirmation-required": true, "x-agent-publish-required": true, "parameters": [{"$ref": "#/components/parameters/ProfileId"}, {"$ref": "#/components/parameters/BundleId"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/ConfirmedWrite"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "403": {"$ref": "#/components/responses/Error"}}}},
+    "/enqueue": {"post": {"operationId": "enqueue", "x-confirmation-required": true, "x-agent-publish-required": true, "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/schedules": {
+      "get": {"operationId": "schedules", "parameters": [{"$ref": "#/components/parameters/Cursor"}, {"$ref": "#/components/parameters/Limit"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}},
+      "post": {"operationId": "createSchedule", "description": "Creating enabled or already-due work requires an approved intent; disabled future schedules do not.", "x-confirmation-conditional": "enabled-or-due", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/Write"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}
+    },
+    "/schedules/{schedule_key}": {"patch": {"operationId": "modifySchedule", "description": "Modification requires approval when the stored schedule is enabled, the result is enabled, or due work exists.", "x-confirmation-conditional": "enabled-or-due", "parameters": [{"$ref": "#/components/parameters/ScheduleKey"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/Write"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/schedules/{schedule_key}/disable": {"post": {"operationId": "disableSchedule", "x-confirmation-required": false, "parameters": [{"$ref": "#/components/parameters/ScheduleKey"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/Write"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/requests": {"get": {"operationId": "requests", "parameters": [{"$ref": "#/components/parameters/Cursor"}, {"$ref": "#/components/parameters/Limit"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/requests/{request_id}": {"get": {"operationId": "requestStatus", "parameters": [{"$ref": "#/components/parameters/RequestId"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/pause": {"post": {"operationId": "pause", "x-confirmation-required": false, "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/Write"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/resume": {"post": {"operationId": "resume", "description": "An approved intent is required when due work exists.", "x-confirmation-conditional": "due-work", "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/run-now": {"post": {"operationId": "runNow", "x-confirmation-required": true, "x-agent-publish-required": true, "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/cancel-pending": {"post": {"operationId": "cancelPending", "x-confirmation-required": true, "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/retry": {"post": {"operationId": "retry", "x-confirmation-required": true, "x-agent-publish-required": true, "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/reconcile": {"post": {"operationId": "reconcile", "x-confirmation-required": true, "x-agent-publish-required": true, "$ref": "#/components/pathItems/ConfirmedAction"}},
+    "/confirmations": {"post": {"operationId": "createConfirmation", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/Confirmation"}, "responses": {"201": {"$ref": "#/components/responses/Success"}, "403": {"$ref": "#/components/responses/Error"}, "428": {"$ref": "#/components/responses/Error"}}}},
+    "/confirmations/{intent_id}": {"get": {"operationId": "confirmationStatus", "parameters": [{"$ref": "#/components/parameters/IntentId"}], "responses": {"200": {"$ref": "#/components/responses/Success"}}}},
+    "/confirmations/{intent_id}/consume": {"post": {"operationId": "consumeConfirmation", "parameters": [{"$ref": "#/components/parameters/IntentId"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/ConfirmedWrite"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Error"}}}},
+    "/operator/confirmations/{intent_id}/approve": {"post": {"operationId": "operatorApprove", "description": "Operator-only. Requires both the agent bearer and X-Post-Pulsar-Operator-Secret; the latter is accepted nowhere else.", "parameters": [{"$ref": "#/components/parameters/IntentId"}, {"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}, {"$ref": "#/components/parameters/OperatorSecret"}], "responses": {"200": {"$ref": "#/components/responses/Success"}, "401": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}}}
+  },
+  "components": {
+    "securitySchemes": {"agentCapability": {"type": "http", "scheme": "bearer", "bearerFormat": "256-bit hexadecimal capability"}},
+    "parameters": {
+      "ProfileId": {"name": "profile_id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"}},
+      "Bucket": {"name": "bucket", "in": "path", "required": true, "schema": {"type": "string", "enum": ["DRAFTS", "QUEUE", "RANDOM", "REELS"]}},
+      "BundleId": {"name": "bundle_id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}},
+      "ScheduleKey": {"name": "schedule_key", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 1}},
+      "RequestId": {"name": "request_id", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 1}},
+      "IntentId": {"name": "intent_id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+      "Cursor": {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 128}},
+      "Limit": {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}},
+      "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"}},
+      "ExpectedRevision": {"name": "If-Match", "in": "header", "required": true, "description": "Exact decimal revision, optionally quoted.", "schema": {"type": "string", "pattern": "^\\\"?[0-9]+\\\"?$"}},
+      "OperatorSecret": {"name": "X-Post-Pulsar-Operator-Secret", "in": "header", "required": true, "schema": {"type": "string", "minLength": 12, "maxLength": 1024, "writeOnly": true}}
+    },
+    "schemas": {
+      "Envelope": {"type": "object", "additionalProperties": false, "required": ["schema", "ok", "request_id"], "properties": {"schema": {"const": "post-pulsar.control/v1"}, "ok": {"type": "boolean"}, "data": {}, "error": {"$ref": "#/components/schemas/Error"}, "request_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"}}},
+      "Error": {"type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": {"code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}, "message": {"type": "string", "maxLength": 160}}},
+      "Write": {"type": "object", "additionalProperties": false, "required": ["profile_id"], "properties": {"profile_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"}, "bundle_key": {"type": "integer", "minimum": 1}, "schedule_key": {"type": "integer", "minimum": 1}, "arguments": {"type": "object", "maxProperties": 32}}},
+      "ConfirmedWrite": {"allOf": [{"$ref": "#/components/schemas/Write"}, {"type": "object", "additionalProperties": false, "required": ["action", "profile_id", "resource_revision"], "properties": {"action": {"type": "string", "enum": ["admit_draft", "enqueue", "run_now", "publish_now", "resume", "schedule_create", "schedule_update", "schedule_enable", "cancel", "delete", "retry", "reconcile"]}, "profile_id": {"type": "string"}, "resource_revision": {"type": "integer", "minimum": 0}, "fingerprint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}, "bundle_key": {"type": ["integer", "null"], "minimum": 1}, "schedule_key": {"type": ["integer", "null"], "minimum": 1}, "arguments": {"type": "object", "maxProperties": 32}}}]},
+      "Confirmation": {"allOf": [{"$ref": "#/components/schemas/ConfirmedWrite"}, {"type": "object", "required": ["consequence"], "properties": {"consequence": {"type": "string", "minLength": 1, "maxLength": 512}}}]},
+      "TextEdit": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "maxLength": 10000}}},
+      "Ambiguity": {"type": "object", "additionalProperties": false, "required": ["candidates"], "properties": {"candidates": {"type": "array", "maxItems": 100, "items": {"type": "object", "additionalProperties": false, "required": ["profile_id", "bucket", "bundle_id", "fingerprint"], "properties": {"profile_id": {"type": "string"}, "bucket": {"type": "string"}, "bundle_id": {"type": "string"}, "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}}}}
+    },
+    "requestBodies": {
+      "Write": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Write"}}}},
+      "ConfirmedWrite": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConfirmedWrite"}}}},
+      "Confirmation": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Confirmation"}}}},
+      "TextEdit": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TextEdit"}}}}
+    },
+    "responses": {
+      "Success": {"description": "Bounded success envelope", "headers": {"X-Post-Pulsar-Principal": {"schema": {"const": "core"}}, "X-Request-ID": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Envelope"}}}},
+      "Accepted": {"description": "Durable request accepted; no platform call occurred in the HTTP thread.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Envelope"}}}},
+      "Error": {"description": "Redacted common error envelope", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Envelope"}}}},
+      "Ambiguity": {"description": "No candidate was selected", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Ambiguity"}}}}
+    },
+    "pathItems": {
+      "ConfirmedAction": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/ExpectedRevision"}], "requestBody": {"$ref": "#/components/requestBodies/ConfirmedWrite"}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "403": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "428": {"$ref": "#/components/responses/Error"}}}
+    }
+  },
+  "x-control-constraints": {
+    "bind": "configured canonical literal loopback only",
+    "max_body_bytes": 1048576,
+    "max_results": 500,
+    "cors": false,
+    "principal_header": "X-Post-Pulsar-Principal",
+    "version_header": "X-Post-Pulsar-Control-Version",
+    "agent_publish_policy": "Agent confirmation creation and consumption for publication-enabling actions require installation allow_agent_publish=true. Operator-origin approval remains separately authenticated."
+  }
+}

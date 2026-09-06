@@ -81,6 +81,11 @@ agent_capability_file = ".post-pulsar/control/agent-capability"
 operator_verifier_file = ".post-pulsar/control/operator-verifier"
 bootstrap_file = ".post-pulsar/control/bootstrap.json"
 endpoint_record_file = ".post-pulsar/control/endpoint.json"
+control_max_body_bytes = 65536
+control_max_results = 100
+confirmation_ttl_seconds = 300
+operator_max_failures = 5
+operator_lockout_seconds = 300
 {extra}
 {profiles if profiles is not None else _profile()}
 """.strip()
@@ -102,6 +107,9 @@ def test_load_valid_profile_config_resolves_paths_and_is_frozen(
         settings.app.endpoint_record_file
         == (tmp_path / ".post-pulsar/control/endpoint.json").resolve()
     )
+    assert settings.app.control_max_body_bytes == 65536
+    assert settings.app.control_max_results == 100
+    assert settings.app.confirmation_ttl_seconds == 300
     profile = settings.profile("ansonphong")
     assert profile.account_root == (tmp_path / "accounts/ansonphong").resolve()
     assert profile.enabled_targets == ("x", "instagram")

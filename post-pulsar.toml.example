@@ -14,6 +14,11 @@ agent_capability_file = ".post-pulsar/control/agent-capability"
 operator_verifier_file = ".post-pulsar/control/operator-verifier"
 bootstrap_file = ".post-pulsar/control/bootstrap.json"
 endpoint_record_file = ".post-pulsar/control/endpoint.json"
+control_max_body_bytes = 65536
+control_max_results = 100
+confirmation_ttl_seconds = 300
+operator_max_failures = 5
+operator_lockout_seconds = 300
 
 [[profiles]]
 profile_id = "ansonphong"

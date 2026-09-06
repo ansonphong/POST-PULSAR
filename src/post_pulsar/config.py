@@ -76,6 +76,11 @@ class AppSettings:
     operator_verifier_file: Path
     bootstrap_file: Path
     endpoint_record_file: Path
+    control_max_body_bytes: int
+    control_max_results: int
+    confirmation_ttl_seconds: int
+    operator_max_failures: int
+    operator_lockout_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +220,11 @@ def load_local_settings(
             "operator_verifier_file",
             "bootstrap_file",
             "endpoint_record_file",
+            "control_max_body_bytes",
+            "control_max_results",
+            "confirmation_ttl_seconds",
+            "operator_max_failures",
+            "operator_lockout_seconds",
         },
         "app",
     )
@@ -277,6 +287,21 @@ def load_local_settings(
                 "app",
             ),
             "app.endpoint_record_file",
+        ),
+        control_max_body_bytes=_bounded_int(
+            app_data, "control_max_body_bytes", 65536, "app", 1024, 1048576
+        ),
+        control_max_results=_bounded_int(
+            app_data, "control_max_results", 100, "app", 1, 500
+        ),
+        confirmation_ttl_seconds=_bounded_int(
+            app_data, "confirmation_ttl_seconds", 300, "app", 30, 900
+        ),
+        operator_max_failures=_bounded_int(
+            app_data, "operator_max_failures", 5, "app", 3, 10
+        ),
+        operator_lockout_seconds=_bounded_int(
+            app_data, "operator_lockout_seconds", 300, "app", 30, 3600
         ),
     )
 
@@ -533,6 +558,26 @@ def _nonnegative_int(
     value = values.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigurationError(f"{section}.{key} must be a non-negative integer")
+    return value
+
+
+def _bounded_int(
+    values: Mapping[str, object],
+    key: str,
+    default: int,
+    section: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = values.get(key, default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise ConfigurationError(
+            f"{section}.{key} must be an integer from {minimum} through {maximum}"
+        )
     return value
 
 

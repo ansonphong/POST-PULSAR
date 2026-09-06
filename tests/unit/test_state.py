@@ -146,6 +146,18 @@ def test_schema_initialization_reopen_and_pragmas_are_idempotent(
         assert repository.schema_version == 1
 
 
+def test_control_queries_are_bounded_and_report_due_work(tmp_path: Path) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    assert [item.profile_id for item in repository.list_profiles(limit=1)] == [
+        "ansonphong"
+    ]
+    assert repository.list_run_requests(profile_id="ansonphong", limit=10) == ()
+    assert repository.has_due_work() is False
+    with pytest.raises(StateValidationError, match="limit"):
+        repository.list_profiles(limit=0)
+
+
 def test_open_existing_never_initializes_missing_state(tmp_path: Path) -> None:
     path = tmp_path / "missing" / "post_pulsar.sqlite3"
 
@@ -1489,22 +1501,27 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     assert replay.result == completed.result
 
 
-def test_resume_always_requires_confirmation_even_when_work_becomes_due(
+def test_resume_requires_confirmation_exactly_when_work_is_due(
     tmp_path: Path,
 ) -> None:
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     pause = repository.get_pause_state()
 
-    with pytest.raises(TransitionError, match="confirmation"):
-        repository.create_run_request(
-            profile_id="ansonphong",
-            action="resume",
-            arguments={},
-            idempotency_key="resume-without-work",
-            expected_revision=pause.revision,
-        )
-    assert repository.claim_next_run_request("no-resume-worker") is None
+    safe = repository.create_run_request(
+        profile_id="ansonphong",
+        action="resume",
+        arguments={},
+        idempotency_key="resume-without-work",
+        expected_revision=pause.revision,
+    )
+    claimed = repository.claim_next_run_request("no-resume-worker")
+    assert claimed is not None and claimed.request_id == safe.request_id
+    repository.complete_run_request(
+        claimed.request_id,
+        worker_token="no-resume-worker",
+        result={"paused": False},
+    )
 
     schedule = repository.create_schedule(
         profile_id="ansonphong",
@@ -1532,7 +1549,7 @@ def test_resume_always_requires_confirmation_even_when_work_becomes_due(
             profile_id="ansonphong",
             action="resume",
             arguments={},
-            idempotency_key="resume-without-work",
+            idempotency_key="resume-with-due-work",
             expected_revision=pause.revision,
         )
     assert repository.claim_next_run_request("still-no-resume-worker") is None

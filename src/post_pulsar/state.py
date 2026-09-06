@@ -117,6 +117,8 @@ _REQUEST_ACTIONS: Final = frozenset(
         "delete",
         "retry",
         "reconcile",
+        "edit_caption",
+        "edit_alt",
     }
 )
 _ADMISSION_PHASES: Final = (
@@ -139,7 +141,7 @@ _SCHEDULE_REQUEST_ACTIONS: Final = frozenset(
     {"schedule_update", "schedule_enable", "schedule_disable"}
 )
 _PROFILE_REQUEST_ACTIONS: Final = frozenset(
-    {"admit_draft", "pause", "resume", "schedule_create"}
+    {"admit_draft", "pause", "resume", "schedule_create", "edit_caption", "edit_alt"}
 )
 _ALWAYS_CONFIRMED_ACTIONS: Final = frozenset(
     {
@@ -147,7 +149,6 @@ _ALWAYS_CONFIRMED_ACTIONS: Final = frozenset(
         "enqueue",
         "run_now",
         "publish_now",
-        "resume",
         "schedule_enable",
         "cancel",
         "delete",
@@ -1029,6 +1030,21 @@ class StateRepository:
             raise StateValidationError("unknown profile")
         return self._profile_from_row(row)
 
+    def list_profiles(
+        self, *, after_profile_id: str | None = None, limit: int = 100
+    ) -> tuple[ProfileRecord, ...]:
+        """Return a bounded stable page without exposing target credentials."""
+        _validate_page_limit(limit)
+        after = after_profile_id or ""
+        if after_profile_id is not None:
+            _validate_profile_id(after_profile_id)
+        rows = self._connection.execute(
+            "SELECT * FROM profiles WHERE profile_id > ? COLLATE NOCASE "
+            "ORDER BY profile_id COLLATE NOCASE, profile_id LIMIT ?",
+            (after, limit),
+        )
+        return tuple(self._profile_from_row(row) for row in rows)
+
     def _normalize_profile_targets(
         self, targets: Sequence[ProfileTargetSnapshot]
     ) -> tuple[tuple[str, str, str, str, str, str], ...]:
@@ -1571,6 +1587,31 @@ class StateRepository:
             "ORDER BY bundle_id COLLATE NOCASE, bundle_id, bundle_key",
             (profile_id,),
         )
+        return tuple(self._bundle_from_row(row) for row in rows)
+
+    def list_bundles(
+        self,
+        *,
+        profile_id: str | None = None,
+        after_bundle_key: int = 0,
+        limit: int = 100,
+    ) -> tuple[BundleRecord, ...]:
+        """Return a bounded primary-key page for control-plane inspection."""
+        _validate_page_limit(limit)
+        if after_bundle_key < 0:
+            raise StateValidationError("bundle cursor is invalid")
+        if profile_id is None:
+            rows = self._connection.execute(
+                "SELECT * FROM bundles WHERE bundle_key > ? ORDER BY bundle_key LIMIT ?",
+                (after_bundle_key, limit),
+            )
+        else:
+            _validate_profile_id(profile_id)
+            rows = self._connection.execute(
+                "SELECT * FROM bundles WHERE profile_id = ? AND bundle_key > ? "
+                "ORDER BY bundle_key LIMIT ?",
+                (profile_id, after_bundle_key, limit),
+            )
         return tuple(self._bundle_from_row(row) for row in rows)
 
     def list_failed_deliveries(self, profile_id: str) -> tuple[DeliveryRecord, ...]:
@@ -2958,6 +2999,39 @@ class StateRepository:
         )
         return tuple(self._schedule_from_row(row) for row in rows)
 
+    def list_schedules(
+        self,
+        *,
+        profile_id: str | None = None,
+        after_schedule_key: int = 0,
+        limit: int = 100,
+    ) -> tuple[ScheduleRecord, ...]:
+        """Return a bounded stable page of schedules."""
+        _validate_page_limit(limit)
+        if after_schedule_key < 0:
+            raise StateValidationError("schedule cursor is invalid")
+        if profile_id is None:
+            rows = self._connection.execute(
+                "SELECT * FROM schedules WHERE schedule_key > ? "
+                "ORDER BY schedule_key LIMIT ?",
+                (after_schedule_key, limit),
+            )
+        else:
+            _validate_profile_id(profile_id)
+            rows = self._connection.execute(
+                "SELECT * FROM schedules WHERE profile_id = ? AND schedule_key > ? "
+                "ORDER BY schedule_key LIMIT ?",
+                (profile_id, after_schedule_key, limit),
+            )
+        return tuple(self._schedule_from_row(row) for row in rows)
+
+    def has_due_work(self) -> bool:
+        """Report whether resuming could enable already-admitted publication."""
+        row = self._connection.execute(
+            "SELECT 1 FROM schedule_runs WHERE state IN ('due', 'dispatching') LIMIT 1"
+        ).fetchone()
+        return row is not None
+
     def set_schedule_enabled(
         self, schedule_key: int, enabled: bool, *, expected_revision: int
     ) -> ScheduleRecord:
@@ -3557,6 +3631,32 @@ class StateRepository:
     def get_run_request(self, request_id: int) -> RunRequestRecord:
         return self._request_from_row(self._request_row(request_id))
 
+    def list_run_requests(
+        self,
+        *,
+        profile_id: str | None = None,
+        after_request_id: int = 0,
+        limit: int = 100,
+    ) -> tuple[RunRequestRecord, ...]:
+        """Return a bounded durable-request page for status polling."""
+        _validate_page_limit(limit)
+        if after_request_id < 0:
+            raise StateValidationError("request cursor is invalid")
+        if profile_id is None:
+            rows = self._connection.execute(
+                "SELECT * FROM run_requests WHERE request_id > ? "
+                "ORDER BY request_id LIMIT ?",
+                (after_request_id, limit),
+            )
+        else:
+            _validate_profile_id(profile_id)
+            rows = self._connection.execute(
+                "SELECT * FROM run_requests WHERE profile_id = ? AND request_id > ? "
+                "ORDER BY request_id LIMIT ?",
+                (profile_id, after_request_id, limit),
+            )
+        return tuple(self._request_from_row(row) for row in rows)
+
     def create_confirmation_intent(
         self,
         *,
@@ -3569,6 +3669,7 @@ class StateRepository:
         expires_at: datetime,
         bundle_key: int | None = None,
         schedule_key: int | None = None,
+        idempotency_key: str | None = None,
     ) -> ConfirmationIntentRecord:
         if action not in _REQUEST_ACTIONS:
             raise StateValidationError("confirmation action is not allow-listed")
@@ -3585,7 +3686,13 @@ class StateRepository:
                 "confirmation intent expiry must be in the future"
             )
         arguments_json = self._safe_json(arguments)
-        intent_id = secrets.token_hex(16)
+        if idempotency_key is not None:
+            _validate_identifier(idempotency_key, "idempotency key")
+        intent_id = (
+            _sha256_text("post-pulsar.control/v1\0" + idempotency_key)[:32]
+            if idempotency_key is not None
+            else secrets.token_hex(16)
+        )
         nonce = secrets.token_hex(32)
         now = self._now_text()
         with self._transaction():
@@ -3618,6 +3725,15 @@ class StateRepository:
                 resource_revision,
                 fingerprint,
             )
+            existing = self._connection.execute(
+                "SELECT * FROM confirmation_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["binding_sha256"]) != binding:
+                    raise ConflictError(
+                        "idempotency key was used for a different confirmation"
+                    )
+                return self._intent_from_row(existing)
             self._connection.execute(
                 "INSERT INTO confirmation_intents(intent_id, action, arguments_json, "
                 "binding_sha256, profile_id, bundle_key, schedule_key, resource_revision, "
@@ -3972,6 +4088,14 @@ class StateRepository:
         )
         return tuple(self._admission_member_from_row(row) for row in rows)
 
+    def list_recoverable_admissions(self) -> tuple[AdmissionRecord, ...]:
+        """Return incomplete admissions in deterministic journal order."""
+        rows = self._connection.execute(
+            "SELECT * FROM admission_journals "
+            "WHERE phase NOT IN ('installed', 'rolled_back') ORDER BY journal_id"
+        )
+        return tuple(self._admission_from_row(row) for row in rows)
+
     def _mark_ambiguous_locked(
         self,
         bundle_key: int,
@@ -4208,6 +4332,13 @@ class StateRepository:
 
         if action in _ALWAYS_CONFIRMED_ACTIONS:
             return True
+        if action == "resume":
+            return (
+                self._connection.execute(
+                    "SELECT 1 FROM schedule_runs WHERE state IN ('due', 'dispatching') LIMIT 1"
+                ).fetchone()
+                is not None
+            )
         if action == "schedule_create":
             return arguments.get("enabled") is True
         if action == "schedule_update":
@@ -4617,6 +4748,11 @@ class StateRepository:
 
     def _now_text(self) -> str:
         return _timestamp(self._now())
+
+
+def _validate_page_limit(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 500:
+        raise StateValidationError("page limit must be from 1 through 500")
 
 
 def _validate_platform(value: str) -> Platform:
