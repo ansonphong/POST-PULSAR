@@ -109,6 +109,10 @@ class _Hasher(Protocol):
     def update(self, data: bytes) -> object: ...
 
 
+class _Reader(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
+
+
 class _PinnedNetworkBackend(httpcore.SyncBackend):
     """Connect only to the validated address while httpcore retains TLS SNI."""
 
@@ -179,11 +183,50 @@ def _pinned_transport_factory(
 class VerifiedPrivateMedia:
     """An open private artifact whose descriptor identity and bytes were verified."""
 
-    stream: BinaryIO
+    stream: VerifiedUploadStream
     sha256: str
     size_bytes: int
     device: int
     inode: int
+
+
+class VerifiedUploadStream:
+    """A forward-only reader that hashes exactly the bytes an adapter consumes."""
+
+    def __init__(self, source: BinaryIO) -> None:
+        self._source = source
+        self._digest = hashlib.sha256()
+        self._size = 0
+        self._closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed verified stream")
+        if size < -1:
+            raise ValueError("invalid read size")
+        data = self._source.read(size)
+        self._digest.update(data)
+        self._size += len(data)
+        return data
+
+    def tell(self) -> int:
+        return self._size
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _result(self) -> tuple[str, int]:
+        return self._digest.hexdigest(), self._size
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +278,7 @@ class StagedMedia:
     size_bytes: int
     cleanup_policy: CleanupPolicy
     public_url: str | None = None
+    source_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Reject forged or cross-profile descriptor identities."""
@@ -407,39 +451,15 @@ def prepare_bundle_media(
                 warnings.extend(normalize_warnings)
             else:
                 source, private_descriptor, _metadata = private_items[0]
-                raw_public_result = _stage_source(
-                    _descriptor_path(private_root, private_descriptor.relative_path),
-                    root=instagram_settings.media_directory,
+                public_result = _stage_public_video(
+                    private_descriptor,
+                    private_root=private_root,
+                    settings=instagram_settings,
                     profile_id=profile_id,
                     bucket=bundle.bucket,
                     bundle_id=bundle.bundle_id,
                     bundle_fingerprint=bundle.fingerprint,
-                    ordinal=1,
-                    staging_kind="instagram_public",
-                    mime_type=private_descriptor.mime_type,
-                    public_url=_public_url(
-                        instagram_settings.media_base_url,
-                        _public_filename(
-                            profile_id,
-                            bundle.bucket,
-                            bundle.fingerprint,
-                            1,
-                            private_descriptor.sha256,
-                            source.suffix.lower(),
-                        ),
-                    ),
-                    forced_filename=_public_filename(
-                        profile_id,
-                        bundle.bucket,
-                        bundle.fingerprint,
-                        1,
-                        private_descriptor.sha256,
-                        source.suffix.lower(),
-                    ),
-                )
-                public_result = _StagedResult(
-                    replace(raw_public_result.descriptor, source_name=source.name),
-                    raw_public_result.created,
+                    source_name=source.name,
                 )
                 staged_results.append(public_result)
                 public_items.append(public_result.descriptor)
@@ -579,44 +599,59 @@ def cleanup_staged_media(
     quarantine = f".delete-{secrets.token_hex(16)}"
     try:
         with _open_descriptor_parent(Path(staging_root), relative) as parent_fd:
-            metadata = os.stat(
-                relative.name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if not stat.S_ISREG(metadata.st_mode):
-                raise MediaSafetyError("staged media is not a regular file")
-            source_fd = _open_regular_at(parent_fd, relative.name)
-            source = os.fdopen(source_fd, "rb")
-            try:
-                opened = os.fstat(source.fileno())
-                os.rename(
-                    relative.name,
-                    quarantine,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
+            with _open_cleanup_directory(parent_fd) as cleanup_fd:
+                metadata = os.stat(
+                    relative.name, dir_fd=parent_fd, follow_symlinks=False
                 )
-                quarantined = os.stat(
-                    quarantine, dir_fd=parent_fd, follow_symlinks=False
-                )
-                if not _same_identity(opened, quarantined):
-                    raise MediaSafetyError(
-                        "staged media identity changed during cleanup"
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise MediaSafetyError("staged media is not a regular file")
+                source_fd = _open_regular_at(parent_fd, relative.name)
+                source = os.fdopen(source_fd, "rb")
+                try:
+                    opened = os.fstat(source.fileno())
+                    if opened.st_nlink != 1:
+                        raise MediaSafetyError(
+                            "staged media has an unsafe cleanup identity"
+                        )
+                    os.rename(
+                        relative.name,
+                        quarantine,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=cleanup_fd,
                     )
-                digest, size = _hash_open_file(source)
-                if digest != staged.sha256 or size != staged.size_bytes:
-                    _restore_quarantine(parent_fd, quarantine, relative.name, opened)
-                    raise MediaSafetyError(
-                        "staged media hash does not match cleanup descriptor"
+                    quarantined = os.stat(
+                        quarantine, dir_fd=cleanup_fd, follow_symlinks=False
                     )
-                final_identity = os.stat(
-                    quarantine, dir_fd=parent_fd, follow_symlinks=False
-                )
-                if not _same_identity(opened, final_identity):
-                    raise MediaSafetyError(
-                        "staged media identity changed during cleanup"
+                    if not _same_identity(opened, quarantined):
+                        raise MediaSafetyError(
+                            "staged media identity changed during cleanup"
+                        )
+                    digest, size = _hash_open_file(source)
+                    if digest != staged.sha256 or size != staged.size_bytes:
+                        _restore_quarantine(
+                            cleanup_fd,
+                            parent_fd,
+                            quarantine,
+                            relative.name,
+                            opened,
+                        )
+                        raise MediaSafetyError(
+                            "staged media hash does not match cleanup descriptor"
+                        )
+                    final_identity = os.stat(
+                        quarantine, dir_fd=cleanup_fd, follow_symlinks=False
                     )
-                os.unlink(quarantine, dir_fd=parent_fd)
-            finally:
-                source.close()
+                    if not _same_identity(opened, final_identity):
+                        raise MediaSafetyError(
+                            "staged media identity changed during cleanup"
+                        )
+                    os.unlink(quarantine, dir_fd=cleanup_fd)
+                    if os.fstat(source.fileno()).st_nlink != 0:
+                        raise MediaSafetyError(
+                            "staged media cleanup identity was not removed"
+                        )
+                finally:
+                    source.close()
     except FileNotFoundError:
         return False
     except MediaSafetyError:
@@ -661,22 +696,34 @@ def open_verified_private_media(
                         "private staged media identity or hash does not match"
                     )
                 stream.seek(0)
+                verified_stream = VerifiedUploadStream(stream)
                 yield VerifiedPrivateMedia(
-                    stream=stream,
+                    stream=verified_stream,
                     sha256=digest,
                     size_bytes=size,
                     device=after.st_dev,
                     inode=after.st_ino,
                 )
+                consumed_hash, consumed_size = verified_stream._result()
                 final = os.fstat(stream.fileno())
-                if not (
-                    stat.S_ISREG(final.st_mode)
-                    and _same_identity(before, final)
-                    and before.st_size == final.st_size
-                    and before.st_mtime_ns == final.st_mtime_ns
+                try:
+                    named = os.stat(
+                        staged.relative_path.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    raise MediaSafetyError(
+                        "private staged media was not consumed completely and unchanged"
+                    ) from None
+                if (
+                    consumed_size != staged.size_bytes
+                    or consumed_hash != staged.sha256
+                    or not _unchanged_open_file(before, final)
+                    or not _same_identity(final, named)
                 ):
                     raise MediaSafetyError(
-                        "private staged media changed while being consumed"
+                        "private staged media was not consumed completely and unchanged"
                     )
             finally:
                 stream.close()
@@ -805,6 +852,7 @@ def _stage_bytes(
     mime_type: str,
     filename: str,
     public_url: str,
+    source_sha256: str,
 ) -> _StagedResult:
     directory = _stage_directory(
         root, profile_id, bucket, bundle_fingerprint, "instagram_public"
@@ -832,18 +880,102 @@ def _stage_bytes(
         )
     return _StagedResult(
         StagedMedia(
-            profile_id,
-            bucket,
-            bundle_id,
-            bundle_fingerprint,
-            source_name,
-            "instagram_public",
-            final_path.relative_to(root.absolute()),
-            digest,
-            mime_type,
-            len(data),
-            "known_terminal_hash_match",
-            public_url,
+            profile_id=profile_id,
+            source_bucket=bucket,
+            bundle_id=bundle_id,
+            bundle_fingerprint=bundle_fingerprint,
+            source_name=source_name,
+            staging_kind="instagram_public",
+            relative_path=final_path.relative_to(root.absolute()),
+            sha256=digest,
+            mime_type=mime_type,
+            size_bytes=len(data),
+            cleanup_policy="known_terminal_hash_match",
+            public_url=public_url,
+            source_sha256=source_sha256,
+        ),
+        created,
+    )
+
+
+def _stage_public_video(
+    private: StagedMedia,
+    *,
+    private_root: Path,
+    settings: InstagramSettings,
+    profile_id: str,
+    bucket: SourceBucket,
+    bundle_id: str,
+    bundle_fingerprint: str,
+    source_name: str,
+) -> _StagedResult:
+    filename = _public_filename(
+        profile_id,
+        bucket,
+        bundle_fingerprint,
+        1,
+        private.sha256,
+        Path(source_name).suffix.lower(),
+    )
+    directory = _stage_directory(
+        settings.media_directory,
+        profile_id,
+        bucket,
+        bundle_fingerprint,
+        "instagram_public",
+    )
+    temporary = f".capture-{secrets.token_hex(16)}"
+    digest = hashlib.sha256()
+    with _open_directory_nofollow(directory) as directory_fd:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            with open_verified_private_media(
+                private,
+                private_root,
+                expected_profile_id=profile_id,
+                expected_bucket=bucket,
+            ) as verified:
+                with os.fdopen(descriptor, "wb") as destination:
+                    size = _copy_stream(verified.stream, destination, digest)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+            sha256 = digest.hexdigest()
+            if sha256 != private.sha256 or size != private.size_bytes:
+                raise MediaSafetyError(
+                    "public video bytes do not match private staging"
+                )
+            created = _install_exclusive(
+                directory_fd,
+                temporary,
+                filename,
+                private.sha256,
+                private.size_bytes,
+                0o444,
+            )
+        except Exception:
+            _safe_unlink_at(directory_fd, temporary)
+            raise
+    final_path = directory / filename
+    return _StagedResult(
+        StagedMedia(
+            profile_id=profile_id,
+            source_bucket=bucket,
+            bundle_id=bundle_id,
+            bundle_fingerprint=bundle_fingerprint,
+            source_name=source_name,
+            staging_kind="instagram_public",
+            relative_path=final_path.relative_to(settings.media_directory.absolute()),
+            sha256=private.sha256,
+            mime_type=private.mime_type,
+            size_bytes=private.size_bytes,
+            cleanup_policy="known_terminal_hash_match",
+            public_url=_public_url(settings.media_base_url, filename),
+            source_sha256=private.sha256,
         ),
         created,
     )
@@ -985,7 +1117,32 @@ def _open_regular_at(directory_fd: int, name: str) -> int:
     return descriptor
 
 
-def _copy_stream(source: BinaryIO, destination: BinaryIO, digest: _Hasher) -> int:
+@contextmanager
+def _open_cleanup_directory(parent_fd: int) -> Iterator[int]:
+    name = ".post-pulsar-cleanup"
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(existing.st_mode):
+            raise MediaSafetyError("cleanup quarantine directory is unsafe") from None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        current_user = os.geteuid() if hasattr(os, "geteuid") else metadata.st_uid
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != current_user
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise MediaSafetyError("cleanup quarantine directory is unsafe")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _copy_stream(source: _Reader, destination: BinaryIO, digest: _Hasher) -> int:
     size = 0
     while chunk := source.read(_COPY_CHUNK_BYTES):
         destination.write(chunk)
@@ -1104,21 +1261,22 @@ def _unchanged_open_file(before: os.stat_result, after: os.stat_result) -> bool:
 
 
 def _restore_quarantine(
-    directory_fd: int,
+    cleanup_fd: int,
+    original_fd: int,
     quarantine: str,
     original: str,
     expected: os.stat_result,
 ) -> None:
     try:
-        os.stat(original, dir_fd=directory_fd, follow_symlinks=False)
+        os.stat(original, dir_fd=original_fd, follow_symlinks=False)
     except FileNotFoundError:
         os.rename(
             quarantine,
             original,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
+            src_dir_fd=cleanup_fd,
+            dst_dir_fd=original_fd,
         )
-        restored = os.stat(original, dir_fd=directory_fd, follow_symlinks=False)
+        restored = os.stat(original, dir_fd=original_fd, follow_symlinks=False)
         if _same_identity(expected, restored):
             return
     except OSError:
@@ -1534,8 +1692,15 @@ def _normalize_instagram_images(
     results: list[_StagedResult] = []
     warnings: list[MediaWarning] = []
     for ordinal, (source, private, _metadata) in enumerate(items, start=1):
-        source_private_path = _descriptor_path(private_root, private.relative_path)
-        normalized = _normalized_jpeg(source_private_path, dimensions)
+        with open_verified_private_media(
+            private,
+            private_root,
+            expected_profile_id=profile_id,
+            expected_bucket=bucket,
+        ) as verified:
+            normalized = _normalized_jpeg(
+                BytesIO(verified.stream.read()), dimensions
+            )
         digest = hashlib.sha256(normalized).hexdigest()
         filename = _public_filename(
             profile_id, bucket, bundle_fingerprint, ordinal, digest, ".jpg"
@@ -1552,6 +1717,7 @@ def _normalize_instagram_images(
             mime_type="image/jpeg",
             filename=filename,
             public_url=_public_url(settings.media_base_url, filename),
+            source_sha256=private.sha256,
         )
         results.append(result)
         if digest != private.sha256:
@@ -1592,9 +1758,9 @@ def _instagram_normalized_dimensions(metadata: MediaMetadata) -> tuple[int, int]
     return dimensions
 
 
-def _normalized_jpeg(path: Path, dimensions: tuple[int, int]) -> bytes:
+def _normalized_jpeg(source_stream: BinaryIO, dimensions: tuple[int, int]) -> bytes:
     try:
-        with Image.open(path) as source:
+        with Image.open(source_stream) as source:
             oriented = ImageOps.exif_transpose(source)
             oriented.load()
             if oriented.mode in {"RGBA", "LA"} or "transparency" in oriented.info:
@@ -1709,12 +1875,18 @@ def _validate_relative_descriptor(staged: StagedMedia) -> None:
             )
         if staged.public_url is not None:
             raise MediaSafetyError("private staged media cannot have a public URL")
+        if staged.source_sha256 is not None:
+            raise MediaSafetyError("private staged media cannot have derivative lineage")
         return
     prefix = f"{staged.profile_id}-{staged.source_bucket}-{staged.bundle_fingerprint}-"
     if len(relative.parts) != 1 or not relative.name.startswith(prefix):
         raise MediaSafetyError("public staged media identity does not match its path")
     if staged.public_url is None:
         raise MediaSafetyError("public staged media requires a URL")
+    if staged.source_sha256 is None or not _SHA256_RE.fullmatch(
+        staged.source_sha256
+    ):
+        raise MediaSafetyError("public staged media requires source hash lineage")
 
 
 def _assert_real_directory(path: Path) -> None:

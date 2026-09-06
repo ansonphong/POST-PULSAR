@@ -162,6 +162,7 @@ def _public_descriptor(tmp_path: Path, body: bytes) -> StagedMedia:
         size_bytes=len(body),
         cleanup_policy="known_terminal_hash_match",
         public_url=f"https://media.example.test/post-pulsar/{path.name}",
+        source_sha256=digest,
     )
 
 
@@ -286,11 +287,54 @@ def test_verified_private_stream_keeps_open_identity_across_path_swap(
     staged = prepared.items[0].private
     path = tmp_path / "private" / staged.relative_path
 
-    with open_verified_private_media(staged, tmp_path / "private") as verified:
-        captured = path.with_name("captured-original.png")
-        path.rename(captured)
-        path.write_bytes(_image_bytes("PNG", size=(700, 700)))
-        assert verified.stream.read() == original
+    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+        with open_verified_private_media(staged, tmp_path / "private") as verified:
+            captured = path.with_name("captured-original.png")
+            path.rename(captured)
+            path.write_bytes(_image_bytes("PNG", size=(700, 700)))
+            assert verified.stream.read() == original
+
+
+def test_verified_private_stream_rejects_incomplete_consumption(tmp_path: Path) -> None:
+    original = _image_bytes("PNG")
+    prepared = prepare_bundle_media(
+        _bundle(tmp_path, {"post.png": original}),
+        profile_id="ansonphong",
+        targets=("x",),
+        private_staging_directory=tmp_path / "private",
+    )
+
+    with pytest.raises(MediaSafetyError, match="consumed completely"):
+        with open_verified_private_media(
+            prepared.items[0].private, tmp_path / "private"
+        ) as verified:
+            assert verified.stream.read(16) == original[:16]
+
+
+def test_verified_private_stream_detects_same_inode_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    original = _image_bytes("PNG")
+    prepared = prepare_bundle_media(
+        _bundle(tmp_path, {"post.png": original}),
+        profile_id="ansonphong",
+        targets=("x",),
+        private_staging_directory=tmp_path / "private",
+    )
+    staged = prepared.items[0].private
+    path = tmp_path / "private" / staged.relative_path
+    timestamps = path.stat()
+
+    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+        with open_verified_private_media(staged, tmp_path / "private") as verified:
+            assert verified.stream.read() == original
+            path.chmod(0o600)
+            with path.open("r+b") as mutable:
+                mutable.seek(0)
+                mutable.write(b"X")
+                mutable.flush()
+                os.fsync(mutable.fileno())
+            os.utime(path, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
 
 
 @pytest.mark.parametrize("replacement", ["regular", "symlink"])
@@ -421,6 +465,9 @@ def test_instagram_carousel_is_normalized_to_common_metadata_free_jpegs(
             assert "exif" not in image.info
             dimensions.append(image.size)
             assert 320 <= image.width <= 1440
+    for item in prepared.items:
+        assert item.public is not None
+        assert item.public.source_sha256 == item.private.sha256
     assert dimensions[0] == dimensions[1]
     width, height = dimensions[0]
     assert 4 * height <= 5 * width
@@ -588,7 +635,90 @@ def test_ffprobe_uses_bounded_argv_and_video_metadata_is_enforced(
     assert item.metadata.duration_seconds == 10.0
     assert item.public is not None
     assert item.public.mime_type == "video/mp4"
+    assert item.public.sha256 == item.private.sha256
+    assert item.public.source_sha256 == item.private.sha256
     assert item.public.absolute_path(tmp_path / "public").read_bytes() == body
+
+
+def test_instagram_normalization_never_reopens_swapped_private_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path, {"post.jpg": _image_bytes("JPEG")})
+    private_root = tmp_path / "private"
+    private_path: Path | None = None
+    real_normalize = media_module._normalized_jpeg
+
+    def swap_during_normalize(source_stream: Any, dimensions: tuple[int, int]) -> bytes:
+        assert private_path is not None
+        captured = private_path.with_name("captured-private.jpg")
+        private_path.rename(captured)
+        private_path.write_bytes(_image_bytes("JPEG", size=(700, 700)))
+        return real_normalize(source_stream, dimensions)
+
+    def remember_private(result: Any, root: Path) -> Any:
+        nonlocal private_path
+        private_path = root / result.descriptor.relative_path
+        return result
+
+    real_stage_source = media_module._stage_source
+
+    def stage_and_remember(*args: Any, **kwargs: Any) -> Any:
+        result = real_stage_source(*args, **kwargs)
+        if kwargs.get("staging_kind") == "private":
+            remember_private(result, private_root)
+        return result
+
+    monkeypatch.setattr(media_module, "_stage_source", stage_and_remember)
+    monkeypatch.setattr(media_module, "_normalized_jpeg", swap_during_normalize)
+
+    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+        prepare_bundle_media(
+            bundle,
+            profile_id="ansonphong",
+            targets=("instagram",),
+            private_staging_directory=private_root,
+            instagram=_instagram(tmp_path),
+        )
+
+    assert not (tmp_path / "public").exists()
+
+
+def test_public_video_copy_uses_held_verified_private_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"\x00\x00\x00\x18ftypmp42" + b"0" * 12
+    bundle = _bundle(tmp_path, {"post.mp4": body}, bucket="REELS")
+    private_root = tmp_path / "private"
+    real_copy = media_module._copy_stream
+    copy_count = 0
+
+    def swap_before_public_copy(source: Any, destination: Any, digest: Any) -> int:
+        nonlocal copy_count
+        copy_count += 1
+        if copy_count == 2:
+            candidates = tuple(private_root.rglob("*.mp4"))
+            assert len(candidates) == 1
+            private_path = candidates[0]
+            private_path.rename(private_path.with_name("captured-private.mp4"))
+            private_path.write_bytes(b"\x00\x00\x00\x18ftypmp42changed")
+        return real_copy(source, destination, digest)
+
+    monkeypatch.setattr(media_module, "_copy_stream", swap_before_public_copy)
+
+    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+        prepare_bundle_media(
+            bundle,
+            profile_id="ansonphong",
+            targets=("instagram",),
+            private_staging_directory=private_root,
+            instagram=_instagram(tmp_path),
+            process_runner=_runner_for(_video_probe()),
+            ffprobe_timeout_seconds=7.0,
+        )
+
+    public_root = tmp_path / "public"
+    assert public_root.exists()
+    assert tuple(public_root.iterdir()) == ()
 
 
 @pytest.mark.parametrize(
@@ -917,3 +1047,6 @@ def test_cleanup_quarantines_open_identity_before_hash_and_unlink(
         descriptor, tmp_path / "public", outcome="published"
     )
     assert path.read_bytes() == replacement
+    quarantine = tmp_path / "public" / ".post-pulsar-cleanup"
+    assert quarantine.stat().st_mode & 0o077 == 0
+    assert tuple(quarantine.iterdir()) == ()
