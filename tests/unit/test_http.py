@@ -157,6 +157,19 @@ class _Adapter(BasePlatformAdapter):
         return PublishResult.published(str(payload["id"]))
 
 
+class _RetryableAfterFinalAdapter(_Adapter):
+    """Deliberately violate the final-result classification contract."""
+
+    def _commit_once(self, prepared: PreparedPublication) -> PublishResult:
+        del prepared
+        self.client.final_request("POST", "/publish", json_body={"safe": True})
+        return PublishResult.failed(
+            "incorrect_retry",
+            "Adapter incorrectly classified a final request as retryable.",
+            retry_classification="safe_pre_final",
+        )
+
+
 def test_pre_final_retry_after_is_bounded_and_token_is_header_only() -> None:
     sleeps: list[float] = []
     token = "token-one-never-render"
@@ -276,8 +289,12 @@ def test_publish_results_allow_only_sanitized_terminal_states() -> None:
         == "ambiguous"
     )
     with pytest.raises(AdapterContractError):
-        PublishResult(  # type: ignore[arg-type]
-            "unknown", None, "bad", "Bad outcome.", "ambiguous"
+        PublishResult(
+            "unknown",  # type: ignore[arg-type]
+            None,
+            "bad",
+            "Bad outcome.",
+            "ambiguous",
         )
     with pytest.raises(AdapterContractError):
         PublishResult.published("unsafe\nremote-id")
@@ -360,6 +377,31 @@ def test_adapter_lifecycle_is_identity_bound_checkpointed_and_commit_gated() -> 
         assert adapter.commit(
             prepared, delivery=_delivery("final_dispatch_started")
         ) == PublishResult.published("post-1")
+        with pytest.raises(AdapterContractError, match="already attempted"):
+            adapter.commit(prepared, delivery=_delivery("final_dispatch_started"))
+        adapter.close()
+
+    assert route.call_count == 1
+
+
+def test_adapter_cannot_return_safe_retry_after_final_request() -> None:
+    snapshot = _snapshot()
+    prepared = PreparedPublication(_request(snapshot), 1, ())
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post("https://api.example.test/publish").mock(
+            return_value=httpx.Response(200, json={"id": "post-1"})
+        )
+        client = PlatformHTTPClient(
+            snapshot,
+            SecretValue("adapter-token"),
+            base_url="https://api.example.test",
+        )
+        adapter = _RetryableAfterFinalAdapter(
+            snapshot, client, RemoteIdentity("10001", "ansonphong")
+        )
+
+        with pytest.raises(AdapterContractError, match="cannot be safely retried"):
+            adapter.commit(prepared, delivery=_delivery("final_dispatch_started"))
         with pytest.raises(AdapterContractError, match="already attempted"):
             adapter.commit(prepared, delivery=_delivery("final_dispatch_started"))
         adapter.close()

@@ -395,6 +395,10 @@ class BasePlatformAdapter(ABC):
             raise AdapterContractError("adapter returned invalid publication result")
         if not self._closer.final_attempted:
             raise AdapterContractError("commit did not perform a final request")
+        if result.retry_classification == "safe_pre_final":
+            raise AdapterContractError(
+                "post-final publication result cannot be safely retried"
+            )
         return result
 
     def _assert_open(self) -> None:
