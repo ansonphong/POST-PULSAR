@@ -70,3 +70,6 @@
 {"event":"commit","sha":"3fcc425","message":"chore(plan): mark T4.2 DONE","time":"2026-09-06T08:08:16Z"}
 {"event":"commit","sha":"ac3c831","message":"style: format source and tests","time":"2026-09-06T08:11:34Z"}
 {"event":"commit","sha":"ed3c18d","message":"ci: lock dependencies and enforce security gates","time":"2026-09-06T08:16:55Z"}
+{"event":"commit","sha":"a9fa746","message":"chore(plan): mark T4.3 DONE","time":"2026-09-06T08:18:41Z"}
+{"event":"commit","sha":"2c07fc2","message":"docs(plan): repair T4.4 execution scope","time":"2026-09-06T08:23:15Z"}
+{"event":"commit","sha":"1aa342b","message":"feat(scheduler): add deterministic profile scheduling","time":"2026-09-06T08:33:42Z"}
