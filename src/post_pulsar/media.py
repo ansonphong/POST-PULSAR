@@ -167,9 +167,7 @@ class _PinnedHTTPTransport(httpx.HTTPTransport):
             max_connections=1,
             max_keepalive_connections=0,
             retries=0,
-            network_backend=_PinnedNetworkBackend(
-                connect_ip, server_hostname, port
-            ),
+            network_backend=_PinnedNetworkBackend(connect_ip, server_hostname, port),
         )
 
 
@@ -534,15 +532,21 @@ def verify_public_media_url(
                 ) as response:
                     if response.status_code in _REDIRECT_STATUS:
                         if redirects >= max_redirects:
-                            raise MediaSafetyError("public media redirect limit exceeded")
+                            raise MediaSafetyError(
+                                "public media redirect limit exceeded"
+                            )
                         location = response.headers.get("location")
                         if not location:
-                            raise MediaSafetyError("public media redirect has no location")
+                            raise MediaSafetyError(
+                                "public media redirect has no location"
+                            )
                         current = urljoin(current, location)
                         redirects += 1
                         continue
                     if response.status_code != 200:
-                        raise MediaSafetyError("public media URL did not return HTTP 200")
+                        raise MediaSafetyError(
+                            "public media URL did not return HTTP 200"
+                        )
                     mime_type = (
                         response.headers.get("content-type", "")
                         .split(";", 1)[0]
@@ -772,7 +776,9 @@ def open_verified_private_media(
     except MediaSafetyError:
         raise
     except OSError:
-        raise MediaSafetyError("private staged media could not be opened safely") from None
+        raise MediaSafetyError(
+            "private staged media could not be opened safely"
+        ) from None
 
 
 def _validate_identity(profile_id: str, bundle: PublishableBundle) -> None:
@@ -1746,9 +1752,7 @@ def _normalize_instagram_images(
             expected_profile_id=profile_id,
             expected_bucket=bucket,
         ) as verified:
-            normalized = _normalized_jpeg(
-                BytesIO(verified.stream.read()), dimensions
-            )
+            normalized = _normalized_jpeg(BytesIO(verified.stream.read()), dimensions)
         digest = hashlib.sha256(normalized).hexdigest()
         filename = _public_filename(
             profile_id, bucket, bundle_fingerprint, ordinal, digest, ".jpg"
@@ -1924,16 +1928,16 @@ def _validate_relative_descriptor(staged: StagedMedia) -> None:
         if staged.public_url is not None:
             raise MediaSafetyError("private staged media cannot have a public URL")
         if staged.source_sha256 is not None:
-            raise MediaSafetyError("private staged media cannot have derivative lineage")
+            raise MediaSafetyError(
+                "private staged media cannot have derivative lineage"
+            )
         return
     prefix = f"{staged.profile_id}-{staged.source_bucket}-{staged.bundle_fingerprint}-"
     if len(relative.parts) != 1 or not relative.name.startswith(prefix):
         raise MediaSafetyError("public staged media identity does not match its path")
     if staged.public_url is None:
         raise MediaSafetyError("public staged media requires a URL")
-    if staged.source_sha256 is None or not _SHA256_RE.fullmatch(
-        staged.source_sha256
-    ):
+    if staged.source_sha256 is None or not _SHA256_RE.fullmatch(staged.source_sha256):
         raise MediaSafetyError("public staged media requires source hash lineage")
 
 

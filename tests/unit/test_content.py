@@ -259,9 +259,7 @@ def test_unreadable_numbered_member_invalidates_its_bundle(
     unreadable = _write(tmp_path, "post-2.jpg", b"two")
     original_stat = Path.stat
 
-    def fail_member_stat(
-        path: Path, *, follow_symlinks: bool = True
-    ) -> object:
+    def fail_member_stat(path: Path, *, follow_symlinks: bool = True) -> object:
         if path == unreadable and not follow_symlinks:
             raise FileNotFoundError(path)
         return original_stat(path, follow_symlinks=follow_symlinks)

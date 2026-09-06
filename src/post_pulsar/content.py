@@ -1049,7 +1049,10 @@ def _verify_stable_read(
         and stat.S_ISREG(path_after.st_mode)
         and _same_file_identity(before, opened_after)
         and _same_file_identity(opened_after, path_after)
-        and observed_size == before.st_size == opened_after.st_size == path_after.st_size
+        and observed_size
+        == before.st_size
+        == opened_after.st_size
+        == path_after.st_size
         and before.st_mtime_ns == opened_after.st_mtime_ns == path_after.st_mtime_ns
         and before.st_ctime_ns == opened_after.st_ctime_ns == path_after.st_ctime_ns
     ):

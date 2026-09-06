@@ -202,7 +202,8 @@ class OneRunApplication:
 
             if bundle is None:
                 scan = scan_account_root(
-                    profile.account_root, buckets=(request.bucket,),
+                    profile.account_root,
+                    buckets=(request.bucket,),
                 )
                 if scan.issues:
                     return RunOutcome("invalid", code=scan.issues[0].code)
@@ -446,8 +447,7 @@ class OneRunApplication:
             if preflight_failure is not None:
                 outcome, failed_platform = preflight_failure
                 remote_evidence = any(
-                    _has_remote_artifacts(repository, item)
-                    for item in claimed.values()
+                    _has_remote_artifacts(repository, item) for item in claimed.values()
                 )
                 if not remote_evidence:
                     _cleanup_media(

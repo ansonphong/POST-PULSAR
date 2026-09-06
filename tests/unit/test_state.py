@@ -1337,7 +1337,8 @@ def test_run_trigger_survives_archive_and_is_profile_bound(
         attempt_count=claim.attempt_count,
     )
     archiving = repository.begin_archiving(
-        admitted.bundle_key, expected_revision=repository.get_bundle(admitted.bundle_key).revision
+        admitted.bundle_key,
+        expected_revision=repository.get_bundle(admitted.bundle_key).revision,
     )
     repository.checkpoint_archive_member(
         admitted.bundle_key, "post.jpg", sha256="a" * 64

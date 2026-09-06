@@ -1233,9 +1233,7 @@ def test_pre_final_staging_crash_is_resumed_and_cleaned(
         clock=lambda: NOW,
         adapter_factory=_factory([]),
     )
-    outcome = second.run_once(
-        RunOnceRequest("operator", "QUEUE", f"resume-{boundary}")
-    )
+    outcome = second.run_once(RunOnceRequest("operator", "QUEUE", f"resume-{boundary}"))
 
     assert outcome.status == "archived"
     assert not any((tmp_path / "state/staging/private").rglob("*.jpg"))
@@ -1345,6 +1343,7 @@ def test_prepared_media_warnings_are_persisted_once(tmp_path: Path) -> None:
 
     with StateRepository.open_existing(tmp_path / "state/post_pulsar.sqlite3") as repo:
         assert [
-            item["event_code"] for item in repo.list_events(cast(int, outcome.bundle_key))
+            item["event_code"]
+            for item in repo.list_events(cast(int, outcome.bundle_key))
         ].count("media_cleanup_deferred") == 1
     instance.release()

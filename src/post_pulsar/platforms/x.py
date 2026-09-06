@@ -89,6 +89,7 @@ class XAdapterError(AdapterContractError):
         self.code = code
         self.retry_classification = retry_classification
 
+
 class XAdapter(BasePlatformAdapter):
     """Single-profile official X adapter with a one-shot final create."""
 

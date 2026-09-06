@@ -746,9 +746,7 @@ def test_public_video_context_entry_failures_do_not_leak_file_descriptors(
     def fail_verified_open(*_args: object, **_kwargs: object) -> EntryFailure:
         return EntryFailure()
 
-    monkeypatch.setattr(
-        media_module, "open_verified_private_media", fail_verified_open
-    )
+    monkeypatch.setattr(media_module, "open_verified_private_media", fail_verified_open)
     baseline = len(tuple(descriptor_root.iterdir()))
 
     for _attempt in range(32):
@@ -919,7 +917,9 @@ def test_public_url_redirect_is_revalidated_and_bounded(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen_requests.append((str(request.url), request.headers["host"]))
         if str(request.url) == public_url:
-            return httpx.Response(302, headers={"location": redirected}, request=request)
+            return httpx.Response(
+                302, headers={"location": redirected}, request=request
+            )
         return httpx.Response(
             200,
             headers={"content-type": "image/jpeg"},
@@ -1015,9 +1015,7 @@ def test_public_url_rejects_an_unsafe_base_even_with_public_dns(tmp_path: Path) 
         verify_public_media_url(
             replace(
                 descriptor,
-                public_url=public_url.replace(
-                    "media.example.test", "93.184.216.34"
-                ),
+                public_url=public_url.replace("media.example.test", "93.184.216.34"),
             ),
             media_base_url="https://93.184.216.34/post-pulsar/",
             resolver=_public_resolver,
@@ -1126,9 +1124,7 @@ def test_cleanup_quarantines_open_identity_before_hash_and_unlink(
 
     monkeypatch.setattr(os, "rename", rename_then_replace)
 
-    assert cleanup_staged_media(
-        descriptor, tmp_path / "public", outcome="published"
-    )
+    assert cleanup_staged_media(descriptor, tmp_path / "public", outcome="published")
     assert path.read_bytes() == replacement
     quarantine = tmp_path / "public" / ".post-pulsar-cleanup"
     assert quarantine.stat().st_mode & 0o077 == 0
