@@ -7,7 +7,7 @@ docs: ["README.md", "https://docs.x.com/x-api/media/initialize-media-upload", "h
 depends: none
 blocks: none
 why: "The relocated repository still contains the PHONG-BOT identity, fragile filename globbing, obsolete/private platform integrations, plaintext credential loading, broken X video upload, and no durable per-platform delivery state. This plan modernizes the existing two-platform publishing product without adding product features."
-stage_state: active
+stage_state: done
 ---
 
 # POST PULSAR Modernization — Master Plan

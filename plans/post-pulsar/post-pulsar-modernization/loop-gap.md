@@ -98,7 +98,7 @@ the final corrections. Remaining gaps: none.
 │ 05-operations-documentation-and-integration.md         · 6 gaps fixed
 │ 03-hardening-amendments.md                             · 1 gap fixed
 ├─ Commits ────────────────────────────────────────────────────────────────
-│ (uncommitted — 7 files modified, awaiting commit)       · 40 gaps fixed
+│ e270a5b00  harden POST PULSAR execution plan             · 40 gaps fixed
 ├─ Review Gate ───────────────────────────────────────────────────────────
 │ ✅ Wave 3 review CLEAN — fixes verified, no scope creep
 ├─ Remaining Gaps ────────────────────────────────────────────────────────
