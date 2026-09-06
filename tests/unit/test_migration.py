@@ -368,6 +368,51 @@ def test_completed_rerun_is_read_only_and_idempotent(tmp_path: Path) -> None:
     assert (journal.read_bytes(), journal.stat().st_mtime_ns) == before
 
 
+def test_completed_dry_run_is_noop_without_sqlite_sidecars_or_mtime_changes(
+    tmp_path: Path,
+) -> None:
+    _legacy(tmp_path)
+    applied = _run(tmp_path, mode="apply")
+    state = tmp_path / "state"
+    database = state / "post_pulsar.sqlite3"
+    shm = Path(f"{database}-shm")
+    if shm.exists():
+        shm.unlink()
+    before_entries = tuple(
+        sorted(path.relative_to(state).as_posix() for path in state.rglob("*"))
+    )
+    before_metadata = {
+        relative: (
+            (state / relative).stat(follow_symlinks=False).st_mode,
+            (state / relative).stat(follow_symlinks=False).st_size,
+            (state / relative).stat(follow_symlinks=False).st_mtime_ns,
+        )
+        for relative in before_entries
+    }
+    state_mtime = state.stat().st_mtime_ns
+
+    report = _run(tmp_path, mode="dry-run")
+
+    assert report.mode == "dry-run"
+    assert report.phase == applied.phase == "complete"
+    assert report.items == applied.items
+    assert report.database_changes == ("no_changes_completed_migration",)
+    assert (
+        tuple(sorted(path.relative_to(state).as_posix() for path in state.rglob("*")))
+        == before_entries
+    )
+    assert {
+        relative: (
+            (state / relative).stat(follow_symlinks=False).st_mode,
+            (state / relative).stat(follow_symlinks=False).st_size,
+            (state / relative).stat(follow_symlinks=False).st_mtime_ns,
+        )
+        for relative in before_entries
+    } == before_metadata
+    assert state.stat().st_mtime_ns == state_mtime
+    assert not shm.exists()
+
+
 def test_nonempty_current_database_is_rejected_before_import(tmp_path: Path) -> None:
     root = _legacy(tmp_path)
     database = tmp_path / "state/post_pulsar.sqlite3"

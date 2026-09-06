@@ -157,7 +157,10 @@ def migrate_legacy_layout(
     backup = state_root / _BACKUP_NAME
     if normalized_mode == "dry-run":
         plan = _preflight_state(plan, database, backup, resuming=journal_existed)
-        return _report(plan, "dry-run")
+        completed_noop = plan.phase == "complete"
+        if completed_noop:
+            _validate_completed(plan, database, legacy_root, account_root)
+        return _report(plan, "dry-run", completed_noop=completed_noop)
 
     injector = cast(MigrationFaultInjector | None, fault_injector)
     locks = LockManager(state_root)
@@ -1077,7 +1080,7 @@ def _validate_completed(
 
 @contextmanager
 def _read_only_database(path: Path):  # type: ignore[no-untyped-def]
-    uri = f"file:{quote(str(path))}?mode=ro"
+    uri = f"file:{quote(str(path))}?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True)
     try:
         yield connection
@@ -1416,12 +1419,22 @@ def _canonical_document_digest(document: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _report(plan: _MigrationPlan, mode: MigrationMode) -> MigrationReport:
-    phase = plan.phase if mode == "apply" else "planned"
+def _report(
+    plan: _MigrationPlan, mode: MigrationMode, *, completed_noop: bool = False
+) -> MigrationReport:
+    database_changes = (
+        ("no_changes_completed_migration",)
+        if completed_noop
+        else (
+            "create_current_schema_state",
+            "register_explicit_profile_without_delivery_outcomes",
+            f"journal_{len(plan.items)}_exact_bundles",
+        )
+    )
     return MigrationReport(
         plan.profile_id,
         mode,
-        phase,
+        plan.phase,
         plan.items,
         plan.untouched,
         plan.issues,
@@ -1430,11 +1443,7 @@ def _report(plan: _MigrationPlan, mode: MigrationMode) -> MigrationReport:
             "official_credentials_not_migrated",
             "remote_identities_not_inferred",
         ),
-        (
-            "create_current_schema_state",
-            "register_explicit_profile_without_delivery_outcomes",
-            f"journal_{len(plan.items)}_exact_bundles",
-        ),
+        database_changes,
     )
 
 
