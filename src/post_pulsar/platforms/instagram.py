@@ -8,12 +8,15 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final, Protocol, TypeAlias, cast
+from pathlib import Path
+from typing import Final, Literal, Protocol, TypeAlias, cast
+from urllib.parse import quote, urlsplit
 
 from post_pulsar.media import (
     MediaSafetyError,
     PublicURLVerification,
     StagedMedia,
+    cleanup_staged_media,
     verify_public_media_url,
 )
 from post_pulsar.platforms.base import (
@@ -57,6 +60,8 @@ class InstagramAdapterError(AdapterContractError):
 
 
 PublicMediaVerifier: TypeAlias = Callable[[StagedMedia], PublicURLVerification]
+CleanupOutcome: TypeAlias = Literal["published", "failed", "ambiguous"]
+PublicMediaCleaner: TypeAlias = Callable[[StagedMedia, CleanupOutcome], bool]
 
 
 class WarningCheckpointWriter(Protocol):
@@ -83,10 +88,12 @@ class InstagramAdapter(BasePlatformAdapter):
         client: PlatformHTTPClient,
         *,
         public_verifier: PublicMediaVerifier | None = None,
+        public_cleaner: PublicMediaCleaner | None = None,
         clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
-        max_status_polls: int = 5,
-        status_poll_seconds: float = 1.0,
+        max_status_polls: int | None = None,
+        status_poll_seconds: float = 60.0,
     ) -> None:
         if snapshot.target.platform != "instagram":
             client.close()
@@ -98,21 +105,55 @@ class InstagramAdapter(BasePlatformAdapter):
         if not isinstance(media_base_url, str) or not media_base_url:
             client.close()
             raise AdapterContractError("Instagram media base URL is missing")
-        if isinstance(max_status_polls, bool) or not 1 <= max_status_polls <= 60:
+        media_directory = snapshot.target.request_settings.get("media_directory")
+        if (
+            not isinstance(media_directory, str)
+            or not media_directory
+            or not Path(media_directory).is_absolute()
+        ):
             client.close()
-            raise AdapterContractError("Instagram status poll bound is invalid")
-        if isinstance(status_poll_seconds, bool) or not 0 <= status_poll_seconds <= 60:
+            raise AdapterContractError("Instagram media directory is missing")
+        try:
+            processing_timeout = _number_setting(
+                snapshot.target.request_settings,
+                "processing_timeout_seconds",
+                minimum=1.0,
+                maximum=86_400.0,
+            )
+        except AdapterContractError:
+            client.close()
+            raise
+        if isinstance(status_poll_seconds, bool) or not 1 <= status_poll_seconds <= 60:
             client.close()
             raise AdapterContractError("Instagram status poll interval is invalid")
+        derived_poll_bound = int(processing_timeout // status_poll_seconds) + 2
+        if max_status_polls is None:
+            max_status_polls = derived_poll_bound
+        if (
+            isinstance(max_status_polls, bool)
+            or not 1 <= max_status_polls <= derived_poll_bound
+        ):
+            client.close()
+            raise AdapterContractError("Instagram status poll bound is invalid")
         super().__init__(snapshot, client)
         self._client = client
+        self._media_base_url = media_base_url
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic
         self._sleeper = sleeper
+        self._processing_timeout = processing_timeout
         self._max_status_polls = max_status_polls
         self._status_poll_seconds = status_poll_seconds
+        self._preflight_verified: set[StagedMedia] = set()
         self._public_verifier = public_verifier or (
             lambda staged: verify_public_media_url(
                 staged, media_base_url=media_base_url
+            )
+        )
+        staging_root = Path(media_directory)
+        self._public_cleaner = public_cleaner or (
+            lambda staged, outcome: cleanup_staged_media(
+                staged, staging_root, outcome=outcome
             )
         )
 
@@ -144,9 +185,34 @@ class InstagramAdapter(BasePlatformAdapter):
     def _preflight(
         self, publication: PublicationRequest
     ) -> tuple[ValidationIssue, ...]:
+        self._preflight_verified.clear()
         issues = list(_local_validation_issues(publication))
         if any(issue.severity == "error" for issue in issues):
             return tuple(issues)
+        try:
+            staged_items = self._owned_staging(publication)
+        except AdapterContractError:
+            issues.append(
+                ValidationIssue(
+                    "instagram",
+                    "error",
+                    "instagram_public_media_identity_invalid",
+                    "Instagram public media belongs to another publication.",
+                    "media",
+                )
+            )
+            return tuple(issues)
+        for staged in staged_items:
+            try:
+                self._verified_public_url(staged)
+            except InstagramAdapterError as exc:
+                issues.append(
+                    ValidationIssue(
+                        "instagram", "error", exc.code, exc.args[0], "media"
+                    )
+                )
+            else:
+                self._preflight_verified.add(staged)
         quota = self._read_publishing_quota()
         if quota.usage >= quota.total:
             issues.append(
@@ -169,127 +235,135 @@ class InstagramAdapter(BasePlatformAdapter):
         blocking = next((issue for issue in issues if issue.severity == "error"), None)
         if blocking is not None:
             raise InstagramAdapterError(blocking.code, blocking.message, "permanent")
-        staged_items = tuple(
-            _owned_public_staging(publication, item.public)
-            for item in publication.media.items
-        )
-        if any(
-            warning.profile_id != self.snapshot.profile_id
-            or warning.source_bucket != self.snapshot.source_bucket
-            or warning.bundle_id != self.snapshot.bundle_id
-            for warning in publication.media.warnings
-        ):
-            raise AdapterContractError("Instagram warning belongs to another profile")
-        quota = self._read_publishing_quota()
-        if quota.usage >= quota.total:
-            raise InstagramAdapterError(
-                "instagram_quota_exhausted",
-                "Instagram content publishing quota is exhausted.",
-                "safe_pre_final",
-            )
-
-        delivery = checkpoints.advance_phase("processing")
-        if prior is not None and prior.attempt_count != delivery.attempt_count:
-            raise AdapterContractError("prior Instagram preparation attempt is stale")
-        artifacts: dict[tuple[str, int], ArtifactRecord] = {
-            (item.kind, item.ordinal): item
-            for item in (() if prior is None else prior.artifacts)
-        }
-        self._checkpoint_warnings(publication, checkpoints)
-
-        verified_urls: list[str] = []
-        for ordinal, staged in enumerate(staged_items):
-            key = ("staged_public", ordinal)
-            existing = artifacts.get(key)
-            if existing is None:
-                existing = checkpoints.checkpoint_artifact(
-                    ArtifactCheckpoint(
-                        kind="staged_public",
-                        ordinal=ordinal,
-                        relative_path=staged.relative_path.as_posix(),
-                        sha256=staged.sha256,
-                    )
-                )
-                artifacts[key] = existing
-            _assert_staging_checkpoint(existing, staged)
-            try:
-                proof = self._public_verifier(staged)
-            except MediaSafetyError:
+        staged_items = self._owned_staging(publication)
+        try:
+            # A direct prepare call cannot bypass the read-only validation barrier.
+            if any(staged not in self._preflight_verified for staged in staged_items):
+                for staged in staged_items:
+                    self._verified_public_url(staged)
+            quota = self._read_publishing_quota()
+            if quota.usage >= quota.total:
                 raise InstagramAdapterError(
-                    "instagram_public_media_unavailable",
-                    "Instagram public media verification failed",
+                    "instagram_quota_exhausted",
+                    "Instagram content publishing quota is exhausted.",
                     "safe_pre_final",
-                ) from None
-            _assert_public_proof(staged, proof)
-            verified_urls.append(proof.final_url)
+                )
 
-        caption = _normalized_caption(publication.text)
-        metadata_kinds = tuple(item.metadata.kind for item in publication.media.items)
-        if len(verified_urls) > 1:
-            child_ids = [
-                self._ensure_child_container(
-                    ordinal,
-                    url,
-                    prior=artifacts.get(("instagram_child_container", ordinal)),
+            delivery = checkpoints.advance_phase("processing")
+            if prior is not None and prior.attempt_count != delivery.attempt_count:
+                raise AdapterContractError(
+                    "prior Instagram preparation attempt is stale"
+                )
+            artifacts: dict[tuple[str, int], ArtifactRecord] = {
+                (item.kind, item.ordinal): item
+                for item in (() if prior is None else prior.artifacts)
+            }
+            self._checkpoint_warnings(publication, checkpoints)
+
+            for ordinal, staged in enumerate(staged_items):
+                key = ("staged_public", ordinal)
+                existing = artifacts.get(key)
+                if existing is None:
+                    existing = checkpoints.checkpoint_artifact(
+                        ArtifactCheckpoint(
+                            kind="staged_public",
+                            ordinal=ordinal,
+                            relative_path=staged.relative_path.as_posix(),
+                            sha256=staged.sha256,
+                        )
+                    )
+                    artifacts[key] = existing
+                _assert_staging_checkpoint(existing, staged)
+
+            caption = _normalized_caption(publication.text)
+            metadata_kinds = tuple(
+                item.metadata.kind for item in publication.media.items
+            )
+            if len(staged_items) > 1:
+                child_ids = [
+                    self._ensure_child_container(
+                        ordinal,
+                        staged,
+                        prior=artifacts.get(("instagram_child_container", ordinal)),
+                        checkpoints=checkpoints,
+                        artifacts=artifacts,
+                    )
+                    for ordinal, staged in enumerate(staged_items)
+                ]
+                parent = self._ensure_parent_container(
+                    {
+                        "media_type": "CAROUSEL",
+                        "children": ",".join(child_ids),
+                        **_caption_form(caption),
+                    },
+                    prior=artifacts.get(("instagram_parent_container", 0)),
                     checkpoints=checkpoints,
                     artifacts=artifacts,
                 )
-                for ordinal, url in enumerate(verified_urls)
-            ]
-            parent = self._ensure_parent_container(
-                {
-                    "media_type": "CAROUSEL",
-                    "children": ",".join(child_ids),
-                    **_caption_form(caption),
-                },
-                prior=artifacts.get(("instagram_parent_container", 0)),
-                checkpoints=checkpoints,
-                artifacts=artifacts,
-            )
-        elif metadata_kinds == ("video",):
-            parent = self._ensure_parent_container(
-                {
-                    "media_type": "REELS",
-                    "video_url": verified_urls[0],
-                    "share_to_feed": "true",
-                    **_caption_form(caption),
-                },
-                prior=artifacts.get(("instagram_parent_container", 0)),
-                checkpoints=checkpoints,
-                artifacts=artifacts,
-            )
-        else:
-            parent = self._ensure_parent_container(
-                {"image_url": verified_urls[0], **_caption_form(caption)},
-                prior=artifacts.get(("instagram_parent_container", 0)),
-                checkpoints=checkpoints,
-                artifacts=artifacts,
-            )
-        self._wait_until_ready(parent)
-        checkpoints.advance_phase("ready")
-        canonical = tuple(artifacts[key] for key in sorted(artifacts))
-        return PreparedPublication(publication, delivery.attempt_count, canonical)
+            elif metadata_kinds == ("video",):
+                parent = self._ensure_parent_container(
+                    {
+                        "media_type": "REELS",
+                        "video_url": self._verified_public_url(staged_items[0]),
+                        "share_to_feed": "true",
+                        **_caption_form(caption),
+                    },
+                    prior=artifacts.get(("instagram_parent_container", 0)),
+                    checkpoints=checkpoints,
+                    artifacts=artifacts,
+                )
+            else:
+                parent = self._ensure_parent_container(
+                    {
+                        "image_url": self._verified_public_url(staged_items[0]),
+                        **_caption_form(caption),
+                    },
+                    prior=artifacts.get(("instagram_parent_container", 0)),
+                    checkpoints=checkpoints,
+                    artifacts=artifacts,
+                )
+            self._wait_until_ready(parent)
+            checkpoints.advance_phase("ready")
+            canonical = tuple(artifacts[key] for key in sorted(artifacts))
+            return PreparedPublication(publication, delivery.attempt_count, canonical)
+        except InstagramAdapterError as exc:
+            if exc.retry_classification != "ambiguous":
+                self._cleanup_staging(staged_items, "failed")
+            raise
+        except PlatformHTTPError as exc:
+            if exc.retry_classification != "ambiguous":
+                self._cleanup_staging(staged_items, "failed")
+            raise
 
     def _commit_once(self, prepared: PreparedPublication) -> PublishResult:
         parent = _artifact(prepared, "instagram_parent_container", 0)
-        creation_id = _unexpired_external_id(parent, self._clock())
+        staged_items = self._owned_staging(prepared.publication)
+        try:
+            creation_id = _unexpired_external_id(parent, self._clock())
+        except InstagramAdapterError:
+            self._cleanup_staging(staged_items, "failed")
+            raise
         try:
             response = self._client.final_request(
                 "POST",
                 f"/{GRAPH_API_VERSION}/{self.snapshot.target.expected_remote_user_id}/media_publish",
                 form={"creation_id": creation_id},
             )
-            return PublishResult.published(
+            result = PublishResult.published(
                 _response_id(response.json(), classification="ambiguous")
             )
         except PlatformHTTPError as exc:
             if exc.retry_classification == "permanent":
-                return PublishResult.failed(
+                result = PublishResult.failed(
                     "instagram_publish_rejected",
                     "Instagram rejected the publication request.",
                     retry_classification="permanent",
                 )
-            return self._resolve_uncertain_publish(creation_id)
+            else:
+                result = self._resolve_uncertain_publish(creation_id)
+        if result.outcome != "ambiguous":
+            self._cleanup_staging(staged_items, cast(CleanupOutcome, result.outcome))
+        return result
 
     def _read_publishing_quota(self) -> PublishingQuota:
         user_id = self.snapshot.target.expected_remote_user_id
@@ -324,19 +398,20 @@ class InstagramAdapter(BasePlatformAdapter):
     def _ensure_child_container(
         self,
         ordinal: int,
-        public_url: str,
+        staged: StagedMedia,
         *,
         prior: ArtifactRecord | None,
         checkpoints: CheckpointWriter,
         artifacts: dict[tuple[str, int], ArtifactRecord],
     ) -> str:
         if prior is not None:
-            container_id = _unexpired_external_id(prior, self._clock())
+            artifact = prior
         else:
+            public_url = self._verified_public_url(staged)
             container_id = self._create_container(
                 {"image_url": public_url, "is_carousel_item": "true"}
             )
-            prior = checkpoints.checkpoint_artifact(
+            artifact = checkpoints.checkpoint_artifact(
                 ArtifactCheckpoint(
                     kind="instagram_child_container",
                     ordinal=ordinal,
@@ -345,9 +420,9 @@ class InstagramAdapter(BasePlatformAdapter):
                     processing_metadata={"state": "created"},
                 )
             )
-            artifacts[("instagram_child_container", ordinal)] = prior
-        self._wait_until_ready(container_id)
-        return container_id
+            artifacts[("instagram_child_container", ordinal)] = artifact
+        self._wait_until_ready(artifact)
+        return _unexpired_external_id(artifact, self._clock())
 
     def _ensure_parent_container(
         self,
@@ -356,9 +431,10 @@ class InstagramAdapter(BasePlatformAdapter):
         prior: ArtifactRecord | None,
         checkpoints: CheckpointWriter,
         artifacts: dict[tuple[str, int], ArtifactRecord],
-    ) -> str:
+    ) -> ArtifactRecord:
         if prior is not None:
-            return _unexpired_external_id(prior, self._clock())
+            _unexpired_external_id(prior, self._clock())
+            return prior
         container_id = self._create_container(form)
         artifact = checkpoints.checkpoint_artifact(
             ArtifactCheckpoint(
@@ -370,7 +446,7 @@ class InstagramAdapter(BasePlatformAdapter):
             )
         )
         artifacts[("instagram_parent_container", 0)] = artifact
-        return container_id
+        return artifact
 
     def _create_container(self, form: Mapping[str, str]) -> str:
         user_id = self.snapshot.target.expected_remote_user_id
@@ -379,14 +455,18 @@ class InstagramAdapter(BasePlatformAdapter):
         ).json()
         return _response_id(payload, classification="safe_pre_final")
 
-    def _wait_until_ready(self, container_id: str) -> None:
+    def _wait_until_ready(self, artifact: ArtifactRecord) -> None:
+        container_id = _unexpired_external_id(artifact, self._clock())
+        deadline = self._container_processing_deadline(artifact)
         for attempt in range(self._max_status_polls):
             status = self._read_container_status(container_id)
             if status == _READY_STATUS:
                 return
             if status == "IN_PROGRESS":
-                if attempt + 1 < self._max_status_polls:
-                    self._sleeper(self._status_poll_seconds)
+                remaining = deadline - self._monotonic()
+                if remaining <= 0 or attempt + 1 >= self._max_status_polls:
+                    break
+                self._sleeper(min(self._status_poll_seconds, remaining))
                 continue
             if status in {"ERROR", "EXPIRED"}:
                 raise InstagramAdapterError(
@@ -430,6 +510,7 @@ class InstagramAdapter(BasePlatformAdapter):
         return status
 
     def _resolve_uncertain_publish(self, container_id: str) -> PublishResult:
+        deadline = self._monotonic() + self._processing_timeout
         for attempt in range(self._max_status_polls):
             try:
                 status = self._read_container_status(container_id)
@@ -439,8 +520,10 @@ class InstagramAdapter(BasePlatformAdapter):
                     "Instagram publication status could not be confirmed.",
                 )
             if status == "IN_PROGRESS":
-                if attempt + 1 < self._max_status_polls:
-                    self._sleeper(self._status_poll_seconds)
+                remaining = deadline - self._monotonic()
+                if remaining <= 0 or attempt + 1 >= self._max_status_polls:
+                    break
+                self._sleeper(min(self._status_poll_seconds, remaining))
                 continue
             codes = {
                 "PUBLISHED": "instagram_publish_status_published",
@@ -456,6 +539,57 @@ class InstagramAdapter(BasePlatformAdapter):
             "instagram_publish_status_timeout",
             "Instagram publication status remained uncertain.",
         )
+
+    def _owned_staging(
+        self, publication: PublicationRequest
+    ) -> tuple[StagedMedia, ...]:
+        staged_items = tuple(
+            _owned_public_staging(publication, item.public)
+            for item in publication.media.items
+        )
+        if any(
+            warning.profile_id != self.snapshot.profile_id
+            or warning.source_bucket != self.snapshot.source_bucket
+            or warning.bundle_id != self.snapshot.bundle_id
+            for warning in publication.media.warnings
+        ):
+            raise AdapterContractError("Instagram warning belongs to another profile")
+        for staged in staged_items:
+            _assert_public_url_identity(
+                staged, cast(str, staged.public_url), self._media_base_url
+            )
+        return staged_items
+
+    def _verified_public_url(self, staged: StagedMedia) -> str:
+        try:
+            proof = self._public_verifier(staged)
+        except MediaSafetyError:
+            raise InstagramAdapterError(
+                "instagram_public_media_unavailable",
+                "Instagram public media verification failed",
+                "safe_pre_final",
+            ) from None
+        _assert_public_proof(staged, proof)
+        _assert_public_url_identity(staged, proof.final_url, self._media_base_url)
+        return proof.final_url
+
+    def _cleanup_staging(
+        self, staged_items: tuple[StagedMedia, ...], outcome: CleanupOutcome
+    ) -> None:
+        for staged in staged_items:
+            try:
+                self._public_cleaner(staged, outcome)
+            except MediaSafetyError:
+                # Cleanup is best-effort and must never erase or mask publish evidence.
+                continue
+
+    def _container_processing_deadline(self, artifact: ArtifactRecord) -> float:
+        if artifact.expires_at is None:
+            raise AdapterContractError("Instagram container expiry is missing")
+        created_at = artifact.expires_at - _CONTAINER_LIFETIME
+        wall_deadline = created_at + timedelta(seconds=self._processing_timeout)
+        remaining = max(0.0, (wall_deadline - self._clock()).total_seconds())
+        return self._monotonic() + remaining
 
     def _checkpoint_warnings(
         self, publication: PublicationRequest, checkpoints: CheckpointWriter
@@ -585,6 +719,47 @@ def _assert_public_proof(staged: StagedMedia, proof: PublicURLVerification) -> N
         )
 
 
+def _assert_public_url_identity(
+    staged: StagedMedia, candidate: str, media_base_url: str
+) -> None:
+    try:
+        base = urlsplit(media_base_url)
+        parsed = urlsplit(candidate)
+        base_port = base.port or 443
+        candidate_port = parsed.port or 443
+    except ValueError:
+        raise InstagramAdapterError(
+            "instagram_public_media_identity_invalid",
+            "Instagram public media URL does not match its publication identity",
+            "safe_pre_final",
+        ) from None
+    expected_path = f"{base.path}{quote(staged.relative_path.name, safe='')}"
+    if (
+        base.scheme.casefold() != "https"
+        or base.hostname is None
+        or base.username is not None
+        or base.password is not None
+        or base.query
+        or base.fragment
+        or not base.path.endswith("/")
+        or parsed.scheme.casefold() != base.scheme.casefold()
+        or parsed.hostname is None
+        or parsed.hostname.rstrip(".").casefold()
+        != base.hostname.rstrip(".").casefold()
+        or candidate_port != base_port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != expected_path
+    ):
+        raise InstagramAdapterError(
+            "instagram_public_media_identity_invalid",
+            "Instagram public media URL does not match its publication identity",
+            "safe_pre_final",
+        )
+
+
 def _assert_staging_checkpoint(artifact: ArtifactRecord, staged: StagedMedia) -> None:
     if (
         artifact.kind != "staged_public"
@@ -652,12 +827,26 @@ def _bounded_integer(value: object, *, minimum: int) -> int | None:
     return value
 
 
+def _number_setting(
+    settings: Mapping[str, object], key: str, *, minimum: float, maximum: float
+) -> float:
+    value = settings.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not minimum <= float(value) <= maximum
+    ):
+        raise AdapterContractError(f"Instagram {key} is invalid")
+    return float(value)
+
+
 __all__ = [
     "GRAPH_API_VERSION",
     "GRAPH_BASE_URL",
     "REQUIRED_SCOPES",
     "InstagramAdapter",
     "InstagramAdapterError",
+    "PublicMediaCleaner",
     "PublishingQuota",
     "PublicMediaVerifier",
 ]
