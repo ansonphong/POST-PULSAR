@@ -415,7 +415,6 @@ def _validated_media_base_url(value: str) -> str:
         or not parsed.netloc
         or not parsed.hostname
         or parsed.username is not None
-        or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or not parsed.path.endswith("/")
