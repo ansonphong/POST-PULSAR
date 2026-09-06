@@ -8,6 +8,7 @@ import re
 import stat
 import unicodedata
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Final, Literal, Protocol
@@ -320,7 +321,6 @@ def _valid_bundle_id(bundle_id: str) -> bool:
 def _potential_bundle_id(filename: str) -> str | None:
     path = Path(filename)
     stem = path.stem
-    suffix = path.suffix.casefold()
     if not stem:
         return None
     if stem.casefold().endswith("-alt"):
@@ -328,9 +328,7 @@ def _potential_bundle_id(filename: str) -> str | None:
     ordinal_match = _ORDINAL_RE.fullmatch(stem)
     if ordinal_match is not None:
         return ordinal_match.group("bundle_id")
-    if suffix:
-        return stem
-    return None
+    return stem
 
 
 def _build_bundle(
@@ -424,13 +422,16 @@ def _build_bundle(
         )
 
     text: dict[str, str | None] = {"caption": None, "alt_text": None}
+    captured_text_bytes: dict[Path, bytes] = {}
     for role in ("caption", "alt_text"):
         role_entries = by_role[role]
         if len(role_entries) != 1:
             continue
         entry = role_entries[0]
         try:
-            value = _read_regular_bytes(entry.path).decode("utf-8")
+            captured = _read_regular_bytes(entry.path)
+            captured_text_bytes[entry.path] = captured
+            value = captured.decode("utf-8")
         except UnicodeDecodeError:
             issues.append(
                 _bundle_issue(
@@ -492,7 +493,7 @@ def _build_bundle(
     ordered_entries.extend(videos)
     members = tuple(entry.path for entry in ordered_entries)
     try:
-        fingerprint = _fingerprint(ordered_entries)
+        fingerprint = _fingerprint(ordered_entries, captured_text_bytes)
     except OSError:
         issue = _bundle_issue(
             "unreadable_member",
@@ -516,7 +517,9 @@ def _build_bundle(
     )
 
 
-def _fingerprint(entries: list[_Member]) -> str:
+def _fingerprint(
+    entries: list[_Member], captured_bytes: Mapping[Path, bytes]
+) -> str:
     digest = hashlib.sha256()
     digest.update(_FINGERPRINT_DOMAIN)
     digest.update(len(entries).to_bytes(8, "big"))
@@ -528,6 +531,11 @@ def _fingerprint(entries: list[_Member]) -> str:
         _hash_field(digest, role.encode("ascii"))
         normalized_name = unicodedata.normalize("NFC", entry.path.name)
         _hash_field(digest, normalized_name.encode("utf-8"))
+        captured = captured_bytes.get(entry.path)
+        if captured is not None:
+            digest.update(len(captured).to_bytes(8, "big"))
+            digest.update(captured)
+            continue
         with _open_regular(entry.path) as source:
             size = os.fstat(source.fileno()).st_size
             digest.update(size.to_bytes(8, "big"))

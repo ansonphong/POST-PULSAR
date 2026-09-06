@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import post_pulsar.content as content_module
 from post_pulsar.content import ContentBundle, InboxScan, scan_inbox
 
 
@@ -66,6 +67,28 @@ def test_fingerprint_is_versioned_deterministic_and_content_sensitive(
     image.rename(tmp_path / "renamed.jpg")
     renamed = scan_inbox(tmp_path).bundles[0]
     assert renamed.fingerprint != first.fingerprint
+
+
+def test_fingerprint_hashes_the_same_text_bytes_used_by_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caption = _write(tmp_path, "post.txt", b"captured caption")
+    _write(tmp_path, "post.jpg", b"image")
+    expected = scan_inbox(tmp_path).bundles[0]
+    original_read = content_module._read_regular_bytes
+
+    def capture_then_replace(path: Path) -> bytes:
+        captured = original_read(path)
+        if path == caption:
+            path.write_bytes(b"replacement caption")
+        return captured
+
+    monkeypatch.setattr(content_module, "_read_regular_bytes", capture_then_replace)
+
+    raced = scan_inbox(tmp_path).bundles[0]
+
+    assert raced.caption == "captured caption"
+    assert raced.fingerprint == expected.fingerprint
 
 
 def test_single_video_and_optional_text_are_parsed(tmp_path: Path) -> None:
@@ -191,6 +214,18 @@ def test_unsupported_alias_invalidates_only_the_exact_bundle(tmp_path: Path) -> 
     assert tuple(bundle.bundle_id for bundle in scan.bundles) == ("catalog",)
     assert "unsupported_bundle_alias" in _codes(scan)
     assert "unsupported_file" in _codes(scan)
+
+
+def test_extensionless_exact_id_alias_invalidates_bundle(tmp_path: Path) -> None:
+    _write(tmp_path, "cat.jpg")
+    alias = _write(tmp_path, "cat", b"unsupported")
+
+    scan = scan_inbox(tmp_path)
+
+    assert scan.bundles == ()
+    assert [(issue.code, issue.member) for issue in scan.issues] == [
+        ("unsupported_bundle_alias", alias)
+    ]
 
 
 def test_visible_unsupported_files_warn_but_never_form_candidates(
