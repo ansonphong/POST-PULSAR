@@ -10,11 +10,13 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import stat
 import subprocess
 import tempfile
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from io import BytesIO
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import BinaryIO, Final, Literal, Protocol, TypeAlias, cast
 from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
 
+import httpcore
 import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -33,6 +36,11 @@ MediaKind: TypeAlias = Literal["image", "video", "animated_gif"]
 StagingKind: TypeAlias = Literal["private", "instagram_public"]
 CleanupPolicy: TypeAlias = Literal["known_terminal_hash_match"]
 TerminalOutcome: TypeAlias = Literal["published", "failed", "ambiguous"]
+SocketOption: TypeAlias = (
+    tuple[int, int, int]
+    | tuple[int, int, bytes | bytearray]
+    | tuple[int, int, None, int]
+)
 
 _PROFILE_ID_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -89,8 +97,93 @@ class Resolver(Protocol):
     ) -> Sequence[tuple[object, ...]]: ...
 
 
+class PinnedTransportFactory(Protocol):
+    """Create a one-hop transport connected to an already validated address."""
+
+    def __call__(
+        self, connect_ip: str, server_hostname: str, port: int
+    ) -> httpx.BaseTransport: ...
+
+
 class _Hasher(Protocol):
     def update(self, data: bytes) -> object: ...
+
+
+class _PinnedNetworkBackend(httpcore.SyncBackend):
+    """Connect only to the validated address while httpcore retains TLS SNI."""
+
+    def __init__(self, connect_ip: str, server_hostname: str, port: int) -> None:
+        self._connect_ip = connect_ip
+        self._server_hostname = server_hostname.rstrip(".").casefold()
+        self._port = port
+        self._delegate = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[SocketOption] | None = None,
+    ) -> httpcore.NetworkStream:
+        if host.rstrip(".").casefold() != self._server_hostname or port != self._port:
+            raise OSError("transport origin changed")
+        return self._delegate.connect_tcp(
+            self._connect_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[SocketOption] | None = None,
+    ) -> httpcore.NetworkStream:
+        raise OSError("Unix sockets are not valid for public media")
+
+    def sleep(self, seconds: float) -> None:
+        self._delegate.sleep(seconds)
+
+
+class _PinnedHTTPTransport(httpx.HTTPTransport):
+    """A fresh single-hop pool whose network backend cannot resolve again."""
+
+    def __init__(self, connect_ip: str, server_hostname: str, port: int) -> None:
+        super().__init__(
+            verify=True,
+            trust_env=False,
+            retries=0,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        )
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            max_connections=1,
+            max_keepalive_connections=0,
+            retries=0,
+            network_backend=_PinnedNetworkBackend(
+                connect_ip, server_hostname, port
+            ),
+        )
+
+
+def _pinned_transport_factory(
+    connect_ip: str, server_hostname: str, port: int
+) -> httpx.BaseTransport:
+    return _PinnedHTTPTransport(connect_ip, server_hostname, port)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPrivateMedia:
+    """An open private artifact whose descriptor identity and bytes were verified."""
+
+    stream: BinaryIO
+    sha256: str
+    size_bytes: int
+    device: int
+    inode: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +264,10 @@ class StagedMedia:
             raise MediaSafetyError("staged media belongs to a different profile")
         if expected_bucket is not None and expected_bucket != self.source_bucket:
             raise MediaSafetyError("staged media belongs to a different source bucket")
+        if self.staging_kind == "private":
+            raise MediaSafetyError(
+                "private staged media must be consumed through its verified stream"
+            )
         return _descriptor_path(Path(staging_root), self.relative_path)
 
 
@@ -265,11 +362,7 @@ def prepare_bundle_media(
             )
             staged_results.append(result)
             descriptor = result.descriptor
-            staged_path = descriptor.absolute_path(
-                private_root,
-                expected_profile_id=profile_id,
-                expected_bucket=bundle.bucket,
-            )
+            staged_path = _descriptor_path(private_root, descriptor.relative_path)
             if bundle.content.video is None:
                 metadata = _inspect_image(staged_path)
             else:
@@ -315,7 +408,7 @@ def prepare_bundle_media(
             else:
                 source, private_descriptor, _metadata = private_items[0]
                 raw_public_result = _stage_source(
-                    private_descriptor.absolute_path(private_root),
+                    _descriptor_path(private_root, private_descriptor.relative_path),
                     root=instagram_settings.media_directory,
                     profile_id=profile_id,
                     bucket=bundle.bucket,
@@ -382,8 +475,8 @@ def verify_public_media_url(
     staged: StagedMedia,
     *,
     media_base_url: str,
-    client: httpx.Client,
     resolver: Resolver | None = None,
+    transport_factory: PinnedTransportFactory | None = None,
     timeout_seconds: float = 15.0,
     max_redirects: int = 3,
     max_response_bytes: int = _DEFAULT_PUBLIC_RESPONSE_BYTES,
@@ -396,55 +489,65 @@ def verify_public_media_url(
     if max_response_bytes <= 0:
         raise MediaSafetyError("public URL response limit is invalid")
     dns_resolver = _resolve_addresses if resolver is None else resolver
+    make_transport = (
+        _pinned_transport_factory if transport_factory is None else transport_factory
+    )
     current = staged.public_url
     redirects = 0
     while True:
         _validate_url_beneath_base(current, media_base_url)
-        _validate_public_dns(current, dns_resolver)
+        parsed_current = urlsplit(current)
+        host = cast(str, parsed_current.hostname)
+        port = parsed_current.port or 443
+        addresses = _validated_public_addresses(current, dns_resolver)
         try:
-            with client.stream(
-                "GET",
-                current,
-                headers={"Accept": staged.mime_type},
-                follow_redirects=False,
-                timeout=timeout_seconds,
-            ) as response:
-                if response.status_code in _REDIRECT_STATUS:
-                    if redirects >= max_redirects:
-                        raise MediaSafetyError("public media redirect limit exceeded")
-                    location = response.headers.get("location")
-                    if not location:
-                        raise MediaSafetyError("public media redirect has no location")
-                    current = urljoin(current, location)
-                    redirects += 1
-                    continue
-                if response.status_code != 200:
-                    raise MediaSafetyError("public media URL did not return HTTP 200")
-                mime_type = (
-                    response.headers.get("content-type", "")
-                    .split(";", 1)[0]
-                    .strip()
-                    .casefold()
-                )
-                if mime_type != staged.mime_type.casefold():
-                    raise MediaSafetyError("public media MIME type does not match")
-                digest = hashlib.sha256()
-                size = 0
-                first = bytearray()
-                tail = bytearray()
-                byte_limit = min(max_response_bytes, staged.size_bytes)
-                for chunk in response.iter_bytes():
-                    size += len(chunk)
-                    if size > byte_limit:
-                        raise MediaSafetyError(
-                            "public media response exceeded byte limit"
-                        )
-                    digest.update(chunk)
-                    if len(first) < 16:
-                        first.extend(chunk[: 16 - len(first)])
-                    tail.extend(chunk)
-                    if len(tail) > 16:
-                        del tail[:-16]
+            with httpx.Client(
+                transport=make_transport(addresses[0], host, port),
+                trust_env=False,
+            ) as client:
+                with client.stream(
+                    "GET",
+                    current,
+                    headers={"Accept": staged.mime_type},
+                    follow_redirects=False,
+                    timeout=timeout_seconds,
+                ) as response:
+                    if response.status_code in _REDIRECT_STATUS:
+                        if redirects >= max_redirects:
+                            raise MediaSafetyError("public media redirect limit exceeded")
+                        location = response.headers.get("location")
+                        if not location:
+                            raise MediaSafetyError("public media redirect has no location")
+                        current = urljoin(current, location)
+                        redirects += 1
+                        continue
+                    if response.status_code != 200:
+                        raise MediaSafetyError("public media URL did not return HTTP 200")
+                    mime_type = (
+                        response.headers.get("content-type", "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .casefold()
+                    )
+                    if mime_type != staged.mime_type.casefold():
+                        raise MediaSafetyError("public media MIME type does not match")
+                    digest = hashlib.sha256()
+                    size = 0
+                    first = bytearray()
+                    tail = bytearray()
+                    byte_limit = min(max_response_bytes, staged.size_bytes)
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > byte_limit:
+                            raise MediaSafetyError(
+                                "public media response exceeded byte limit"
+                            )
+                        digest.update(chunk)
+                        if len(first) < 16:
+                            first.extend(chunk[: 16 - len(first)])
+                        tail.extend(chunk)
+                        if len(tail) > 16:
+                            del tail[:-16]
         except MediaSafetyError:
             raise
         except httpx.HTTPError:
@@ -472,23 +575,115 @@ def cleanup_staged_media(
         return False
     if outcome not in {"published", "failed"}:
         raise MediaSafetyError("unknown staging cleanup outcome")
-    path = staged.absolute_path(staging_root)
+    relative = staged.relative_path
+    quarantine = f".delete-{secrets.token_hex(16)}"
     try:
-        metadata = os.lstat(path)
+        with _open_descriptor_parent(Path(staging_root), relative) as parent_fd:
+            metadata = os.stat(
+                relative.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(metadata.st_mode):
+                raise MediaSafetyError("staged media is not a regular file")
+            source_fd = _open_regular_at(parent_fd, relative.name)
+            source = os.fdopen(source_fd, "rb")
+            try:
+                opened = os.fstat(source.fileno())
+                os.rename(
+                    relative.name,
+                    quarantine,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                quarantined = os.stat(
+                    quarantine, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if not _same_identity(opened, quarantined):
+                    raise MediaSafetyError(
+                        "staged media identity changed during cleanup"
+                    )
+                digest, size = _hash_open_file(source)
+                if digest != staged.sha256 or size != staged.size_bytes:
+                    _restore_quarantine(parent_fd, quarantine, relative.name, opened)
+                    raise MediaSafetyError(
+                        "staged media hash does not match cleanup descriptor"
+                    )
+                final_identity = os.stat(
+                    quarantine, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if not _same_identity(opened, final_identity):
+                    raise MediaSafetyError(
+                        "staged media identity changed during cleanup"
+                    )
+                os.unlink(quarantine, dir_fd=parent_fd)
+            finally:
+                source.close()
     except FileNotFoundError:
         return False
-    except OSError:
-        raise MediaSafetyError("staged media metadata could not be read") from None
-    if not stat.S_ISREG(metadata.st_mode):
-        raise MediaSafetyError("staged media is not a regular file")
-    digest, size = _hash_regular(path)
-    if digest != staged.sha256 or size != staged.size_bytes:
-        raise MediaSafetyError("staged media hash does not match cleanup descriptor")
-    try:
-        path.unlink()
+    except MediaSafetyError:
+        raise
     except OSError:
         raise MediaSafetyError("staged media could not be removed safely") from None
     return True
+
+
+@contextmanager
+def open_verified_private_media(
+    staged: StagedMedia,
+    staging_root: str | os.PathLike[str],
+    *,
+    expected_profile_id: str | None = None,
+    expected_bucket: SourceBucket | None = None,
+) -> Iterator[VerifiedPrivateMedia]:
+    """Yield a hash-bound no-follow stream; private paths are never upload inputs."""
+
+    if staged.staging_kind != "private":
+        raise MediaSafetyError("verified private stream requires private staging")
+    if expected_profile_id is not None and expected_profile_id != staged.profile_id:
+        raise MediaSafetyError("staged media belongs to a different profile")
+    if expected_bucket is not None and expected_bucket != staged.source_bucket:
+        raise MediaSafetyError("staged media belongs to a different source bucket")
+    try:
+        with _open_descriptor_parent(
+            Path(staging_root), staged.relative_path
+        ) as parent_fd:
+            descriptor = _open_regular_at(parent_fd, staged.relative_path.name)
+            stream = os.fdopen(descriptor, "rb")
+            try:
+                before = os.fstat(stream.fileno())
+                digest, size = _hash_open_file(stream)
+                after = os.fstat(stream.fileno())
+                if (
+                    not _same_identity(before, after)
+                    or digest != staged.sha256
+                    or size != staged.size_bytes
+                ):
+                    raise MediaSafetyError(
+                        "private staged media identity or hash does not match"
+                    )
+                stream.seek(0)
+                yield VerifiedPrivateMedia(
+                    stream=stream,
+                    sha256=digest,
+                    size_bytes=size,
+                    device=after.st_dev,
+                    inode=after.st_ino,
+                )
+                final = os.fstat(stream.fileno())
+                if not (
+                    stat.S_ISREG(final.st_mode)
+                    and _same_identity(before, final)
+                    and before.st_size == final.st_size
+                    and before.st_mtime_ns == final.st_mtime_ns
+                ):
+                    raise MediaSafetyError(
+                        "private staged media changed while being consumed"
+                    )
+            finally:
+                stream.close()
+    except MediaSafetyError:
+        raise
+    except OSError:
+        raise MediaSafetyError("private staged media could not be opened safely") from None
 
 
 def _validate_identity(profile_id: str, bundle: PublishableBundle) -> None:
@@ -531,49 +726,52 @@ def _stage_source(
     destination_directory = _stage_directory(
         root, profile_id, bucket, bundle_fingerprint, staging_kind
     )
-    temporary = destination_directory / f".capture-{secrets.token_hex(16)}"
+    temporary = f".capture-{secrets.token_hex(16)}"
     try:
         source, source_before = _open_regular(source_path)
     except OSError:
         raise MediaSafetyError("source media could not be opened safely") from None
     try:
         digest = hashlib.sha256()
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as destination:
-                size = _copy_stream(source, destination, digest)
-                destination.flush()
-                os.fsync(destination.fileno())
-        except Exception:
-            _safe_unlink_temporary(temporary)
-            raise
-        try:
-            source_opened_after = os.fstat(source.fileno())
-            source_after = os.lstat(source_path)
-        except OSError:
-            _safe_unlink_temporary(temporary)
-            raise MediaSafetyError("source media changed during capture") from None
-        if not _unchanged_source(source_before, source_opened_after, source_after):
-            _safe_unlink_temporary(temporary)
-            raise MediaSafetyError("source media changed during capture")
+        with _open_directory_nofollow(destination_directory) as directory_fd:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as destination:
+                    size = _copy_stream(source, destination, digest)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+            except Exception:
+                _safe_unlink_at(directory_fd, temporary)
+                raise
+            try:
+                source_opened_after = os.fstat(source.fileno())
+                source_after = os.lstat(source_path)
+            except OSError:
+                _safe_unlink_at(directory_fd, temporary)
+                raise MediaSafetyError("source media changed during capture") from None
+            if not _unchanged_source(source_before, source_opened_after, source_after):
+                _safe_unlink_at(directory_fd, temporary)
+                raise MediaSafetyError("source media changed during capture")
+            sha256 = digest.hexdigest()
+            if size <= 0:
+                _safe_unlink_at(directory_fd, temporary)
+                raise MediaSafetyError("source media is empty")
+            suffix = source_path.suffix.lower()
+            filename = forced_filename or (
+                f"{ordinal:02d}-{bundle_fingerprint}-{sha256}{suffix}"
+            )
+            file_mode = 0o400 if staging_kind == "private" else 0o444
+            created = _install_exclusive(
+                directory_fd, temporary, filename, sha256, size, file_mode
+            )
     finally:
         source.close()
-
-    sha256 = digest.hexdigest()
-    if size <= 0:
-        _safe_unlink_temporary(temporary)
-        raise MediaSafetyError("source media is empty")
-    suffix = source_path.suffix.lower()
-    filename = forced_filename or (
-        f"{ordinal:02d}-{bundle_fingerprint}-{sha256}{suffix}"
-    )
     final_path = destination_directory / filename
-    file_mode = 0o400 if staging_kind == "private" else 0o444
-    created = _install_exclusive(temporary, final_path, sha256, size, file_mode)
     relative_path = final_path.relative_to(root.absolute())
     return _StagedResult(
         StagedMedia(
@@ -611,19 +809,27 @@ def _stage_bytes(
     directory = _stage_directory(
         root, profile_id, bucket, bundle_fingerprint, "instagram_public"
     )
-    temporary = directory / f".capture-{secrets.token_hex(16)}"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as destination:
-            destination.write(data)
-            destination.flush()
-            os.fsync(destination.fileno())
-    except Exception:
-        _safe_unlink_temporary(temporary)
-        raise
+    temporary = f".capture-{secrets.token_hex(16)}"
     digest = hashlib.sha256(data).hexdigest()
     final_path = directory / filename
-    created = _install_exclusive(temporary, final_path, digest, len(data), 0o444)
+    with _open_directory_nofollow(directory) as directory_fd:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as destination:
+                destination.write(data)
+                destination.flush()
+                os.fsync(destination.fileno())
+        except Exception:
+            _safe_unlink_at(directory_fd, temporary)
+            raise
+        created = _install_exclusive(
+            directory_fd, temporary, filename, digest, len(data), 0o444
+        )
     return _StagedResult(
         StagedMedia(
             profile_id,
@@ -730,6 +936,55 @@ def _open_regular(path: Path) -> tuple[BinaryIO, os.stat_result]:
     return source, opened
 
 
+@contextmanager
+def _open_directory_nofollow(path: Path) -> Iterator[int]:
+    """Hold every directory component without following symlinks."""
+
+    absolute = path.expanduser().absolute()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(child)
+                raise OSError("not a directory")
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _open_descriptor_parent(root: Path, relative: Path) -> Iterator[int]:
+    _validate_relative_path(relative)
+    parent = root.expanduser().absolute().joinpath(*relative.parts[:-1])
+    try:
+        with _open_directory_nofollow(parent) as descriptor:
+            yield descriptor
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise MediaSafetyError("staging path contains an unsafe component") from None
+
+
+def _open_regular_at(directory_fd: int, name: str) -> int:
+    if Path(name).name != name or not name:
+        raise OSError("unsafe name")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        os.close(descriptor)
+        raise OSError("not regular")
+    return descriptor
+
+
 def _copy_stream(source: BinaryIO, destination: BinaryIO, digest: _Hasher) -> int:
     size = 0
     while chunk := source.read(_COPY_CHUNK_BYTES):
@@ -762,77 +1017,115 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _install_exclusive(
-    temporary: Path,
-    final_path: Path,
+    directory_fd: int,
+    temporary: str,
+    final_name: str,
     expected_hash: str,
     expected_size: int,
     file_mode: int,
 ) -> bool:
     try:
-        os.link(temporary, final_path, follow_symlinks=False)
+        os.link(
+            temporary,
+            final_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     except FileExistsError:
         try:
-            metadata = os.lstat(final_path)
+            descriptor = _open_regular_at(directory_fd, final_name)
         except OSError:
-            _safe_unlink_temporary(temporary)
+            _safe_unlink_at(directory_fd, temporary)
             raise MediaSafetyError("existing staging artifact is unsafe") from None
-        if not stat.S_ISREG(metadata.st_mode):
-            _safe_unlink_temporary(temporary)
-            raise MediaSafetyError("existing staging artifact is unsafe")
-        actual_hash, actual_size = _hash_regular(final_path)
+        with os.fdopen(descriptor, "rb") as existing:
+            actual_hash, actual_size = _hash_open_file(existing)
         if actual_hash != expected_hash or actual_size != expected_size:
-            _safe_unlink_temporary(temporary)
+            _safe_unlink_at(directory_fd, temporary)
             raise MediaSafetyError("staging name collision has different bytes")
-        _safe_unlink_temporary(temporary)
+        _safe_unlink_at(directory_fd, temporary)
         return False
     except OSError:
-        _safe_unlink_temporary(temporary)
+        _safe_unlink_at(directory_fd, temporary)
         raise MediaSafetyError(
             "staging artifact could not be installed safely"
         ) from None
-    _safe_unlink_temporary(temporary)
+    _safe_unlink_at(directory_fd, temporary)
     try:
-        final_path.chmod(file_mode)
+        descriptor = _open_regular_at(directory_fd, final_name)
+        try:
+            os.fchmod(descriptor, file_mode)
+        finally:
+            os.close(descriptor)
     except OSError:
-        final_path.unlink(missing_ok=True)
+        _safe_unlink_at(directory_fd, final_name)
         raise MediaSafetyError(
             "staging artifact permissions could not be secured"
         ) from None
     return True
 
 
-def _safe_unlink_temporary(path: Path) -> None:
+def _safe_unlink_at(directory_fd: int, name: str) -> None:
     try:
-        metadata = os.lstat(path)
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
     except OSError:
         return
     if stat.S_ISREG(metadata.st_mode):
         try:
-            path.unlink()
+            os.unlink(name, dir_fd=directory_fd)
         except OSError:
             return
 
 
-def _hash_regular(path: Path) -> tuple[str, int]:
-    try:
-        source, before = _open_regular(path)
-    except OSError:
-        raise MediaSafetyError("staged media could not be read safely") from None
+def _hash_open_file(source: BinaryIO) -> tuple[str, int]:
+    source.seek(0)
+    before = os.fstat(source.fileno())
     digest = hashlib.sha256()
     size = 0
-    try:
-        while chunk := source.read(_COPY_CHUNK_BYTES):
-            digest.update(chunk)
-            size += len(chunk)
-        opened_after = os.fstat(source.fileno())
-        path_after = os.lstat(path)
-        if not _unchanged_source(before, opened_after, path_after):
-            raise MediaSafetyError("staged media changed while hashing")
-    finally:
-        source.close()
+    while chunk := source.read(_COPY_CHUNK_BYTES):
+        digest.update(chunk)
+        size += len(chunk)
+    after = os.fstat(source.fileno())
+    if not _unchanged_open_file(before, after):
+        raise MediaSafetyError("staged media changed while hashing")
     return digest.hexdigest(), size
+
+
+def _unchanged_open_file(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(after.st_mode)
+        and _same_identity(before, after)
+        and before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and before.st_ctime_ns == after.st_ctime_ns
+    )
+
+
+def _restore_quarantine(
+    directory_fd: int,
+    quarantine: str,
+    original: str,
+    expected: os.stat_result,
+) -> None:
+    try:
+        os.stat(original, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.rename(
+            quarantine,
+            original,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        restored = os.stat(original, dir_fd=directory_fd, follow_symlinks=False)
+        if _same_identity(expected, restored):
+            return
+    except OSError:
+        raise MediaSafetyError(
+            "staged media quarantine could not be restored safely"
+        ) from None
+    raise MediaSafetyError("staged media quarantine could not be restored safely")
 
 
 def _verify_bundle_fingerprint(
@@ -841,11 +1134,7 @@ def _verify_bundle_fingerprint(
     private_root: Path,
 ) -> None:
     staged_paths = {
-        source: descriptor.absolute_path(
-            private_root,
-            expected_profile_id=descriptor.profile_id,
-            expected_bucket=bundle.bucket,
-        )
+        source: _descriptor_path(private_root, descriptor.relative_path)
         for source, descriptor, _metadata in private_items
     }
     digest = hashlib.sha256()
@@ -1139,6 +1428,9 @@ def _validate_platform_media(
     items: list[tuple[Path, StagedMedia, MediaMetadata]],
     targets: tuple[MediaTarget, ...],
 ) -> None:
+    if "x" in targets and any(item[2].kind == "animated_gif" for item in items):
+        if len(items) != 1:
+            raise MediaSafetyError("X animated GIF must be the sole media item")
     for _source, descriptor, metadata in items:
         if "x" in targets:
             _validate_x(descriptor, metadata)
@@ -1214,8 +1506,12 @@ def _validate_instagram(descriptor: StagedMedia, metadata: MediaMetadata) -> Non
         raise MediaSafetyError("Instagram Reel frame rate must be 23 to 60 fps")
     if metadata.width > 1920:
         raise MediaSafetyError("Instagram Reel horizontal dimensions exceed 1920")
-    if metadata.video_bitrate is not None and metadata.video_bitrate > 25_000_000:
+    if metadata.video_bitrate is None:
+        raise MediaSafetyError("Instagram Reel video bitrate metadata is required")
+    if metadata.video_bitrate > 25_000_000:
         raise MediaSafetyError("Instagram Reel video bitrate exceeds 25 Mbps")
+    if metadata.audio_codec is not None and metadata.audio_bitrate is None:
+        raise MediaSafetyError("Instagram Reel audio bitrate metadata is required")
     if metadata.audio_bitrate is not None and metadata.audio_bitrate > 128_000:
         raise MediaSafetyError("Instagram Reel audio bitrate exceeds 128 kbps")
     names = set(metadata.format_name.casefold().split(","))
@@ -1234,16 +1530,12 @@ def _normalize_instagram_images(
     settings: InstagramSettings,
 ) -> tuple[list[_StagedResult], list[MediaWarning]]:
     first_metadata = items[0][2]
-    ratio = min(1.91, max(4 / 5, first_metadata.width / first_metadata.height))
+    dimensions = _instagram_normalized_dimensions(first_metadata)
     results: list[_StagedResult] = []
     warnings: list[MediaWarning] = []
     for ordinal, (source, private, _metadata) in enumerate(items, start=1):
-        source_private_path = private.absolute_path(
-            private_root,
-            expected_profile_id=profile_id,
-            expected_bucket=bucket,
-        )
-        normalized = _normalized_jpeg(source_private_path, ratio)
+        source_private_path = _descriptor_path(private_root, private.relative_path)
+        normalized = _normalized_jpeg(source_private_path, dimensions)
         digest = hashlib.sha256(normalized).hexdigest()
         filename = _public_filename(
             profile_id, bucket, bundle_fingerprint, ordinal, digest, ".jpg"
@@ -1276,13 +1568,35 @@ def _normalize_instagram_images(
     return results, warnings
 
 
-def _normalized_jpeg(path: Path, ratio: float) -> bytes:
+def _instagram_normalized_dimensions(metadata: MediaMetadata) -> tuple[int, int]:
+    source_ratio = Fraction(metadata.width, metadata.height)
+    ratio = min(Fraction(191, 100), max(Fraction(4, 5), source_ratio))
+    bounded_ratio = ratio.limit_denominator(100)
+    numerator = bounded_ratio.numerator
+    denominator = bounded_ratio.denominator
+    minimum_scale = max(1, math.ceil(320 / numerator))
+    maximum_scale = 1440 // numerator
+    if maximum_scale < minimum_scale:
+        raise MediaSafetyError("Instagram normalization dimensions are unsupported")
+    desired_width = min(1440, max(320, metadata.width))
+    scale = min(
+        maximum_scale,
+        max(minimum_scale, round(desired_width / numerator)),
+    )
+    dimensions = (numerator * scale, denominator * scale)
+    actual_ratio = Fraction(*dimensions)
+    if not (320 <= dimensions[0] <= 1440) or not (
+        Fraction(4, 5) <= actual_ratio <= Fraction(191, 100)
+    ):
+        raise MediaSafetyError("Instagram normalization dimensions are unsupported")
+    return dimensions
+
+
+def _normalized_jpeg(path: Path, dimensions: tuple[int, int]) -> bytes:
     try:
         with Image.open(path) as source:
             oriented = ImageOps.exif_transpose(source)
             oriented.load()
-            width = min(1440, max(320, oriented.width))
-            height = max(1, round(width / ratio))
             if oriented.mode in {"RGBA", "LA"} or "transparency" in oriented.info:
                 rgba = oriented.convert("RGBA")
                 white = Image.new("RGBA", rgba.size, "white")
@@ -1292,7 +1606,7 @@ def _normalized_jpeg(path: Path, ratio: float) -> bytes:
                 rgb = oriented.convert("RGB")
             normalized = ImageOps.fit(
                 rgb,
-                (width, height),
+                dimensions,
                 method=Image.Resampling.LANCZOS,
                 centering=(0.5, 0.5),
             )
@@ -1308,10 +1622,32 @@ def _normalized_jpeg(path: Path, ratio: float) -> bytes:
                 )
                 data = output.getvalue()
                 if len(data) <= _INSTAGRAM_IMAGE_MAX_BYTES:
+                    _verify_normalized_jpeg(data, dimensions)
                     return data
     except OSError:
         raise MediaSafetyError("Instagram image normalization failed") from None
     raise MediaSafetyError("Instagram normalized image exceeds the 8 MiB limit")
+
+
+def _verify_normalized_jpeg(data: bytes, dimensions: tuple[int, int]) -> None:
+    try:
+        with Image.open(BytesIO(data)) as candidate:
+            candidate.verify()
+        with Image.open(BytesIO(data)) as candidate:
+            candidate.load()
+            if (
+                candidate.format != "JPEG"
+                or candidate.mode != "RGB"
+                or candidate.size != dimensions
+                or "exif" in candidate.info
+            ):
+                raise MediaSafetyError(
+                    "Instagram normalized image failed output validation"
+                )
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError):
+        raise MediaSafetyError(
+            "Instagram normalized image failed output validation"
+        ) from None
 
 
 def _public_filename(
@@ -1333,6 +1669,16 @@ def _public_url(base_url: str, filename: str) -> str:
 
 
 def _descriptor_path(root: Path, relative_path: Path) -> Path:
+    _validate_relative_path(relative_path)
+    root_path = root.expanduser().absolute()
+    _assert_real_directory(root_path)
+    candidate = root_path.joinpath(*relative_path.parts)
+    if candidate.parts[: len(root_path.parts)] != root_path.parts:
+        raise MediaSafetyError("staged media escaped its configured root")
+    return candidate
+
+
+def _validate_relative_path(relative_path: Path) -> None:
     if (
         relative_path.is_absolute()
         or not relative_path.parts
@@ -1340,12 +1686,6 @@ def _descriptor_path(root: Path, relative_path: Path) -> Path:
         or "\\" in relative_path.as_posix()
     ):
         raise MediaSafetyError("staged media relative path is unsafe")
-    root_path = root.expanduser().absolute()
-    _assert_real_directory(root_path)
-    candidate = root_path.joinpath(*relative_path.parts)
-    if candidate.parts[: len(root_path.parts)] != root_path.parts:
-        raise MediaSafetyError("staged media escaped its configured root")
-    return candidate
 
 
 def _validate_relative_descriptor(staged: StagedMedia) -> None:
@@ -1473,7 +1813,7 @@ def _resolve_addresses(
     )
 
 
-def _validate_public_dns(url: str, resolver: Resolver) -> None:
+def _validated_public_addresses(url: str, resolver: Resolver) -> tuple[str, ...]:
     parsed = urlsplit(url)
     host = cast(str, parsed.hostname)
     port = parsed.port or 443
@@ -1483,6 +1823,7 @@ def _validate_public_dns(url: str, resolver: Resolver) -> None:
         raise MediaSafetyError("public media hostname could not be resolved") from None
     if not answers:
         raise MediaSafetyError("public media hostname returned no addresses")
+    validated: set[str] = set()
     for answer in answers:
         try:
             socket_address = cast(tuple[object, ...], answer[4])
@@ -1494,6 +1835,8 @@ def _validate_public_dns(url: str, resolver: Resolver) -> None:
             raise MediaSafetyError(
                 "public media hostname resolved to a nonpublic address"
             )
+        validated.add(str(parsed_address))
+    return tuple(sorted(validated))
 
 
 def _validate_signature(mime_type: str, first: bytes, tail: bytes) -> None:
@@ -1523,12 +1866,9 @@ def _remove_new_staging(
             if result.descriptor.staging_kind == "private"
             else cast(InstagramSettings, instagram).media_directory
         )
-        path = result.descriptor.absolute_path(root)
         try:
-            metadata = os.lstat(path)
-            if stat.S_ISREG(metadata.st_mode):
-                path.unlink()
-        except OSError:
+            cleanup_staged_media(result.descriptor, root, outcome="failed")
+        except MediaSafetyError:
             continue
 
 
@@ -1538,9 +1878,12 @@ __all__ = [
     "MediaWarning",
     "PreparedMedia",
     "PreparedMediaItem",
+    "PinnedTransportFactory",
     "PublicURLVerification",
     "StagedMedia",
+    "VerifiedPrivateMedia",
     "cleanup_staged_media",
+    "open_verified_private_media",
     "prepare_bundle_media",
     "verify_public_media_url",
 ]

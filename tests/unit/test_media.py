@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import subprocess
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 from io import BytesIO
 from pathlib import Path
@@ -23,9 +26,22 @@ from post_pulsar.media import (
     MediaSafetyError,
     StagedMedia,
     cleanup_staged_media,
+    open_verified_private_media,
     prepare_bundle_media,
     verify_public_media_url,
 )
+
+
+class MockPinnedTransportFactory:
+    def __init__(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.handler = handler
+        self.calls: list[tuple[str, str, int]] = []
+
+    def __call__(
+        self, connect_ip: str, server_hostname: str, port: int
+    ) -> httpx.BaseTransport:
+        self.calls.append((connect_ip, server_hostname, port))
+        return httpx.MockTransport(self.handler)
 
 
 def _image_bytes(
@@ -185,10 +201,21 @@ def test_x_image_is_verified_and_staged_from_the_admitted_stream(
     assert item.metadata.format_name == "PNG"
     assert (item.metadata.width, item.metadata.height) == (640, 640)
     assert item.private.mime_type == "image/png"
-    assert item.private.absolute_path(tmp_path / "private").read_bytes() == original
+    with open_verified_private_media(
+        item.private,
+        tmp_path / "private",
+        expected_profile_id="ansonphong",
+        expected_bucket="QUEUE",
+    ) as verified:
+        assert verified.stream.read() == original
+        assert verified.sha256 == item.private.sha256
+        assert verified.size_bytes == len(original)
     assert item.public is None
     assert item.private.relative_path.parts[:2] == ("ansonphong", "QUEUE")
-    assert item.private.absolute_path(tmp_path / "private").stat().st_mode & 0o222 == 0
+    private_path = tmp_path / "private" / item.private.relative_path
+    assert private_path.stat().st_mode & 0o222 == 0
+    with pytest.raises(MediaSafetyError, match="verified stream"):
+        item.private.absolute_path(tmp_path / "private")
     with pytest.raises(FrozenInstanceError):
         item.private.sha256 = "changed"  # type: ignore[misc]
 
@@ -210,9 +237,60 @@ def test_open_descriptor_is_not_reused_across_profiles(tmp_path: Path) -> None:
 
     assert first.items[0].private.relative_path != second.items[0].private.relative_path
     with pytest.raises(MediaSafetyError, match="profile"):
-        first.items[0].private.absolute_path(
-            tmp_path / "private", expected_profile_id="360hextile"
-        )
+        with open_verified_private_media(
+            first.items[0].private,
+            tmp_path / "private",
+            expected_profile_id="360hextile",
+        ) as verified:
+            verified.stream.read(0)
+
+
+@pytest.mark.parametrize("replacement", ["regular", "symlink"])
+def test_verified_private_stream_rejects_path_replacement_before_open(
+    tmp_path: Path, replacement: str
+) -> None:
+    original = _image_bytes("PNG")
+    prepared = prepare_bundle_media(
+        _bundle(tmp_path, {"post.png": original}),
+        profile_id="ansonphong",
+        targets=("x",),
+        private_staging_directory=tmp_path / "private",
+    )
+    staged = prepared.items[0].private
+    path = tmp_path / "private" / staged.relative_path
+    path.unlink()
+    if replacement == "regular":
+        path.write_bytes(_image_bytes("PNG", size=(700, 700)))
+    else:
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(original)
+        path.symlink_to(outside)
+
+    with pytest.raises(
+        MediaSafetyError, match="opened safely|identity or hash|unsafe component"
+    ):
+        with open_verified_private_media(staged, tmp_path / "private") as verified:
+            verified.stream.read()
+
+
+def test_verified_private_stream_keeps_open_identity_across_path_swap(
+    tmp_path: Path,
+) -> None:
+    original = _image_bytes("PNG")
+    prepared = prepare_bundle_media(
+        _bundle(tmp_path, {"post.png": original}),
+        profile_id="ansonphong",
+        targets=("x",),
+        private_staging_directory=tmp_path / "private",
+    )
+    staged = prepared.items[0].private
+    path = tmp_path / "private" / staged.relative_path
+
+    with open_verified_private_media(staged, tmp_path / "private") as verified:
+        captured = path.with_name("captured-original.png")
+        path.rename(captured)
+        path.write_bytes(_image_bytes("PNG", size=(700, 700)))
+        assert verified.stream.read() == original
 
 
 @pytest.mark.parametrize("replacement", ["regular", "symlink"])
@@ -332,7 +410,7 @@ def test_instagram_carousel_is_normalized_to_common_metadata_free_jpegs(
     ]
     public = [item.public for item in prepared.items]
     assert all(item is not None for item in public)
-    ratios: list[float] = []
+    dimensions: list[tuple[int, int]] = []
     for descriptor in public:
         assert descriptor is not None
         assert descriptor.relative_path.parent == Path(".")
@@ -341,10 +419,12 @@ def test_instagram_carousel_is_normalized_to_common_metadata_free_jpegs(
         with Image.open(descriptor.absolute_path(tmp_path / "public")) as image:
             assert image.format == "JPEG"
             assert "exif" not in image.info
-            ratios.append(image.width / image.height)
+            dimensions.append(image.size)
             assert 320 <= image.width <= 1440
-    assert ratios[0] == pytest.approx(ratios[1], abs=0.002)
-    assert 4 / 5 <= ratios[0] <= 1.91
+    assert dimensions[0] == dimensions[1]
+    width, height = dimensions[0]
+    assert 4 * height <= 5 * width
+    assert 100 * width <= 191 * height
 
 
 @pytest.mark.parametrize(
@@ -418,6 +498,21 @@ def test_code_owned_image_size_and_animated_gif_limits_are_enforced(
         )
 
 
+def test_x_animated_gif_must_be_the_only_media_item(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        {"post-1.gif": _animated_gif_bytes(), "post-2.jpg": _image_bytes("JPEG")},
+    )
+
+    with pytest.raises(MediaSafetyError, match="sole media item"):
+        prepare_bundle_media(
+            bundle,
+            profile_id="ansonphong",
+            targets=("x",),
+            private_staging_directory=tmp_path / "private",
+        )
+
+
 def test_staging_root_symlink_is_rejected(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, {"post.jpg": _image_bytes("JPEG")})
     real_root = tmp_path / "real-staging"
@@ -432,6 +527,42 @@ def test_staging_root_symlink_is_rejected(tmp_path: Path) -> None:
             targets=("x",),
             private_staging_directory=staging_link,
         )
+
+
+def test_staging_generation_uses_held_parent_not_swapped_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path, {"post.jpg": _image_bytes("JPEG")})
+    private_root = tmp_path / "private"
+    destination = private_root / "ansonphong" / "QUEUE" / bundle.fingerprint
+    held = destination.with_name(f"{destination.name}-held")
+    outside = tmp_path / "outside-stage"
+    outside.mkdir()
+    real_open = media_module._open_directory_nofollow
+    swapped = False
+
+    @contextmanager
+    def swap_after_open(path: Path) -> Any:
+        nonlocal swapped
+        with real_open(path) as descriptor:
+            if path == destination and not swapped:
+                swapped = True
+                path.rename(held)
+                path.symlink_to(outside, target_is_directory=True)
+            yield descriptor
+
+    monkeypatch.setattr(media_module, "_open_directory_nofollow", swap_after_open)
+
+    with pytest.raises(MediaSafetyError):
+        prepare_bundle_media(
+            bundle,
+            profile_id="ansonphong",
+            targets=("x",),
+            private_staging_directory=private_root,
+        )
+
+    assert tuple(outside.iterdir()) == ()
+    assert any(held.iterdir())
 
 
 def test_ffprobe_uses_bounded_argv_and_video_metadata_is_enforced(
@@ -527,49 +658,117 @@ def test_video_platform_limits_are_enforced(
         )
 
 
+@pytest.mark.parametrize(
+    "probe",
+    [
+        _video_probe(video_bit_rate=None),
+        _video_probe(audio_bit_rate=None),
+    ],
+)
+def test_instagram_video_missing_bitrate_metadata_fails_closed(
+    tmp_path: Path, probe: dict[str, object]
+) -> None:
+    bundle = _bundle(
+        tmp_path, {"post.mp4": b"\x00\x00\x00\x18ftypmp42data"}, bucket="REELS"
+    )
+
+    with pytest.raises(MediaSafetyError, match="bitrate metadata is required"):
+        prepare_bundle_media(
+            bundle,
+            profile_id="ansonphong",
+            targets=("instagram",),
+            private_staging_directory=tmp_path / "private",
+            instagram=_instagram(tmp_path),
+            process_runner=_runner_for(probe),
+            ffprobe_timeout_seconds=7.0,
+        )
+
+
 def test_public_url_verification_streams_exact_bytes_with_mocked_transport(
     tmp_path: Path,
 ) -> None:
     body = _image_bytes("JPEG")
     descriptor = _public_descriptor(tmp_path, body)
-    transport = httpx.MockTransport(
+    factory = MockPinnedTransportFactory(
         lambda request: httpx.Response(
-            200, headers={"content-type": "image/jpeg"}, content=body
+            200,
+            headers={"content-type": "image/jpeg"},
+            content=body,
+            request=request,
         )
     )
 
-    with httpx.Client(transport=transport) as client:
-        verified = verify_public_media_url(
-            descriptor,
-            media_base_url="https://media.example.test/post-pulsar/",
-            client=client,
-            resolver=_public_resolver,
-        )
+    verified = verify_public_media_url(
+        descriptor,
+        media_base_url="https://media.example.test/post-pulsar/",
+        resolver=_public_resolver,
+        transport_factory=factory,
+    )
 
     assert verified.sha256 == descriptor.sha256
     assert verified.size_bytes == descriptor.size_bytes
+    assert factory.calls == [("93.184.216.34", "media.example.test", 443)]
+
+
+def test_default_pinned_backend_connects_to_ip_not_resolved_hostname() -> None:
+    calls: list[tuple[str, int]] = []
+    sentinel = object()
+
+    class FakeBackend:
+        def connect_tcp(self, host: str, port: int, **_kwargs: object) -> object:
+            calls.append((host, port))
+            return sentinel
+
+    backend = media_module._PinnedNetworkBackend(
+        "93.184.216.34", "media.example.test", 443
+    )
+    backend._delegate = FakeBackend()  # type: ignore[assignment]
+
+    connected = backend.connect_tcp("media.example.test", 443)
+
+    assert connected is sentinel
+    assert calls == [("93.184.216.34", 443)]
+    with pytest.raises(OSError, match="origin"):
+        backend.connect_tcp("rebound.example.test", 443)
 
 
 def test_public_url_redirect_is_revalidated_and_bounded(tmp_path: Path) -> None:
     body = _image_bytes("JPEG")
     descriptor = _public_descriptor(tmp_path, body)
-    redirected = descriptor.public_url + "-final"
+    public_url = descriptor.public_url
+    assert public_url is not None
+    redirected = public_url + "-final"
+    seen_requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == descriptor.public_url:
-            return httpx.Response(302, headers={"location": redirected})
-        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=body)
-
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        verified = verify_public_media_url(
-            replace(descriptor, public_url=redirected.removesuffix("-final")),
-            media_base_url="https://media.example.test/post-pulsar/",
-            client=client,
-            resolver=_public_resolver,
-            max_redirects=1,
+        seen_requests.append((str(request.url), request.headers["host"]))
+        if str(request.url) == public_url:
+            return httpx.Response(302, headers={"location": redirected}, request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/jpeg"},
+            content=body,
+            request=request,
         )
 
+    factory = MockPinnedTransportFactory(handler)
+    verified = verify_public_media_url(
+        replace(descriptor, public_url=public_url),
+        media_base_url="https://media.example.test/post-pulsar/",
+        resolver=_public_resolver,
+        transport_factory=factory,
+        max_redirects=1,
+    )
+
     assert verified.redirects == 1
+    assert factory.calls == [
+        ("93.184.216.34", "media.example.test", 443),
+        ("93.184.216.34", "media.example.test", 443),
+    ]
+    assert seen_requests == [
+        (public_url, "media.example.test"),
+        (redirected, "media.example.test"),
+    ]
 
 
 @pytest.mark.parametrize("failure", ["private_dns", "escape", "mime", "body"])
@@ -594,20 +793,19 @@ def test_public_url_rejects_private_redirect_or_mismatched_response(
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
         return _public_resolver(host, port, **kwargs)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaSafetyError):
-            verify_public_media_url(
-                descriptor,
-                media_base_url="https://media.example.test/post-pulsar/",
-                client=client,
-                resolver=resolver,
-            )
+    with pytest.raises(MediaSafetyError):
+        verify_public_media_url(
+            descriptor,
+            media_base_url="https://media.example.test/post-pulsar/",
+            resolver=resolver,
+            transport_factory=MockPinnedTransportFactory(handler),
+        )
 
 
 def test_public_url_requires_a_matching_media_signature(tmp_path: Path) -> None:
     body = b"not-a-jpeg"
     descriptor = _public_descriptor(tmp_path, body)
-    transport = httpx.MockTransport(
+    factory = MockPinnedTransportFactory(
         lambda _request: httpx.Response(
             200,
             headers={"content-type": "image/jpeg"},
@@ -615,20 +813,19 @@ def test_public_url_requires_a_matching_media_signature(tmp_path: Path) -> None:
         )
     )
 
-    with httpx.Client(transport=transport) as client:
-        with pytest.raises(MediaSafetyError, match="signature"):
-            verify_public_media_url(
-                descriptor,
-                media_base_url="https://media.example.test/post-pulsar/",
-                client=client,
-                resolver=_public_resolver,
-            )
+    with pytest.raises(MediaSafetyError, match="signature"):
+        verify_public_media_url(
+            descriptor,
+            media_base_url="https://media.example.test/post-pulsar/",
+            resolver=_public_resolver,
+            transport_factory=factory,
+        )
 
 
 def test_public_url_rejects_an_unsafe_base_even_with_public_dns(tmp_path: Path) -> None:
     body = _image_bytes("JPEG")
     descriptor = _public_descriptor(tmp_path, body)
-    transport = httpx.MockTransport(
+    factory = MockPinnedTransportFactory(
         lambda _request: httpx.Response(
             200,
             headers={"content-type": "image/jpeg"},
@@ -636,21 +833,20 @@ def test_public_url_rejects_an_unsafe_base_even_with_public_dns(tmp_path: Path) 
         )
     )
 
-    with httpx.Client(transport=transport) as client:
-        with pytest.raises(MediaSafetyError, match="base URL"):
-            verify_public_media_url(
-                replace(
-                    descriptor,
-                    public_url=descriptor.public_url.replace(
-                        "media.example.test", "93.184.216.34"
-                    )
-                    if descriptor.public_url
-                    else None,
+    public_url = descriptor.public_url
+    assert public_url is not None
+    with pytest.raises(MediaSafetyError, match="base URL"):
+        verify_public_media_url(
+            replace(
+                descriptor,
+                public_url=public_url.replace(
+                    "media.example.test", "93.184.216.34"
                 ),
-                media_base_url="https://93.184.216.34/post-pulsar/",
-                client=client,
-                resolver=_public_resolver,
-            )
+            ),
+            media_base_url="https://93.184.216.34/post-pulsar/",
+            resolver=_public_resolver,
+            transport_factory=factory,
+        )
 
 
 def test_cleanup_is_hash_guarded_and_retains_ambiguous_evidence(tmp_path: Path) -> None:
@@ -685,3 +881,39 @@ def test_cleanup_rejects_a_symlink_swap_without_touching_its_target(
         cleanup_staged_media(descriptor, tmp_path / "public", outcome="failed")
 
     assert outside.read_bytes() == body
+
+
+def test_cleanup_quarantines_open_identity_before_hash_and_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _image_bytes("JPEG")
+    descriptor = _public_descriptor(tmp_path, body)
+    path = descriptor.absolute_path(tmp_path / "public")
+    replacement = b"replacement-must-survive"
+    real_rename = os.rename
+    swapped = False
+
+    def rename_then_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if not swapped:
+            swapped = True
+            path.write_bytes(replacement)
+
+    monkeypatch.setattr(os, "rename", rename_then_replace)
+
+    assert cleanup_staged_media(
+        descriptor, tmp_path / "public", outcome="published"
+    )
+    assert path.read_bytes() == replacement
