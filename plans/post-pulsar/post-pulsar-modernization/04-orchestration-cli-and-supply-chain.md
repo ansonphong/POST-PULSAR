@@ -326,6 +326,10 @@ same preview/confirmation-intent rules as control clients; interactive CLI
 approval uses the operator principal outside MCP, then the exact approved intent
 may be consumed once. Operator approval remains available when agent publication
 eligibility is disabled, but the agent still cannot create publishing intents.
+Keyed schedule mutations must resolve to real control handlers, and approved
+cancel/delete requests create guarded terminal tombstones only for pristine,
+non-in-flight work while preserving source media. Retry and reconcile use the
+same approved-intent durable request path as every other sensitive mutation.
 
 **Test:** yes
 
@@ -338,8 +342,14 @@ eligibility is disabled, but the agent still cannot create publishing intents.
 - `src/post_pulsar/cli.py`
 - `src/post_pulsar/__main__.py`
 - `src/post_pulsar/bootstrap.py`
+- `src/post_pulsar/control.py`
+- `src/post_pulsar/state.py`
 - `api/bootstrap.schema.json`
+- `api/control-v1.openapi.json`
+- `tests/unit/test_cli.py`
 - `tests/unit/test_cli_control.py`
+- `tests/unit/test_state.py`
+- `tests/contract/test_control.py`
 
 **Acceptance:**
 - Commands are profile-explicit, bounded, deterministic, secret-safe, and map
@@ -352,7 +362,13 @@ eligibility is disabled, but the agent still cannot create publishing intents.
   its memory-hard verifier.
 - Bootstrap creation is atomic, owner-only, schema-validated, contains no
   credential values, and rejects arbitrary service executables/arguments.
+- Cancel/delete rejects claimed, dispatched, published, ambiguous, or
+  artifact-bearing work; preserves source media; and records revisioned
+  terminal tombstones.
 
 **Verify-After:**
+- `.venv/bin/python -m pytest tests/unit/test_state.py -q` (focused)
+- `.venv/bin/python -m pytest tests/contract/test_control.py -q` (focused)
 - `.venv/bin/python -m pytest tests/unit/test_cli.py tests/unit/test_cli_control.py -q` (focused)
+- `.venv/bin/python -m pytest tests/unit/test_daemon.py -q` (focused)
 - `.venv/bin/python -m post_pulsar --help` (scoped_check)
