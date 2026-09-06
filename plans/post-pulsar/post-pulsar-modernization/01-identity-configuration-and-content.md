@@ -6,7 +6,20 @@ Establish the POST PULSAR package and secure inputs before any platform or state
 
 ### Task 1.1: Establish package and identity baseline
 
-Create a Python 3.12 src-layout distribution named post-pulsar with the post-pulsar entry point and python -m post_pulsar support. Declare current direct runtime and development dependencies and strict Ruff/mypy/pytest policy in pyproject.toml, add deterministic line-ending rules, update ignores for POST PULSAR runtime artifacts, and remove the stale requirements freeze. Preserve Anson Phong as author while eliminating active PHONG-BOT package identity. Bootstrap the ignored verifier environment with python3 -m venv .venv and install the editable development extras so every downstream focused hook has a declared runner.
+Create a Python 3.12 src-layout distribution named post-pulsar with reserved
+`post-pulsar` and `python -m post_pulsar` entry surfaces. Until `T4.2` wires the
+real CLI, `__main__.py` must be import-safe and report that implementation is
+not complete; it must not import a nonexistent module. Declare current direct
+runtime/development dependencies, including a pinned `uv` bootstrap and
+`pytest-socket`, plus strict Ruff/mypy/pytest policy. Add deterministic
+line-ending rules and ignores for POST PULSAR runtime artifacts. Preserve
+Anson Phong as author while eliminating active PHONG-BOT package identity.
+Create the ignored `.venv` with `python3 -m venv`, install the editable
+development extras, and use its pinned `uv` for every later lock command.
+Verify the checkout basename and exact fetch/push origin; set a drifted origin
+to `git@github.com:ansonphong/POST-PULSAR.git`, but stop for a guarded directory
+rename if the checkout is not already `POST-PULSAR`. Keep the legacy
+`requirements.txt` until the atomic operational cutover in `T5.1`.
 
 **Test:** no
 
@@ -16,21 +29,40 @@ Create a Python 3.12 src-layout distribution named post-pulsar with the post-pul
 - `pyproject.toml`
 - `src/post_pulsar/__init__.py`
 - `src/post_pulsar/__main__.py`
-- `requirements.txt`
 
 **Acceptance:**
-- Project metadata requires Python 3.12+, exposes post-pulsar, and names only supported direct dependencies.
+- Project metadata requires Python 3.12+, reserves the post-pulsar entry point, and names only supported direct dependencies and declared verification tools.
 - Tracked text files have deterministic attributes and generated state, local config, tokens, logs, environments, and prepared media are ignored.
-- The legacy requirements.txt is removed; the ignored .venv is bootstrapped from the declared extras and importing post_pulsar exposes the same version as project metadata.
+- The ignored `.venv` is bootstrapped from declared extras, its pinned `uv` is executable, and importing `post_pulsar` exposes the same version as project metadata.
+- Repository basename and fetch/push origin exactly match `POST-PULSAR` and the requested SSH URL; legacy installation remains runnable until `T5.1`.
 
 **Verify-After:**
 - `python3 -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); assert d['project']['name']=='post-pulsar'; assert d['project']['requires-python']=='>=3.12'"` (focused)
 - `.venv/bin/python -c "import importlib.metadata as m, post_pulsar; assert post_pulsar.__version__ == m.version('post-pulsar')"` (focused)
-- `git check-attr text eol -- .gitattributes README.md src/post_pulsar/__init__.py` (scoped_check)
+- `.venv/bin/uv --version` (focused)
+- `python3 -c "import subprocess; p=subprocess.run(['git','check-attr','text','eol','--','README.md','src/post_pulsar/__init__.py','setup.bat'],text=True,capture_output=True,check=True).stdout; assert 'README.md: text: set' in p and 'README.md: eol: lf' in p and 'setup.bat: eol: crlf' in p"` (scoped_check)
+- `python3 -c "import subprocess; paths=['post-pulsar.toml','.env','.post-pulsar/post_pulsar.sqlite3','post_pulsar.log','.venv/bin/python','public-media/file.jpg']; assert all(subprocess.run(['git','check-ignore','-q',p]).returncode==0 for p in paths)"` (scoped_check)
+- `test "$(basename "$PWD")" = POST-PULSAR && test "$(git remote get-url origin)" = git@github.com:ansonphong/POST-PULSAR.git && test "$(git remote get-url --push origin)" = git@github.com:ansonphong/POST-PULSAR.git` (scoped_check)
 
 ### Task 1.2: Replace configuration and secret loading
 
-Implement frozen typed TOML configuration whose paths resolve relative to the config file. Reject unknown fields, unsafe paths, enabled targets without expected account IDs, and invalid Instagram HTTPS media settings before network access. Read publishing tokens only from POST_PULSAR_X_USER_ACCESS_TOKEN and POST_PULSAR_INSTAGRAM_ACCESS_TOKEN; never load .env implicitly or serialize secrets. Replace config-sample.json and the broken Threads-era update_config.py with safe tracked examples. Without reading their contents, reduce ignored legacy config.json and instagram_session.json permissions to owner-only where the filesystem supports it; deletion and credential/session rotation remain explicit operator actions documented later.
+Implement frozen typed TOML configuration whose paths resolve relative to the
+config file. Split local settings loading from publishing credential
+validation: `status` and operator-confirmed `reconcile` require neither tokens
+nor network, while `run` and guarded `retry` validate only required
+snapshotted targets. Local config accepts zero enabled targets so stored
+recovery remains reachable; `T4.1` alone rejects zero targets when it reaches
+new-bundle admission. Reject unknown
+fields, unsafe/colliding paths, enabled targets without
+expected account IDs, and an Instagram base URL containing non-HTTPS scheme,
+userinfo, query, fragment, IP literal, or traversal. Read publishing tokens
+only from `POST_PULSAR_X_USER_ACCESS_TOKEN` and
+`POST_PULSAR_INSTAGRAM_ACCESS_TOKEN`; never load `.env` implicitly or serialize
+secrets. Add safe tracked examples alongside the still-runnable legacy files;
+`config-sample.json` and `update_config.py` are removed atomically in `T5.1`.
+Without reading contents, reduce ignored legacy `config.json` and
+`instagram_session.json` permissions to owner-only where supported; deletion
+and credential/session rotation remain explicit operator actions.
 
 **Test:** yes
 
@@ -42,13 +74,11 @@ Implement frozen typed TOML configuration whose paths resolve relative to the co
 - `post-pulsar.toml.example`
 - `.env.example`
 - `tests/unit/test_config.py`
-- `config-sample.json`
-- `update_config.py`
 
 **Acceptance:**
-- Valid TOML returns immutable app/X/Instagram settings with paths anchored to the config location.
-- Unknown keys, path escape/collision, invalid HTTPS settings, and missing enabled-target tokens or account IDs fail with sanitized actionable errors.
-- Tracked examples contain variable names and placeholders only; legacy JSON and token-copy updater are gone.
+- Valid TOML returns immutable app/X/Instagram local settings with paths anchored to the config location, while publishing credential validation is command-specific.
+- Unknown keys, path escape/collision, unsafe HTTPS settings, and missing credentials/account IDs for an actually required remote target fail with sanitized actionable errors; zero-target local settings remain valid for recovery commands.
+- `status` and `reconcile` load local state without credentials even when a snapshotted target is now disabled; tracked examples contain variable names and placeholders only.
 - If ignored legacy config/session files exist, no group/other permission bits remain where chmod is supported; their contents are never printed or migrated.
 
 **Verify-After:**
@@ -76,4 +106,3 @@ Replace PhongBot._get_basename_without_number and prefix globbing with the Stage
 
 **Verify-After:**
 - `.venv/bin/python -m pytest tests/unit/test_content.py -q` (focused)
-

@@ -16,7 +16,8 @@ Instagram, suitable for manual use or an external OS scheduler.
 - Stage 2 — Design: complete; quality gate B+ (8.55/10).
 - Stage 3 — Plan: complete; 15-task execution graph validated with zero
   mechanical warnings and no execution blockers.
-- Stage 4 — Harden: pending.
+- Stage 4 — Harden: complete; 40/40 gaps fixed across three iterations, with
+  three independent verification passes and no gaps remaining.
 - Stage 5 — Execute: pending.
 - Stage 6 — Review: pending.
 

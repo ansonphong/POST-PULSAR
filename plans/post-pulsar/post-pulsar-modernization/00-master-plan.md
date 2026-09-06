@@ -1,13 +1,13 @@
 ---
-stage: 3
+stage: 4
 target: standard
 repo: post-pulsar
-context: ["plans/post-pulsar-modernization/01-brainstorm.md", "plans/post-pulsar-modernization/02-design.md", "plans/post-pulsar-modernization/02-design-evaluation.md"]
+context: ["plans/post-pulsar-modernization/01-brainstorm.md", "plans/post-pulsar-modernization/02-design.md", "plans/post-pulsar-modernization/02-design-evaluation.md", "plans/post-pulsar-modernization/03-hardening-amendments.md"]
 docs: ["README.md", "https://docs.x.com/x-api/media/initialize-media-upload", "https://docs.x.com/x-api/media/upload-media", "https://docs.x.com/x-api/posts/create-or-edit-post", "https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api"]
 depends: none
 blocks: none
 why: "The relocated repository still contains the PHONG-BOT identity, fragile filename globbing, obsolete/private platform integrations, plaintext credential loading, broken X video upload, and no durable per-platform delivery state. This plan modernizes the existing two-platform publishing product without adding product features."
-stage_state: done
+stage_state: active
 ---
 
 # POST PULSAR Modernization — Master Plan
@@ -60,6 +60,7 @@ stage_state: done
 | `README.md` | modify | Document the current product, APIs, setup, operation, and limitations. |
 | `MIGRATION.md` | create | Guide existing PHONG-BOT operators through the breaking security/API migration. |
 | `SECURITY.md` | create | Document secret handling, rotation, reporting, and supported practices. |
+| `MODERNIZATION_REPORT.md` | create | Record completed work, verification evidence, operator gates, and clearly out-of-scope future opportunities. |
 | `LICENSE.md` | modify | Retain licensing while applying the durable POST PULSAR identity. |
 | `phong-bot.py` | delete | Remove the obsolete unsafe orchestrator. |
 | `post_base.py` | delete | Remove the obsolete platform base implementation. |
@@ -87,10 +88,11 @@ stage_state: done
 - Supported media is inspected by content, constrained per platform, and temporary public Instagram media is safely staged and reconciled.
 - Focused unit, contract, and integration tests pass; lint, typing, packaging, lock verification, and dependency audit pass.
 - README and migration/security documents explain setup, credential provisioning, scheduling, limitations, recovery, and operator-required rotation steps without advertising new features.
+- A final modernization report records completed changes and evidence, then separately lists easy future API/platform opportunities and original recommendations while stating they were not implemented.
 
 ## Execution Rules
 
 - This master file is the sole checkbox ledger.
 - Use planctl to mutate task state; never hand-edit checkbox marks.
 - Phase files contain task detail and Verify-After hooks, but no checkboxes.
-
+- Stage 6 is report-only: it runs broad quality/security gates and delivers their actual evidence in the final review response; `T5.3` owns the last tracked modernization-report update.

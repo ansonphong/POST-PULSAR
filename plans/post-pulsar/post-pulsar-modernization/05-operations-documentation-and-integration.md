@@ -6,7 +6,22 @@ Replace unsafe launchers, finish the operator migration, and prove the critical 
 
 ### Task 5.1: Replace setup, launcher, and scheduled-task scripts
 
-Rename all operational scripts to POST PULSAR and make them resolve their own repository path, create/use a project-local .venv, install the frozen project without system package upgrades, propagate exit codes, and avoid duplicate cron/task entries. The Unix scripts must be non-root and shell-safe; Windows scripts must quote paths and create/update the PostPulsar scheduled task explicitly. Remove the legacy venv helper and all hard-coded /root/phong-bot paths. Add static script contract tests and exercise Windows parsing/dry-run behavior through cmd.exe without changing Task Scheduler.
+Perform one atomic operational cutover. Rename every launcher/setup/task script
+to POST PULSAR, make it resolve its own repository path, create/use a local
+`.venv`, install via the frozen lock without OS upgrades, propagate exit codes,
+and avoid duplicate scheduler entries. Unix scripts are non-root and shell-safe;
+Windows scripts quote paths and explicitly create/update `PostPulsar`. Remove
+the legacy `venv` helper, flat Python entry/modules, requirements freeze,
+secret-bearing JSON sample, and Threads-era updater only in this same task, so
+every prior commit retains the old runnable path and this commit switches fully
+to the already-tested package. Update README's minimum install/run references
+in the same cutover; `T5.2` completes the full documentation rewrite. Add
+static script/identity/import contract tests and exercise Windows parsing/dry-
+run behavior through `cmd.exe` without changing Task Scheduler.
+Each setup detects a foreign-layout `.venv` (`Scripts` versus `bin`) and fails
+with an actionable guarded recreate instruction rather than deleting or using
+the wrong interpreter; isolated tests construct both mismatched layouts without
+touching the developer environment.
 
 **Test:** yes
 
@@ -26,6 +41,14 @@ Rename all operational scripts to POST PULSAR and make them resolve their own re
 - `task-setup.bat`
 - `task-setup-post-pulsar.bat`
 - `venv.bat`
+- `phong-bot.py`
+- `post_base.py`
+- `post_x.py`
+- `post_instagram.py`
+- `requirements.txt`
+- `config-sample.json`
+- `update_config.py`
+- `README.md`
 - `tests/unit/test_scripts.py`
 
 **Acceptance:**
@@ -33,16 +56,33 @@ Rename all operational scripts to POST PULSAR and make them resolve their own re
 - Setup is project-local, lock-frozen, and repeatable, never upgrades the operating system, and launchers return the application exit code.
 - Unix syntax and Windows batch quoting/idempotent task command construction pass automated checks; the Windows task path is exercised only in dry-run mode during verification.
 - Scheduling remains external and one-shot; no new scheduler product feature is introduced.
+- The cutover commit leaves the new package runnable/importable and contains no active legacy entry/module/config/dependency path.
+- POSIX and Windows setup paths reject the other OS's `.venv` layout deterministically and never delete it automatically.
 
 **Verify-After:**
 - `bash -n setup-post-pulsar.sh run-post-pulsar.sh` (focused)
 - `.venv/bin/python -m pytest tests/unit/test_scripts.py -q` (focused)
 - `cmd.exe /d /c "set POST_PULSAR_DRY_RUN=1&& task-setup-post-pulsar.bat"` (scoped_check)
 - `! rg -n -i "phong[-_ ]?bot|/root/|run-bot" setup-post-pulsar.sh setup-post-pulsar.bat run-post-pulsar.sh run-post-pulsar.bat task-setup-post-pulsar.bat` (scoped_check)
+- `.venv/bin/python -m compileall -q src/post_pulsar && .venv/bin/python -m post_pulsar --help` (scoped_check)
 
 ### Task 5.2: Rewrite operator, migration, and security documentation
 
-Rewrite README for POST PULSAR's actual X and Instagram support, official API prerequisites, configuration, one-shot workflow, external scheduling, media grammar, limitations, status/recovery, locked installation, and testing. Add a migration guide covering filename/config changes, required OAuth/Professional-account/public-hosting setup, plaintext credential and Instagram session revocation, and state reset expectations. Add security policy/secret hygiene and update licensing identity without changing GPL terms or authorship. Add a focused documentation contract test for required headings, implemented commands/environment variables, and prohibited stale claims.
+Rewrite README for POST PULSAR's actual X and Instagram support, official API
+prerequisites, `ffprobe`/FFmpeg operator provisioning, configuration, one-shot
+workflow, external scheduling, exact media grammar/limits, normalization and alt
+warnings, status/recovery, locked installation, and tests. Add a migration guide
+covering filename/config changes, required OAuth/Professional-account/public-
+hosting setup, plaintext credential/session revocation, and state expectations.
+Add security policy/secret hygiene and update licensing identity without
+changing GPL terms/authorship. Create `MODERNIZATION_REPORT.md` recording
+completed changes and actual evidence available through `T5.2`, operator-only
+gates, lock/API refresh date, and clearly separated easy future platform/API
+opportunities and original recommendations; it must state none of those future
+items were implemented and must not guess or contain pending-evidence claims.
+Add a focused documentation contract test for required headings, implemented
+commands/environment variables, truthful negated/migration references, and
+prohibited active stale claims/install instructions.
 
 **Test:** yes
 
@@ -54,6 +94,7 @@ Rewrite README for POST PULSAR's actual X and Instagram support, official API pr
 - `README.md`
 - `MIGRATION.md`
 - `SECURITY.md`
+- `MODERNIZATION_REPORT.md`
 - `LICENSE.md`
 - `tests/unit/test_docs.py`
 
@@ -61,15 +102,28 @@ Rewrite README for POST PULSAR's actual X and Instagram support, official API pr
 - Documentation matches implemented commands, config, locked installation, file grammar, supported media, recovery states, and official APIs.
 - Migration explicitly tells operators to rotate legacy X credentials, revoke the private Instagram session, and provision environment tokens without printing values.
 - No unsupported platform or feature is advertised and licensing remains GPL-3.0 with Anson Phong attribution.
+- The modernization report fulfills the requested end-state/future-opportunity deliverable without presenting unimplemented ideas as current capability.
 
 **Verify-After:**
 - `.venv/bin/python -m pytest tests/unit/test_docs.py -q` (focused)
 - `rg -n "POST PULSAR|post-pulsar|POST_PULSAR_|official|rotate|revoke|ambiguous" README.md MIGRATION.md SECURITY.md` (scoped_check)
-- `! rg -n -i "Threads API unavailable|instagrapi|tweepy|username/password login" README.md SECURITY.md` (scoped_check)
 
 ### Task 5.3: Prove the offline end-to-end workflow
 
-Add integration tests that assemble real temporary inbox/config/state directories with fake official adapters and exercise no-candidate, invalid-bundle, all-preflight-before-mutation, successful two-target archive, one-target failure then safe retry, published-target skip, fingerprint drift, ambiguous final outcome, reconcile, interrupted archive recovery, and restart idempotence. Cover permanent or attempt-exhausted failure followed by operator correction and guarded retry, failed retry revalidation leaving state unchanged, immutable snapshot mismatch remaining blocked, and exact reconcile --not-published transition. Keep this task's hooks focused; complete project gates run in Stage 6/CI rather than inside task execution.
+Add integration tests using temporary inbox/config/state directories, fake
+official adapters, and injected chooser/clock/sleeper. Exercise zero-target and
+no-candidate paths, invalid bundles, all-preflight-before-mutation, successful
+two-target archive, one-target failure with `next_attempt_at` skipped until the
+fake clock advances exactly past due, published-target skip, fingerprint drift,
+ambiguous final outcome, reconcile, interrupted archive recovery, and restart
+idempotence. Inject a crash after the fake remote final-create side effect but
+before DB result commit; restart must mark stale `final_dispatch_started`
+ambiguous, call no publish method, retain source, and require explicit
+reconciliation. Cover five-failure exhaustion with controlled time, operator
+correction plus guarded retry, failed retry revalidation leaving state unchanged,
+immutable snapshot mismatch remaining blocked, exact `reconcile --not-published`,
+and resource/staging cleanup. Keep hooks focused; full project gates run in
+Stage 6/CI.
 
 **Test:** yes
 
@@ -79,15 +133,17 @@ Add integration tests that assemble real temporary inbox/config/state directorie
 
 **Files:**
 - `tests/integration/test_workflow.py`
-- `tests/conftest.py`
+- `MODERNIZATION_REPORT.md`
 
 **Acceptance:**
 - Integration coverage demonstrates that partial, ambiguous, drifted, and interrupted states cannot duplicate posts or lose source files.
 - Blocked known failures require explicit guarded retry, failed revalidation is nonmutating, snapshot mismatch remains blocked, and reconcile --not-published changes only the selected target.
+- Backoff/exhaustion assertions use an injected clock with no real sleep; the post-created/pre-commit crash window is explicitly proven ambiguous and non-republishing.
 - The test suite performs no live login, upload, publish, or external HTTP request.
+- The modernization report is finalized with actual Stage 5 focused integration evidence and no pending/guessed gate claims; broad Stage 6 evidence is delivered in the final review response.
 
 **Verify-After:**
-- `uv run pytest tests/integration/test_workflow.py -q` (focused)
-- `uv run ruff check tests/integration/test_workflow.py tests/conftest.py` (scoped_check)
-- `uv run mypy tests/integration/test_workflow.py` (scoped_check)
-
+- `.venv/bin/uv run --frozen pytest tests/integration/test_workflow.py -q` (focused)
+- `.venv/bin/uv run --frozen ruff check tests/integration/test_workflow.py` (scoped_check)
+- `.venv/bin/uv run --frozen mypy tests/integration/test_workflow.py` (scoped_check)
+- `git diff --exit-code -- uv.lock` (scoped_check)
