@@ -1080,12 +1080,54 @@ def _validate_completed(
 
 @contextmanager
 def _read_only_database(path: Path):  # type: ignore[no-untyped-def]
+    database_before = _immutable_file_snapshot(path, required=True)
+    wal = Path(f"{path}-wal")
+    shm = Path(f"{path}-shm")
+    wal_before = _immutable_file_snapshot(wal, required=False)
+    shm_before = _immutable_file_snapshot(shm, required=False)
+    if wal_before is not None and wal_before[3] > 0:
+        raise MigrationError(
+            "migration database has an active WAL and cannot be inspected read-only"
+        )
     uri = f"file:{quote(str(path))}?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True)
     try:
         yield connection
-    finally:
+    except BaseException:
         connection.close()
+        raise
+    else:
+        connection.close()
+        if (
+            _immutable_file_snapshot(path, required=True) != database_before
+            or _immutable_file_snapshot(wal, required=False) != wal_before
+            or _immutable_file_snapshot(shm, required=False) != shm_before
+        ):
+            raise MigrationError(
+                "migration database changed during immutable inspection"
+            )
+
+
+def _immutable_file_snapshot(
+    path: Path, *, required: bool
+) -> tuple[int, int, int, int, int] | None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise MigrationError("migration database is unavailable") from None
+        return None
+    except OSError:
+        raise MigrationError("migration database sidecar is unsafe") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise MigrationError("migration database sidecar is unsafe")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
 
 
 def _write_plan(path: Path, plan: _MigrationPlan) -> None:

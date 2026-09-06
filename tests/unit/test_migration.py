@@ -413,6 +413,56 @@ def test_completed_dry_run_is_noop_without_sqlite_sidecars_or_mtime_changes(
     assert not shm.exists()
 
 
+def test_dry_run_rejects_wal_only_state_without_touching_source_or_sidecars(
+    tmp_path: Path,
+) -> None:
+    root = _legacy(tmp_path)
+    state = tmp_path / "state"
+    database = state / "post_pulsar.sqlite3"
+    with StateRepository(database):
+        pass
+    repository = StateRepository(database)
+    try:
+        repository.register_profile(
+            "foreign", tmp_path / "foreign-account", (), config_hash="f" * 64
+        )
+        with sqlite3.connect(database) as authoritative:
+            assert (
+                authoritative.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+                == 1
+            )
+        immutable_uri = f"file:{database}?mode=ro&immutable=1"
+        with sqlite3.connect(immutable_uri, uri=True) as stale:
+            assert stale.execute("SELECT COUNT(*) FROM profiles").fetchone()[0] == 0
+        wal = Path(f"{database}-wal")
+        assert wal.stat().st_size > 0
+        before_source = _filesystem_snapshot(root)
+        before_state = _filesystem_snapshot(state)
+
+        with pytest.raises(MigrationError, match="active WAL"):
+            _run(tmp_path, mode="dry-run")
+
+        assert _filesystem_snapshot(root) == before_source
+        assert _filesystem_snapshot(state) == before_state
+    finally:
+        repository.close()
+
+
+def _filesystem_snapshot(
+    root: Path,
+) -> tuple[int, dict[str, tuple[int, int, int, bytes | None]]]:
+    entries: dict[str, tuple[int, int, int, bytes | None]] = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.stat(follow_symlinks=False)
+        entries[path.relative_to(root).as_posix()] = (
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None,
+        )
+    return root.stat(follow_symlinks=False).st_mtime_ns, entries
+
+
 def test_nonempty_current_database_is_rejected_before_import(tmp_path: Path) -> None:
     root = _legacy(tmp_path)
     database = tmp_path / "state/post_pulsar.sqlite3"
