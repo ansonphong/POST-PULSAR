@@ -8,6 +8,7 @@ read publishing tokens.
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import tomllib
 from collections.abc import Iterable, Mapping
@@ -352,9 +353,12 @@ def _positive_number(
     values: Mapping[str, object], key: str, default: float, section: str
 ) -> float:
     value = values.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise ConfigurationError(f"{section}.{key} must be a positive number")
-    return float(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigurationError(f"{section}.{key} must be a finite positive number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ConfigurationError(f"{section}.{key} must be a finite positive number")
+    return number
 
 
 def _positive_int(
@@ -457,9 +461,15 @@ def _validate_path_separation(
                 raise ConfigurationError(
                     f"runtime directories must not overlap: {left_name}, {right_name}"
                 )
+    for directory_name, directory in items:
+        if app.log_file == directory or directory.is_relative_to(app.log_file):
+            raise ConfigurationError(
+                f"app.log_file must not equal or contain {directory_name}"
+            )
+
     for directory_name in ("app.posts_directory", "instagram.media_directory"):
         directory = directories[directory_name]
-        if app.log_file == directory or app.log_file.is_relative_to(directory):
+        if app.log_file.is_relative_to(directory):
             raise ConfigurationError(
                 f"app.log_file must not overlap {directory_name}"
             )

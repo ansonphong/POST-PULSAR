@@ -300,3 +300,58 @@ def test_boolean_is_not_accepted_as_integer_setting(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="app.log_backups"):
         load_local_settings(path)
+
+
+@pytest.mark.parametrize(
+    "log_file", ["posts", ".post-pulsar", "public-media", "."]
+)
+def test_log_file_cannot_equal_or_contain_runtime_directory(
+    tmp_path: Path, log_file: str
+) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        'log_file = "post_pulsar.log"', f'log_file = "{log_file}"'
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="app.log_file"):
+        load_local_settings(path)
+
+
+def test_log_file_may_be_inside_state_directory(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        'log_file = "post_pulsar.log"',
+        'log_file = ".post-pulsar/logs/post_pulsar.log"',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    settings = load_local_settings(path)
+
+    assert settings.app.log_file == (
+        tmp_path / ".post-pulsar" / "logs" / "post_pulsar.log"
+    ).resolve()
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "original", "invalid"),
+    [
+        ("x", "request_timeout_seconds", "30", "nan"),
+        ("x", "processing_timeout_seconds", "300", "inf"),
+        ("instagram", "request_timeout_seconds", "30", "-inf"),
+        ("instagram", "processing_timeout_seconds", "300", "nan"),
+    ],
+)
+def test_timeout_settings_must_be_finite(
+    tmp_path: Path, section: str, key: str, original: str, invalid: str
+) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    prefix, section_text = text.split(f"[{section}]", maxsplit=1)
+    section_text = section_text.replace(
+        f"{key} = {original}", f"{key} = {invalid}", 1
+    )
+    path.write_text(f"{prefix}[{section}]{section_text}", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=rf"{section}\.{key}"):
+        load_local_settings(path)
