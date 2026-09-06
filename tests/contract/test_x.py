@@ -29,8 +29,11 @@ from post_pulsar.platforms.http import HTTPPolicy, PlatformHTTPClient
 from post_pulsar.platforms.x import XAdapter
 from post_pulsar.state import (
     ArtifactRecord,
+    BundleFileSnapshot,
     DeliveryPhase,
     DeliveryRecord,
+    ProfileTargetSnapshot,
+    StateRepository,
     TargetSnapshot,
 )
 
@@ -42,6 +45,7 @@ FINGERPRINT = "a" * 64
 class Clock:
     def __init__(self) -> None:
         self.now = NOW
+        self.elapsed = 0.0
         self.sleeps: list[float] = []
 
     def __call__(self) -> datetime:
@@ -50,6 +54,10 @@ class Clock:
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.now += timedelta(seconds=seconds)
+        self.elapsed += seconds
+
+    def monotonic(self) -> float:
+        return self.elapsed
 
 
 class Writer:
@@ -98,6 +106,126 @@ class Writer:
             raise AssertionError("checkpoint changed")
         self.records[key] = record
         return record
+
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        self.events.append(("transition", checkpoint))
+        key = (checkpoint.kind, checkpoint.ordinal)
+        if (
+            self.records.get(key) != current
+            or checkpoint.external_id != current.external_id
+        ):
+            raise AssertionError("processing transition changed artifact identity")
+        record = ArtifactRecord(
+            current.bundle_key,
+            current.platform,
+            current.attempt_count,
+            current.kind,
+            current.ordinal,
+            current.external_id,
+            current.relative_path,
+            current.sha256,
+            current.expires_at,
+            checkpoint.processing_metadata,
+        )
+        self.records[key] = record
+        return record
+
+    def replace_expired_artifact(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        self.events.append(("replace", checkpoint))
+        key = (checkpoint.kind, checkpoint.ordinal)
+        if self.records.get(key) != current:
+            raise AssertionError("expired replacement changed artifact identity")
+        record = ArtifactRecord(
+            current.bundle_key,
+            current.platform,
+            current.attempt_count,
+            current.kind,
+            current.ordinal,
+            checkpoint.external_id,
+            checkpoint.relative_path,
+            checkpoint.sha256,
+            checkpoint.expires_at,
+            checkpoint.processing_metadata,
+        )
+        self.records[key] = record
+        return record
+
+
+class RepositoryWriter:
+    def __init__(
+        self,
+        repository: StateRepository,
+        *,
+        bundle_key: int,
+        claim_token: str,
+        attempt_count: int,
+    ) -> None:
+        self.repository = repository
+        self.bundle_key = bundle_key
+        self.claim_token = claim_token
+        self.attempt_count = attempt_count
+
+    def advance_phase(self, phase: DeliveryPhase) -> DeliveryRecord:
+        return self.repository.advance_delivery_phase(
+            self.bundle_key,
+            "x",
+            phase,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
+
+    def checkpoint_artifact(self, checkpoint: ArtifactCheckpoint) -> ArtifactRecord:
+        return self.repository.checkpoint_artifact(
+            self.bundle_key,
+            "x",
+            kind=checkpoint.kind,
+            ordinal=checkpoint.ordinal,
+            external_id=checkpoint.external_id,
+            relative_path=checkpoint.relative_path,
+            sha256=checkpoint.sha256,
+            expires_at=checkpoint.expires_at,
+            processing_metadata=checkpoint.processing_metadata,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
+
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        assert checkpoint.external_id is not None
+        return self.repository.transition_artifact_processing(
+            self.bundle_key,
+            "x",
+            kind=checkpoint.kind,
+            ordinal=checkpoint.ordinal,
+            external_id=checkpoint.external_id,
+            expected_processing_metadata=current.processing_metadata,
+            processing_metadata=checkpoint.processing_metadata,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
+
+    def replace_expired_artifact(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord:
+        assert current.external_id is not None and checkpoint.external_id is not None
+        assert checkpoint.expires_at is not None
+        return self.repository.replace_expired_artifact(
+            self.bundle_key,
+            "x",
+            kind=checkpoint.kind,
+            ordinal=checkpoint.ordinal,
+            expected_external_id=current.external_id,
+            external_id=checkpoint.external_id,
+            expires_at=checkpoint.expires_at,
+            processing_metadata=checkpoint.processing_metadata,
+            claim_token=self.claim_token,
+            attempt_count=self.attempt_count,
+        )
 
 
 def snapshot(*, settings: dict[str, object] | None = None) -> PublicationSnapshot:
@@ -190,6 +318,7 @@ def adapter(
         client,
         private_staging_directory=tmp_path,
         clock=timer,
+        monotonic=timer.monotonic,
         sleeper=timer.sleep,
     )
 
@@ -235,6 +364,7 @@ def test_weighted_text_and_alt_text_preflight_boundaries(tmp_path: Path) -> None
         )
         == ()
     )
+    assert target.preflight(request(tmp_path, (), text="\r\n" * 141)) == ()
     issues = target.preflight(
         request(tmp_path, ("image",), text="界" * 141, alt="a" * 1001)
     )
@@ -338,7 +468,10 @@ def test_chunked_video_checkpoint_order_status_params_and_retry_after(
             events.append("append")
             match = re.search(rb'name="segment_index"\r\n\r\n([0-9]+)', req.content)
             assert match is not None
-            append_indices.append(int(match.group(1)))
+            segment_index = int(match.group(1))
+            append_indices.append(segment_index)
+            source = b"media-0-" * 3
+            assert source[segment_index * 4 : (segment_index + 1) * 4] in req.content
             return httpx.Response(204)
         if req.url.path == "/2/media/upload/8001/finalize":
             events.append("finalize")
@@ -388,6 +521,23 @@ def test_chunked_video_checkpoint_order_status_params_and_retry_after(
     assert next(
         a for a in prepared.artifacts if a.kind == "x_media_id"
     ).expires_at == NOW + timedelta(seconds=3540)
+    transitions = [
+        event.processing_metadata["state"]
+        for kind, event in writer.events
+        if kind == "transition" and isinstance(event, ArtifactCheckpoint)
+    ]
+    assert transitions == [
+        "appending",
+        "appending",
+        "appending",
+        "appending",
+        "appending",
+        "appending",
+        "finalizing",
+        "finalized",
+        "pending",
+        "succeeded",
+    ]
 
 
 def test_final_create_ambiguity_is_returned_and_never_repeated(tmp_path: Path) -> None:
@@ -473,3 +623,303 @@ def test_unexpired_media_is_reused_but_new_attempt_reuploads_expired_media(
         item.external_id for item in prepared_two.artifacts if item.kind == "x_media_id"
     )
     assert second_id == "7002"
+
+
+def test_same_attempt_expired_media_is_atomically_replaced_before_final(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    ids = iter(("7101", "7102"))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload":
+            return httpx.Response(
+                200,
+                json={"data": {"id": next(ids), "expires_after_secs": 3600}},
+            )
+        raise AssertionError(req.url)
+
+    publication = request(tmp_path, ("image",))
+    writer = Writer()
+    with adapter(tmp_path, handler, clock=clock) as target:
+        first = target.prepare(publication, prior=None, checkpoints=writer)
+        clock.now += timedelta(hours=2)
+        clock.elapsed += 7200
+        replaced = target.prepare(publication, prior=first, checkpoints=writer)
+    media_record = next(
+        item for item in replaced.artifacts if item.kind == "x_media_id"
+    )
+    assert media_record.external_id == "7102"
+    assert any(event[0] == "replace" for event in writer.events)
+
+
+@pytest.mark.parametrize(
+    ("state", "next_segment", "expected_appends", "expects_finalize", "expects_status"),
+    [
+        ("initialized", 0, [0, 1, 2, 3, 4, 5], True, False),
+        ("appending", 3, [3, 4, 5], True, False),
+        ("finalizing", 6, [], False, True),
+        ("finalized", 6, [], False, True),
+        ("pending", 6, [], False, True),
+        ("in_progress", 6, [], False, True),
+        ("succeeded", 6, [], False, False),
+    ],
+)
+def test_chunked_resume_never_repeats_completed_remote_steps(
+    tmp_path: Path,
+    state: str,
+    next_segment: int,
+    expected_appends: list[int],
+    expects_finalize: bool,
+    expects_status: bool,
+) -> None:
+    append_indices: list[int] = []
+    finalize_calls = 0
+    status_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal finalize_calls, status_calls
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload/8201/append":
+            match = re.search(rb'name="segment_index"\r\n\r\n([0-9]+)', req.content)
+            assert match is not None
+            append_indices.append(int(match.group(1)))
+            return httpx.Response(204)
+        if req.url.path == "/2/media/upload/8201/finalize":
+            finalize_calls += 1
+            return httpx.Response(200, json={"data": {"id": "8201"}})
+        if req.url.path == "/2/media/upload":
+            status_calls += 1
+            assert dict(req.url.params) == {"command": "STATUS", "media_id": "8201"}
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8201",
+                        "processing_info": {"state": "succeeded"},
+                    }
+                },
+            )
+        raise AssertionError(req.url)
+
+    settings: dict[str, object] = {"chunk_size_bytes": 4}
+    publication = request(tmp_path, ("video",), settings=settings)
+    item = publication.media.items[0]
+    writer = Writer()
+    staged = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "staged_private",
+            0,
+            relative_path=item.private.relative_path.as_posix(),
+            sha256=item.private.sha256,
+        )
+    )
+    remote = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "x_media_id",
+            0,
+            external_id="8201",
+            expires_at=NOW + timedelta(hours=1),
+            processing_metadata={
+                "state": state,
+                "next_segment_index": next_segment,
+                "source_sha256": item.private.sha256,
+                "media_type": item.private.mime_type,
+            },
+        )
+    )
+    prior = PreparedPublication(
+        publication,
+        1,
+        tuple(sorted((staged, remote), key=lambda a: (a.kind, a.ordinal))),
+    )
+    with adapter(tmp_path, handler, settings=settings) as target:
+        prepared = target.prepare(publication, prior=prior, checkpoints=writer)
+    assert append_indices == expected_appends
+    assert finalize_calls == int(expects_finalize)
+    assert status_calls == int(expects_status)
+    final_remote = next(
+        item for item in prepared.artifacts if item.kind == "x_media_id"
+    )
+    assert final_remote.processing_metadata["state"] == "succeeded"
+
+
+def test_resume_before_finalize_status_404_performs_finalize_once(
+    tmp_path: Path,
+) -> None:
+    status_calls = 0
+    finalize_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal status_calls, finalize_calls
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload":
+            status_calls += 1
+            return httpx.Response(404)
+        if req.url.path == "/2/media/upload/8251/finalize":
+            finalize_calls += 1
+            return httpx.Response(200, json={"data": {"id": "8251"}})
+        raise AssertionError(req.url)
+
+    settings: dict[str, object] = {"chunk_size_bytes": 4}
+    publication = request(tmp_path, ("video",), settings=settings)
+    item = publication.media.items[0]
+    writer = Writer()
+    staged = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "staged_private",
+            0,
+            relative_path=item.private.relative_path.as_posix(),
+            sha256=item.private.sha256,
+        )
+    )
+    remote = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "x_media_id",
+            0,
+            external_id="8251",
+            expires_at=NOW + timedelta(hours=1),
+            processing_metadata={
+                "state": "finalizing",
+                "next_segment_index": 6,
+                "source_sha256": item.private.sha256,
+                "media_type": item.private.mime_type,
+            },
+        )
+    )
+    prior = PreparedPublication(
+        publication,
+        1,
+        tuple(sorted((staged, remote), key=lambda value: (value.kind, value.ordinal))),
+    )
+    with adapter(tmp_path, handler, settings=settings) as target:
+        prepared = target.prepare(publication, prior=prior, checkpoints=writer)
+    assert status_calls == 1
+    assert finalize_calls == 1
+    final_remote = next(
+        artifact for artifact in prepared.artifacts if artifact.kind == "x_media_id"
+    )
+    assert final_remote.processing_metadata["state"] == "succeeded"
+
+
+def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None:
+    timer = Clock()
+    repository = StateRepository(tmp_path / "state.sqlite3", clock=timer)
+    repository.register_profile(
+        "alpha",
+        tmp_path / "accounts/alpha",
+        (
+            ProfileTargetSnapshot(
+                "x",
+                "12345",
+                "expected_user",
+                "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
+                {},
+            ),
+        ),
+        config_hash="b" * 64,
+    )
+    bundle_key = repository.add_bundle(
+        profile_id="alpha",
+        bundle_id="cat",
+        fingerprint=FINGERPRINT,
+        source_bucket="QUEUE",
+        files=(
+            BundleFileSnapshot(
+                "cat_1.jpg", "image", 1, "image", "image/jpeg", 24, "c" * 64
+            ),
+        ),
+        targets=(
+            TargetSnapshot(
+                "x",
+                "12345",
+                "expected_user",
+                "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
+                "2",
+                1,
+                {},
+            ),
+        ),
+    )
+    delivery = repository.claim_delivery(bundle_key, "x", "claim-x-real")
+    writer = RepositoryWriter(
+        repository,
+        bundle_key=bundle_key,
+        claim_token="claim-x-real",
+        attempt_count=delivery.attempt_count,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload":
+            return httpx.Response(
+                200, json={"data": {"id": "7301", "expires_after_secs": 3600}}
+            )
+        raise AssertionError(req.url)
+
+    publication = request(tmp_path, ("image",))
+    with adapter(tmp_path, handler, clock=timer) as target:
+        prepared = target.prepare(publication, prior=None, checkpoints=writer)
+    assert [item.kind for item in prepared.artifacts] == [
+        "staged_private",
+        "x_media_id",
+    ]
+    assert repository.get_delivery(bundle_key, "x").phase == "ready"
+
+
+def test_processing_retry_after_cannot_overrun_monotonic_deadline(
+    tmp_path: Path,
+) -> None:
+    timer = Clock()
+    status_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload/initialize":
+            return httpx.Response(
+                202, json={"data": {"id": "8401", "expires_after_secs": 3600}}
+            )
+        if req.url.path == "/2/media/upload/8401/append":
+            return httpx.Response(204)
+        if req.url.path == "/2/media/upload/8401/finalize":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8401",
+                        "processing_info": {"state": "pending", "check_after_secs": 1},
+                    }
+                },
+            )
+        if req.url.path == "/2/media/upload":
+            status_calls += 1
+            if status_calls == 1:
+                return httpx.Response(429, headers={"Retry-After": "60"})
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8401",
+                        "processing_info": {"state": "succeeded"},
+                    }
+                },
+            )
+        raise AssertionError(req.url)
+
+    settings: dict[str, object] = {
+        "chunk_size_bytes": 4,
+        "processing_timeout_seconds": 5,
+    }
+    publication = request(tmp_path, ("video",), settings=settings)
+    with adapter(tmp_path, handler, settings=settings, clock=timer) as target:
+        with pytest.raises(AdapterContractError, match="timed out"):
+            target.prepare(publication, prior=None, checkpoints=Writer())
+    assert timer.elapsed == 5
+    assert status_calls == 1

@@ -205,6 +205,35 @@ def test_pre_final_retry_after_is_bounded_and_token_is_header_only() -> None:
         assert token.encode() not in request.content
 
 
+def test_read_only_retry_budget_caps_retry_after_and_aborts_before_repeat() -> None:
+    remaining = 3.0
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        nonlocal remaining
+        sleeps.append(seconds)
+        remaining -= seconds
+
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get("https://api.example.test/status").mock(
+            return_value=httpx.Response(429, headers={"Retry-After": "60"})
+        )
+        with PlatformHTTPClient(
+            _snapshot(),
+            SecretValue("budget-token"),
+            base_url="https://api.example.test",
+            policy=HTTPPolicy(max_pre_final_attempts=3),
+            sleeper=sleep,
+        ) as client:
+            with pytest.raises(PlatformHTTPError, match="retry budget"):
+                client.read_only_request(
+                    "GET", "/status", retry_budget_seconds=lambda: remaining
+                )
+
+    assert sleeps == [3.0]
+    assert route.call_count == 1
+
+
 def test_final_dispatch_is_one_shot_and_uncertain_errors_are_sanitized() -> None:
     token = "final-token-never-render"
     with respx.mock(assert_all_called=True) as router:

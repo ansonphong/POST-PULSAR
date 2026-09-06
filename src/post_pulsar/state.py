@@ -156,6 +156,9 @@ _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SCHEDULE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
+_MIME_TYPE_RE: Final = re.compile(
+    r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}\Z"
+)
 
 
 class StateError(RuntimeError):
@@ -3116,7 +3119,27 @@ class StateRepository:
                 or not 0 <= value <= 100
             ):
                 raise StateValidationError("processing progress is out of range")
-        return self._safe_json(metadata)
+            if key == "next_segment_index" and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 1000
+            ):
+                raise StateValidationError("processing segment index is out of range")
+            if key == "check_after_seconds" and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 3600
+            ):
+                raise StateValidationError("processing delay is out of range")
+            if key == "source_sha256" and (
+                not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+            ):
+                raise StateValidationError("processing source hash is invalid")
+            if key == "media_type" and (
+                not isinstance(value, str) or not _MIME_TYPE_RE.fullmatch(value)
+            ):
+                raise StateValidationError("processing media type is invalid")
+        return self._safe_json(dict(metadata))
 
     def _safe_json(self, value: object) -> str:
         try:

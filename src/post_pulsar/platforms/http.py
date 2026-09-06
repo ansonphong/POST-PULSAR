@@ -212,10 +212,17 @@ class PlatformHTTPClient:
         path: str,
         *,
         params: Mapping[str, RequestValue] | None = None,
+        retry_budget_seconds: Callable[[], float] | None = None,
     ) -> SafeHTTPResponse:
         if method.upper() not in {"GET", "HEAD"}:
             raise AdapterContractError("read-only request method is invalid")
-        return self._request(method, path, stage="read_only", params=params)
+        return self._request(
+            method,
+            path,
+            stage="read_only",
+            params=params,
+            retry_budget_seconds=retry_budget_seconds,
+        )
 
     def pre_final_request(
         self,
@@ -278,6 +285,7 @@ class PlatformHTTPClient:
         form: Mapping[str, str] | None = None,
         content: bytes | None = None,
         files: Mapping[str, FileValue] | None = None,
+        retry_budget_seconds: Callable[[], float] | None = None,
     ) -> SafeHTTPResponse:
         self._assert_open()
         normalized_method = method.upper()
@@ -303,7 +311,9 @@ class PlatformHTTPClient:
                 ) as response:
                     status = response.status_code
                     if status in _RETRYABLE_STATUS and attempt < attempts:
-                        self._sleeper(self._retry_delay(response, attempt))
+                        self._sleep_before_retry(
+                            self._retry_delay(response, attempt), retry_budget_seconds
+                        )
                         continue
                     if not 200 <= status < 300:
                         raise self._status_error(status, stage)
@@ -317,7 +327,9 @@ class PlatformHTTPClient:
                 raise
             except httpx.TimeoutException:
                 if attempt < attempts:
-                    self._sleeper(self._fallback_delay(attempt))
+                    self._sleep_before_retry(
+                        self._fallback_delay(attempt), retry_budget_seconds
+                    )
                     continue
                 raise PlatformHTTPError(
                     "request_timeout",
@@ -326,7 +338,9 @@ class PlatformHTTPClient:
                 ) from None
             except httpx.RequestError:
                 if attempt < attempts:
-                    self._sleeper(self._fallback_delay(attempt))
+                    self._sleep_before_retry(
+                        self._fallback_delay(attempt), retry_budget_seconds
+                    )
                     continue
                 code = (
                     "final_dispatch_uncertain" if stage == "final" else "network_error"
@@ -397,6 +411,32 @@ class PlatformHTTPClient:
                 self.policy.max_retry_after_seconds,
             )
         )
+
+    def _sleep_before_retry(
+        self,
+        delay: float,
+        retry_budget_seconds: Callable[[], float] | None,
+    ) -> None:
+        if retry_budget_seconds is None:
+            self._sleeper(delay)
+            return
+        remaining = retry_budget_seconds()
+        if (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, (int, float))
+            or not math.isfinite(float(remaining))
+            or remaining < 0
+        ):
+            raise AdapterContractError("HTTP retry budget is invalid")
+        bounded = min(delay, float(remaining))
+        if bounded > 0:
+            self._sleeper(bounded)
+        if bounded >= float(remaining):
+            raise PlatformHTTPError(
+                "retry_budget_exhausted",
+                "request retry budget was exhausted",
+                "safe_pre_final",
+            )
 
     def _reject_credential_in_payload(self, *values: object) -> None:
         token = self._token

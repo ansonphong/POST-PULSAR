@@ -585,6 +585,36 @@ def test_remote_artifact_processing_transitions_and_expired_replacement_are_guar
         )
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"source_sha256": "not-a-hash"},
+        {"media_type": "not a mime"},
+        {"next_segment_index": -1},
+        {"next_segment_index": 1001},
+        {"check_after_seconds": 3601},
+    ],
+)
+def test_remote_processing_metadata_is_bounded(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository, "x-metadata")
+    claim = _claim(repository, bundle_key, "x", "x-metadata-claim")
+    with pytest.raises(StateValidationError, match="processing"):
+        repository.checkpoint_artifact(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="media-invalid",
+            expires_at=clock() + timedelta(hours=1),
+            processing_metadata=metadata,
+            **claim,  # type: ignore[arg-type]
+        )
+
+
 def test_instagram_container_and_public_staging_checkpoints_are_durable(
     tmp_path: Path,
 ) -> None:

@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 from post_pulsar.media import PreparedMediaItem, open_verified_private_media
 from post_pulsar.platforms.base import (
@@ -36,7 +36,7 @@ _URL_RE: Final = re.compile(
     r"(?i)(?<![@\w])(?:"
     r"(?:https?://|www\.)[^\s<>\]\[{}]+"
     r"|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"[a-z]{2,63}(?:/[^\s<>\]\[{}]*)?"
+    r"(?:xn--[a-z0-9-]{2,59}|[a-z]{2,63})(?:/[^\s<>\]\[{}]*)?"
     r")"
 )
 _WEIGHT_ONE_RANGES: Final = (
@@ -54,6 +54,27 @@ _MAX_SEGMENTS: Final = 1000
 _DEFAULT_PROCESSING_TIMEOUT: Final = 120.0
 _MAX_PROCESSING_POLLS: Final = 100
 _EXPIRY_SKEW_SECONDS: Final = 60
+_CHUNK_STATES: Final = frozenset(
+    {
+        "initialized",
+        "appending",
+        "finalizing",
+        "finalized",
+        "pending",
+        "in_progress",
+        "succeeded",
+    }
+)
+
+
+class _DurableXCheckpointWriter(Protocol):
+    def transition_artifact_processing(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord: ...
+
+    def replace_expired_artifact(
+        self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
+    ) -> ArtifactRecord: ...
 
 
 class XAdapter(BasePlatformAdapter):
@@ -66,6 +87,7 @@ class XAdapter(BasePlatformAdapter):
         *,
         private_staging_directory: str | Path,
         clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if snapshot.target.platform != "x" or snapshot.target.api_version != "2":
@@ -74,6 +96,7 @@ class XAdapter(BasePlatformAdapter):
         self._client = client
         self._staging_root = Path(private_staging_directory)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic
         self._sleeper = sleeper
         self._chunk_size = _integer_setting(
             snapshot.target.request_settings,
@@ -181,7 +204,8 @@ class XAdapter(BasePlatformAdapter):
         delivery = checkpoints.advance_phase("processing")
         _validate_delivery(delivery, self.snapshot, "processing")
         attempt = delivery.attempt_count
-        prior_ids = self._reusable_prior_ids(publication, prior, attempt)
+        durable = _durable_writer(checkpoints)
+        prior_ids, expired_ids = self._prior_ids(publication, prior, attempt)
         records: list[ArtifactRecord] = []
 
         for ordinal, item in enumerate(publication.media.items):
@@ -193,7 +217,6 @@ class XAdapter(BasePlatformAdapter):
                         ordinal,
                         relative_path=item.private.relative_path.as_posix(),
                         sha256=item.private.sha256,
-                        processing_metadata={"mime_type": item.private.mime_type},
                     ),
                     self.snapshot,
                     attempt,
@@ -204,7 +227,14 @@ class XAdapter(BasePlatformAdapter):
         for ordinal, item in enumerate(publication.media.items):
             reusable = prior_ids.get(ordinal)
             if reusable is None:
-                record = self._upload(item, ordinal, checkpoints, attempt)
+                record = self._upload(
+                    item,
+                    ordinal,
+                    checkpoints,
+                    durable,
+                    attempt,
+                    replacement=expired_ids.get(ordinal),
+                )
                 media_id = cast("str", record.external_id)
             else:
                 record = reusable
@@ -213,7 +243,7 @@ class XAdapter(BasePlatformAdapter):
                     item.metadata.kind != "image"
                     or item.private.mime_type == "image/gif"
                 ):
-                    self._append_finalize_and_wait(media_id, item)
+                    record = self._resume_chunked(record, item, durable)
             media_ids.append(media_id)
             records.append(record)
             alt = _normalized_optional(publication.alt_text)
@@ -230,16 +260,17 @@ class XAdapter(BasePlatformAdapter):
             tuple(sorted(records, key=lambda record: (record.kind, record.ordinal))),
         )
 
-    def _reusable_prior_ids(
+    def _prior_ids(
         self,
         publication: PublicationRequest,
         prior: PreparedPublication | None,
         attempt: int,
-    ) -> dict[int, ArtifactRecord]:
+    ) -> tuple[dict[int, ArtifactRecord], dict[int, ArtifactRecord]]:
         if prior is None or prior.attempt_count != attempt:
-            return {}
+            return {}, {}
         expected_ordinals = set(range(len(publication.media.items)))
         found: dict[int, ArtifactRecord] = {}
+        expired: dict[int, ArtifactRecord] = {}
         now = _aware_utc(self._clock())
         for artifact in prior.artifacts:
             if artifact.kind != "x_media_id":
@@ -257,19 +288,30 @@ class XAdapter(BasePlatformAdapter):
                 != item.private.mime_type
             ):
                 raise AdapterContractError("prior X media checkpoint is invalid")
+            state = artifact.processing_metadata.get("state")
+            allowed_states = (
+                {"succeeded"}
+                if item.metadata.kind == "image"
+                and item.private.mime_type != "image/gif"
+                else _CHUNK_STATES
+            )
+            if state not in allowed_states:
+                raise AdapterContractError("prior X media checkpoint is invalid")
             if _aware_utc(artifact.expires_at) <= now:
-                raise AdapterContractError(
-                    "expired X media requires a new delivery attempt"
-                )
-            found[artifact.ordinal] = artifact
-        return found
+                expired[artifact.ordinal] = artifact
+            else:
+                found[artifact.ordinal] = artifact
+        return found, expired
 
     def _upload(
         self,
         item: PreparedMediaItem,
         ordinal: int,
         checkpoints: CheckpointWriter,
+        durable: _DurableXCheckpointWriter,
         attempt: int,
+        *,
+        replacement: ArtifactRecord | None,
     ) -> ArtifactRecord:
         if item.metadata.kind == "image" and item.private.mime_type != "image/gif":
             with open_verified_private_media(
@@ -291,7 +333,15 @@ class XAdapter(BasePlatformAdapter):
             )
             media_id, expiry = _media_identity(response, self._clock())
             return self._checkpoint_media_id(
-                checkpoints, item, ordinal, attempt, media_id, expiry
+                checkpoints,
+                durable,
+                item,
+                ordinal,
+                attempt,
+                media_id,
+                expiry,
+                state="succeeded",
+                replacement=replacement,
             )
 
         category = (
@@ -314,87 +364,217 @@ class XAdapter(BasePlatformAdapter):
         media_id, expiry = _media_identity(response, self._clock())
         # The returned ID is durable before the first byte-changing remote call.
         record = self._checkpoint_media_id(
-            checkpoints, item, ordinal, attempt, media_id, expiry
+            checkpoints,
+            durable,
+            item,
+            ordinal,
+            attempt,
+            media_id,
+            expiry,
+            state="initialized",
+            next_segment_index=0,
+            replacement=replacement,
         )
-        self._append_finalize_and_wait(media_id, item)
-        return record
+        return self._resume_chunked(record, item, durable)
 
     def _checkpoint_media_id(
         self,
         checkpoints: CheckpointWriter,
+        durable: _DurableXCheckpointWriter,
         item: PreparedMediaItem,
         ordinal: int,
         attempt: int,
         media_id: str,
         expiry: datetime,
+        *,
+        state: str,
+        next_segment_index: int | None = None,
+        replacement: ArtifactRecord | None,
     ) -> ArtifactRecord:
-        return _checkpoint_exact(
-            checkpoints,
-            ArtifactCheckpoint(
-                "x_media_id",
-                ordinal,
-                external_id=media_id,
-                expires_at=expiry,
-                processing_metadata={
-                    "source_sha256": item.private.sha256,
-                    "media_type": item.private.mime_type,
-                },
+        checkpoint = ArtifactCheckpoint(
+            "x_media_id",
+            ordinal,
+            external_id=media_id,
+            expires_at=expiry,
+            processing_metadata=_media_processing_metadata(
+                item, state=state, next_segment_index=next_segment_index
             ),
-            self.snapshot,
-            attempt,
         )
+        if replacement is None:
+            return _checkpoint_exact(checkpoints, checkpoint, self.snapshot, attempt)
+        record = durable.replace_expired_artifact(replacement, checkpoint)
+        _assert_checkpoint_record(record, checkpoint, self.snapshot, attempt)
+        return record
 
-    def _append_finalize_and_wait(self, media_id: str, item: PreparedMediaItem) -> None:
+    def _resume_chunked(
+        self,
+        record: ArtifactRecord,
+        item: PreparedMediaItem,
+        checkpoints: _DurableXCheckpointWriter,
+    ) -> ArtifactRecord:
+        media_id = cast(str, record.external_id)
         segments = math.ceil(item.private.size_bytes / self._chunk_size)
         if segments > _MAX_SEGMENTS:
             raise AdapterContractError("X media requires too many upload segments")
-        with open_verified_private_media(
-            item.private,
-            self._staging_root,
-            expected_profile_id=self.snapshot.profile_id,
-            expected_bucket=self.snapshot.source_bucket,
-        ) as verified:
-            for segment in range(segments):
-                chunk = verified.stream.read(self._chunk_size)
-                if not chunk:
-                    raise AdapterContractError("X media ended before its final segment")
-                self._client.pre_final_request(
-                    "POST",
-                    f"/2/media/upload/{media_id}/append",
-                    form={"segment_index": str(segment)},
-                    files={"media": (item.source_name, chunk, item.private.mime_type)},
+        state = record.processing_metadata.get("state")
+        next_segment = record.processing_metadata.get("next_segment_index", 0)
+        if (
+            state not in _CHUNK_STATES
+            or isinstance(next_segment, bool)
+            or not isinstance(next_segment, int)
+            or not 0 <= next_segment <= segments
+        ):
+            raise AdapterContractError("prior X media processing state is invalid")
+        if state in {"initialized", "appending"}:
+            with open_verified_private_media(
+                item.private,
+                self._staging_root,
+                expected_profile_id=self.snapshot.profile_id,
+                expected_bucket=self.snapshot.source_bucket,
+            ) as verified:
+                for segment in range(segments):
+                    chunk = verified.stream.read(self._chunk_size)
+                    if not chunk:
+                        raise AdapterContractError(
+                            "X media ended before its final segment"
+                        )
+                    if segment < next_segment:
+                        continue
+                    self._client.pre_final_request(
+                        "POST",
+                        f"/2/media/upload/{media_id}/append",
+                        form={"segment_index": str(segment)},
+                        files={
+                            "media": (item.source_name, chunk, item.private.mime_type)
+                        },
+                    )
+                    record = self._transition_media(
+                        checkpoints,
+                        record,
+                        item,
+                        state="appending",
+                        next_segment_index=segment + 1,
+                    )
+                if verified.stream.read(1):
+                    raise AdapterContractError(
+                        "X media exceeded its declared segment count"
+                    )
+            record = self._transition_media(
+                checkpoints,
+                record,
+                item,
+                state="finalizing",
+                next_segment_index=segments,
+            )
+            return self._finalize_and_wait(record, item, checkpoints)
+        if state == "finalizing":
+            try:
+                response = self._client.read_only_request(
+                    "GET",
+                    "/2/media/upload",
+                    params={"command": "STATUS", "media_id": media_id},
                 )
-            if verified.stream.read(1):
-                raise AdapterContractError(
-                    "X media exceeded its declared segment count"
+            except PlatformHTTPError as error:
+                if (
+                    error.status_code == 404
+                    and error.retry_classification == "permanent"
+                ):
+                    return self._finalize_and_wait(record, item, checkpoints)
+                raise
+            data = _response_data(response, "X media status response is invalid")
+            if data.get("id") != media_id:
+                raise AdapterContractError("X media status response is invalid")
+            info = data.get("processing_info")
+            if info is None:
+                return self._transition_media(
+                    checkpoints,
+                    record,
+                    item,
+                    state="succeeded",
+                    next_segment_index=segments,
                 )
+            return self._wait_for_processing(record, item, checkpoints, initial=info)
+        if state == "succeeded":
+            return record
+        return self._wait_for_processing(record, item, checkpoints, initial=None)
+
+    def _finalize_and_wait(
+        self,
+        record: ArtifactRecord,
+        item: PreparedMediaItem,
+        checkpoints: _DurableXCheckpointWriter,
+    ) -> ArtifactRecord:
+        media_id = cast(str, record.external_id)
+        segments = math.ceil(item.private.size_bytes / self._chunk_size)
         response = self._client.pre_final_request(
             "POST", f"/2/media/upload/{media_id}/finalize"
         )
         data = _response_data(response, "X media finalize response is invalid")
         if data.get("id") != media_id:
             raise AdapterContractError("X media finalize response is invalid")
-        self._wait_for_processing(media_id, data.get("processing_info"))
-
-    def _wait_for_processing(self, media_id: str, initial: object) -> None:
-        info = initial
-        deadline = _aware_utc(self._clock()) + timedelta(
-            seconds=self._processing_timeout
+        record = self._transition_media(
+            checkpoints,
+            record,
+            item,
+            state="finalized",
+            next_segment_index=segments,
         )
+        if "processing_info" not in data or data.get("processing_info") is None:
+            return self._transition_media(
+                checkpoints,
+                record,
+                item,
+                state="succeeded",
+                next_segment_index=segments,
+            )
+        return self._wait_for_processing(
+            record, item, checkpoints, initial=data.get("processing_info")
+        )
+
+    def _wait_for_processing(
+        self,
+        record: ArtifactRecord,
+        item: PreparedMediaItem,
+        checkpoints: _DurableXCheckpointWriter,
+        *,
+        initial: object,
+    ) -> ArtifactRecord:
+        media_id = cast(str, record.external_id)
+        info = initial
+        deadline = self._monotonic() + self._processing_timeout
         for _poll in range(_MAX_PROCESSING_POLLS):
             if info is None:
-                return
+                resumed_state = record.processing_metadata.get("state")
+                if resumed_state in {"finalized", "pending", "in_progress"}:
+                    info = {
+                        "state": (
+                            "in_progress"
+                            if resumed_state == "finalized"
+                            else resumed_state
+                        ),
+                        "check_after_secs": 0,
+                    }
+                else:
+                    return record
             if not isinstance(info, Mapping):
                 raise AdapterContractError("X media processing response is invalid")
             state = info.get("state")
+            if state not in {"pending", "in_progress", "succeeded", "failed"}:
+                raise AdapterContractError("X media processing response is invalid")
+            record = self._transition_media(
+                checkpoints,
+                record,
+                item,
+                state=cast(str, state),
+                next_segment_index=record.processing_metadata.get("next_segment_index"),
+                processing_info=info,
+            )
             if state == "succeeded":
-                return
+                return record
             if state == "failed":
                 raise AdapterContractError("X media processing failed")
-            if state not in {"pending", "in_progress"}:
-                raise AdapterContractError("X media processing response is invalid")
-            now = _aware_utc(self._clock())
-            if now >= deadline:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
                 break
             delay = info.get("check_after_secs", 1)
             if (
@@ -403,20 +583,56 @@ class XAdapter(BasePlatformAdapter):
                 or not math.isfinite(float(delay))
             ):
                 raise AdapterContractError("X media processing delay is invalid")
-            bounded = min(
-                max(float(delay), 0.0), 60.0, max(0.0, (deadline - now).total_seconds())
-            )
+            bounded = min(max(float(delay), 0.0), 60.0, remaining)
             self._sleeper(bounded)
-            response = self._client.read_only_request(
-                "GET",
-                "/2/media/upload",
-                params={"command": "STATUS", "media_id": media_id},
-            )
+            if self._monotonic() >= deadline:
+                break
+            try:
+                response = self._client.read_only_request(
+                    "GET",
+                    "/2/media/upload",
+                    params={"command": "STATUS", "media_id": media_id},
+                    retry_budget_seconds=lambda: max(0.0, deadline - self._monotonic()),
+                )
+            except PlatformHTTPError as error:
+                if error.code == "retry_budget_exhausted":
+                    raise AdapterContractError("X media processing timed out") from None
+                raise
+            if self._monotonic() >= deadline:
+                raise AdapterContractError("X media processing timed out")
             data = _response_data(response, "X media status response is invalid")
             if data.get("id") != media_id:
                 raise AdapterContractError("X media status response is invalid")
             info = data.get("processing_info")
         raise AdapterContractError("X media processing timed out")
+
+    def _transition_media(
+        self,
+        checkpoints: _DurableXCheckpointWriter,
+        current: ArtifactRecord,
+        item: PreparedMediaItem,
+        *,
+        state: str,
+        next_segment_index: object,
+        processing_info: Mapping[object, object] | None = None,
+    ) -> ArtifactRecord:
+        checkpoint = ArtifactCheckpoint(
+            current.kind,
+            current.ordinal,
+            external_id=current.external_id,
+            expires_at=current.expires_at,
+            processing_metadata=_media_processing_metadata(
+                item,
+                state=state,
+                next_segment_index=next_segment_index,
+                processing_info=processing_info,
+            ),
+        )
+        record = checkpoints.transition_artifact_processing(current, checkpoint)
+        _assert_checkpoint_record(
+            record, checkpoint, self.snapshot, current.attempt_count
+        )
+        return record
 
     def _apply_alt_text(self, media_id: str, alt_text: str) -> None:
         self._client.pre_final_request(
@@ -522,6 +738,16 @@ def _checkpoint_exact(
     attempt: int,
 ) -> ArtifactRecord:
     record = writer.checkpoint_artifact(checkpoint)
+    _assert_checkpoint_record(record, checkpoint, snapshot, attempt)
+    return record
+
+
+def _assert_checkpoint_record(
+    record: ArtifactRecord,
+    checkpoint: ArtifactCheckpoint,
+    snapshot: PublicationSnapshot,
+    attempt: int,
+) -> None:
     if (
         record.bundle_key != snapshot.bundle_key
         or record.platform != "x"
@@ -535,7 +761,65 @@ def _checkpoint_exact(
         or dict(record.processing_metadata) != dict(checkpoint.processing_metadata)
     ):
         raise AdapterContractError("X checkpoint writer returned mismatched state")
-    return record
+
+
+def _durable_writer(writer: CheckpointWriter) -> _DurableXCheckpointWriter:
+    if not callable(
+        getattr(writer, "transition_artifact_processing", None)
+    ) or not callable(getattr(writer, "replace_expired_artifact", None)):
+        raise AdapterContractError("X checkpoint writer lacks resumable operations")
+    return cast(_DurableXCheckpointWriter, writer)
+
+
+def _media_processing_metadata(
+    item: PreparedMediaItem,
+    *,
+    state: str,
+    next_segment_index: object = None,
+    processing_info: Mapping[object, object] | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "state": state,
+        "source_sha256": item.private.sha256,
+        "media_type": item.private.mime_type,
+    }
+    if next_segment_index is not None:
+        if (
+            isinstance(next_segment_index, bool)
+            or not isinstance(next_segment_index, int)
+            or not 0 <= next_segment_index <= _MAX_SEGMENTS
+        ):
+            raise AdapterContractError("X media segment checkpoint is invalid")
+        metadata["next_segment_index"] = next_segment_index
+    if processing_info is not None:
+        progress = processing_info.get("progress_percent")
+        if progress is not None:
+            if (
+                isinstance(progress, bool)
+                or not isinstance(progress, (int, float))
+                or not math.isfinite(float(progress))
+                or not 0 <= float(progress) <= 100
+            ):
+                raise AdapterContractError("X media processing response is invalid")
+            metadata["progress_percent"] = progress
+        delay = processing_info.get("check_after_secs")
+        if delay is not None:
+            if (
+                isinstance(delay, bool)
+                or not isinstance(delay, (int, float))
+                or not math.isfinite(float(delay))
+                or not 0 <= float(delay) <= 3600
+            ):
+                raise AdapterContractError("X media processing response is invalid")
+            metadata["check_after_seconds"] = delay
+        error = processing_info.get("error")
+        if isinstance(error, Mapping):
+            code = error.get("code")
+            if isinstance(code, (str, int)) and not isinstance(code, bool):
+                rendered = str(code)
+                if rendered and len(rendered) <= 64:
+                    metadata["error_code"] = rendered
+    return metadata
 
 
 def _validate_delivery(
@@ -558,7 +842,9 @@ def _issue(code: str, message: str, field: str) -> ValidationIssue:
 def _normalized_optional(value: str | None) -> str | None:
     if value is None:
         return None
-    normalized = unicodedata.normalize("NFC", value)
+    normalized = (
+        unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
+    )
     return normalized if normalized else None
 
 
@@ -571,12 +857,15 @@ def _contains_invalid_text(value: str) -> bool:
 
 
 def _weighted_text_length(value: str) -> int:
-    """Apply X's standard 280-weight scale and 23-character URL transform."""
-    normalized = unicodedata.normalize("NFC", value)
+    """Apply the public twitter-text v3 weighting/configuration rules."""
+    normalized = _normalized_optional(value)
+    if normalized is None:
+        return 0
     total = 0
     cursor = 0
     for match in _URL_RE.finditer(normalized):
-        url = match.group(0).rstrip(".,!?;:")
+        raw_url = match.group(0)
+        url = raw_url.rstrip(".,!?;:")
         if not url:
             continue
         total += _weighted_codepoints(normalized[cursor : match.start()]) + 23
@@ -604,7 +893,6 @@ def _weighted_codepoints(value: str) -> int:
 
 
 def _emoji_cluster_end(value: str, start: int) -> int:
-    """Recognize the multi-code-point emoji forms weighted as one X glyph."""
     if not _is_emoji_base(value, start):
         return start
     index = _consume_emoji_suffix(value, start + 1)
