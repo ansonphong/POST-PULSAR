@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -160,6 +161,7 @@ _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MIME_TYPE_RE: Final = re.compile(
     r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}\Z"
 )
+_RANDOM_SELECTION_DOMAIN: Final = b"POST-PULSAR-RANDOM-SELECTION\x00V1\x00"
 
 
 class StateError(RuntimeError):
@@ -221,6 +223,15 @@ class BundleFileSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class BundleAdmissionCandidate:
+    """One fully snapshotted candidate offered to transactional selection."""
+
+    bundle_id: str
+    fingerprint: str
+    files: tuple[BundleFileSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileRecord:
     profile_id: str
     account_root: Path
@@ -241,6 +252,8 @@ class BundleRecord:
     archive_path: str | None
     ready_marker_name: str
     ready_marker_archived: bool
+    claimed_by_type: str | None
+    claimed_by_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,7 +705,9 @@ class StateRepository:
         busy_timeout_ms: int = 5000,
     ) -> None:
         if busy_timeout_ms < 1000:
-            raise StateValidationError("busy timeout must be at least 1000 milliseconds")
+            raise StateValidationError(
+                "busy timeout must be at least 1000 milliseconds"
+            )
         self.path = Path(database_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -714,6 +729,35 @@ class StateRepository:
         except BaseException:
             self._connection.close()
             raise
+
+    @classmethod
+    def open_existing(
+        cls,
+        database_path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        secret_values: Iterable[str] = (),
+        busy_timeout_ms: int = 5000,
+    ) -> StateRepository:
+        """Open only an existing regular current-schema database."""
+
+        path = Path(database_path)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            raise MigrationRequiredError(
+                "migration required: state database does not exist"
+            ) from None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise MigrationRequiredError(
+                "migration required: state database path is unsafe"
+            )
+        return cls(
+            path,
+            clock=clock,
+            secret_values=secret_values,
+            busy_timeout_ms=busy_timeout_ms,
+        )
 
     def __enter__(self) -> StateRepository:
         return self
@@ -738,7 +782,9 @@ class StateRepository:
 
     @property
     def journal_mode(self) -> str:
-        return str(self._connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        return str(
+            self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
 
     def _initialize_schema(self) -> None:
         try:
@@ -774,9 +820,10 @@ class StateRepository:
                     raise MigrationRequiredError(
                         "migration required: current-version database schema is incomplete"
                     )
-                if _schema_manifest_digest(
-                    self._connection
-                ) != _expected_schema_manifest_digest():
+                if (
+                    _schema_manifest_digest(self._connection)
+                    != _expected_schema_manifest_digest()
+                ):
                     raise MigrationRequiredError(
                         "migration required: current-version database schema is not canonical"
                     )
@@ -792,9 +839,10 @@ class StateRepository:
             self._connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._connection.execute("COMMIT")
-            if _schema_manifest_digest(
-                self._connection
-            ) != _expected_schema_manifest_digest():
+            if (
+                _schema_manifest_digest(self._connection)
+                != _expected_schema_manifest_digest()
+            ):
                 raise StateError("new database schema failed canonical validation")
         except (MigrationRequiredError, StateError):
             raise
@@ -876,7 +924,8 @@ class StateRepository:
                         (str(root), config_hash, now, profile_id),
                     )
                     self._connection.execute(
-                        "DELETE FROM profile_targets WHERE profile_id = ?", (profile_id,)
+                        "DELETE FROM profile_targets WHERE profile_id = ?",
+                        (profile_id,),
                     )
                     self._replace_profile_targets(profile_id, normalized_targets)
         except sqlite3.IntegrityError as exc:
@@ -889,7 +938,9 @@ class StateRepository:
                 raise ConflictError(
                     "token environment variable is assigned to multiple targets"
                 ) from None
-            raise ConflictError("profile identity conflicts with durable state") from None
+            raise ConflictError(
+                "profile identity conflicts with durable state"
+            ) from None
         return self.get_profile(profile_id)
 
     def get_profile(self, profile_id: str) -> ProfileRecord:
@@ -1010,68 +1061,210 @@ class StateRepository:
             raise StateValidationError("at least one exact bundle file is required")
         normalized_files = self._normalize_bundle_files(files)
         normalized_targets = self._normalize_target_snapshots(targets)
-        now = self._now_text()
         with self._transaction():
-            profile = self._connection.execute(
-                "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
-            ).fetchone()
-            if profile is None:
-                raise StateValidationError("unknown profile")
-            duplicate = self._connection.execute(
-                "SELECT 1 FROM bundles WHERE profile_id = ? AND bundle_id = ?",
-                (profile_id, bundle_id),
-            ).fetchone()
-            if duplicate is not None:
-                raise ConflictError("bundle ID has already been used for this profile")
-            active = self._connection.execute(
-                "SELECT 1 FROM bundles WHERE profile_id = ? "
-                "AND status IN ('active', 'blocked', 'archiving')",
-                (profile_id,),
-            ).fetchone()
-            if active is not None:
-                raise ConflictError("profile already has one active bundle")
-            configured = {
-                target[0]: target for target in self._stored_profile_targets(profile_id)
-            }
-            for target in normalized_targets:
-                current = configured.get(str(target[0]))
-                if current is None:
-                    raise StateValidationError(
-                        "target snapshot is not configured for profile"
-                    )
-                target_binding = (
-                    str(target[1]),
-                    str(target[2]),
-                    str(target[3]),
-                    str(target[7]),
+            bundle_key = self._insert_bundle_locked(
+                profile_id=profile_id,
+                bundle_id=bundle_id,
+                fingerprint=fingerprint,
+                source_bucket=bucket,
+                normalized_files=normalized_files,
+                normalized_targets=normalized_targets,
+                claimed_by_type=None,
+                claimed_by_id=None,
+            )
+        return bundle_key
+
+    def admit_selected_bundle(
+        self,
+        *,
+        profile_id: str,
+        source_bucket: SourceBucket,
+        candidates: Sequence[BundleAdmissionCandidate],
+        targets: Sequence[TargetSnapshot],
+        trigger_id: str,
+    ) -> BundleRecord:
+        """Select and admit one candidate with its counter and trigger atomically."""
+
+        _validate_profile_id(profile_id)
+        bucket = _validate_bucket(source_bucket)
+        _validate_identifier(trigger_id, "run trigger ID")
+        if not candidates:
+            raise StateValidationError("at least one admission candidate is required")
+        if not targets:
+            raise StateValidationError("at least one target snapshot is required")
+        normalized_targets = self._normalize_target_snapshots(targets)
+        normalized: list[
+            tuple[BundleAdmissionCandidate, tuple[tuple[object, ...], ...]]
+        ] = []
+        identities: set[str] = set()
+        for candidate in candidates:
+            _validate_bundle_id(candidate.bundle_id)
+            _validate_sha256(candidate.fingerprint, "bundle fingerprint")
+            identity = candidate.bundle_id.casefold()
+            if identity in identities:
+                raise StateValidationError("admission candidate IDs collide")
+            identities.add(identity)
+            if not candidate.files:
+                raise StateValidationError(
+                    "admission candidate requires exact bundle files"
                 )
-                current_binding = (current[1], current[2], current[3], current[5])
-                if target_binding != current_binding:
+            normalized.append(
+                (candidate, self._normalize_bundle_files(candidate.files))
+            )
+
+        with self._transaction():
+            self._require_profile(profile_id)
+            replay_rows = tuple(
+                self._connection.execute(
+                    "SELECT * FROM bundles WHERE claimed_by_type = 'run_once' "
+                    "AND claimed_by_id = ?",
+                    (trigger_id,),
+                )
+            )
+            if replay_rows:
+                if len(replay_rows) != 1:
+                    raise ConflictError("run trigger identity is not unique")
+                replay = replay_rows[0]
+                offered = {
+                    (item.bundle_id.casefold(), item.fingerprint)
+                    for item, _files in normalized
+                }
+                if (
+                    str(replay["profile_id"]) != profile_id
+                    or str(replay["source_bucket"]) != bucket
+                    or (str(replay["bundle_id"]).casefold(), str(replay["fingerprint"]))
+                    not in offered
+                ):
                     raise ConflictError(
-                        "target snapshot does not match current profile target"
+                        "run trigger identity conflicts with prior admission"
                     )
-            cursor = self._connection.execute(
-                "INSERT INTO bundles(profile_id, bundle_id, fingerprint, source_bucket, "
-                "profile_root_snapshot, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                return self._bundle_from_row(replay)
+            counter = self._selection_counter_locked(profile_id)
+            if bucket == "RANDOM":
+                selected, normalized_files = min(
+                    normalized,
+                    key=lambda item: (
+                        _random_selection_score(profile_id, counter, item[0]),
+                        item[0].bundle_id.casefold(),
+                        item[0].bundle_id,
+                    ),
+                )
+                self._write_selection_counter_locked(profile_id, counter + 1)
+            else:
+                selected, normalized_files = min(
+                    normalized,
+                    key=lambda item: (
+                        item[0].bundle_id.casefold(),
+                        item[0].bundle_id,
+                    ),
+                )
+            bundle_key = self._insert_bundle_locked(
+                profile_id=profile_id,
+                bundle_id=selected.bundle_id,
+                fingerprint=selected.fingerprint,
+                source_bucket=bucket,
+                normalized_files=normalized_files,
+                normalized_targets=normalized_targets,
+                claimed_by_type="run_once",
+                claimed_by_id=trigger_id,
+            )
+        return self.get_bundle(bundle_key)
+
+    def _insert_bundle_locked(
+        self,
+        *,
+        profile_id: str,
+        bundle_id: str,
+        fingerprint: str,
+        source_bucket: SourceBucket,
+        normalized_files: tuple[tuple[object, ...], ...],
+        normalized_targets: tuple[tuple[object, ...], ...],
+        claimed_by_type: str | None,
+        claimed_by_id: str | None,
+    ) -> int:
+        profile = self._connection.execute(
+            "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
+        if profile is None:
+            raise StateValidationError("unknown profile")
+        duplicate = self._connection.execute(
+            "SELECT 1 FROM bundles WHERE profile_id = ? AND bundle_id = ?",
+            (profile_id, bundle_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ConflictError("bundle ID has already been used for this profile")
+        active = self._connection.execute(
+            "SELECT 1 FROM bundles WHERE profile_id = ? "
+            "AND status IN ('active', 'blocked', 'archiving')",
+            (profile_id,),
+        ).fetchone()
+        if active is not None:
+            raise ConflictError("profile already has one active bundle")
+        configured = {
+            target[0]: target for target in self._stored_profile_targets(profile_id)
+        }
+        for target in normalized_targets:
+            current = configured.get(str(target[0]))
+            if current is None:
+                raise StateValidationError(
+                    "target snapshot is not configured for profile"
+                )
+            target_binding = (
+                str(target[1]),
+                str(target[2]),
+                str(target[3]),
+                str(target[7]),
+            )
+            current_binding = (current[1], current[2], current[3], current[5])
+            if target_binding != current_binding:
+                raise ConflictError(
+                    "target snapshot does not match current profile target"
+                )
+        now = self._now_text()
+        cursor = self._connection.execute(
+            "INSERT INTO bundles(profile_id, bundle_id, fingerprint, source_bucket, "
+            "profile_root_snapshot, status, claimed_by_type, claimed_by_id, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            (
+                profile_id,
+                bundle_id,
+                fingerprint,
+                source_bucket,
+                str(profile["account_root"]),
+                claimed_by_type,
+                claimed_by_id,
+                now,
+                now,
+            ),
+        )
+        bundle_key = _lastrowid(cursor)
+        self._connection.executemany(
+            "INSERT INTO bundle_files(bundle_key, relative_name, role, ordinal, "
+            "media_kind, mime_type, size_bytes, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ((bundle_key, *item) for item in normalized_files),
+        )
+        for target in normalized_targets:
+            (
+                platform,
+                remote_id,
+                username,
+                token_env,
+                api_version,
+                adapter_version,
+                settings_json,
+                settings_hash,
+                snapshot_hash,
+            ) = target
+            self._connection.execute(
+                "INSERT INTO target_snapshots(bundle_key, profile_id, profile_root, "
+                "platform, expected_remote_user_id, expected_username, token_env_var, "
+                "api_version, adapter_version, request_settings_json, "
+                "request_settings_sha256, snapshot_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    bundle_key,
                     profile_id,
-                    bundle_id,
-                    fingerprint,
-                    bucket,
                     str(profile["account_root"]),
-                    now,
-                    now,
-                ),
-            )
-            bundle_key = _lastrowid(cursor)
-            self._connection.executemany(
-                "INSERT INTO bundle_files(bundle_key, relative_name, role, ordinal, "
-                "media_kind, mime_type, size_bytes, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ((bundle_key, *item) for item in normalized_files),
-            )
-            for target in normalized_targets:
-                (
                     platform,
                     remote_id,
                     username,
@@ -1081,33 +1274,13 @@ class StateRepository:
                     settings_json,
                     settings_hash,
                     snapshot_hash,
-                ) = target
-                self._connection.execute(
-                    "INSERT INTO target_snapshots(bundle_key, profile_id, profile_root, "
-                    "platform, expected_remote_user_id, expected_username, token_env_var, "
-                    "api_version, adapter_version, request_settings_json, "
-                    "request_settings_sha256, snapshot_sha256) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        bundle_key,
-                        profile_id,
-                        str(profile["account_root"]),
-                        platform,
-                        remote_id,
-                        username,
-                        token_env,
-                        api_version,
-                        adapter_version,
-                        settings_json,
-                        settings_hash,
-                        snapshot_hash,
-                    ),
-                )
-                self._connection.execute(
-                    "INSERT INTO deliveries(bundle_key, platform, status, updated_at) "
-                    "VALUES (?, ?, 'pending', ?)",
-                    (bundle_key, platform, now),
-                )
+                ),
+            )
+            self._connection.execute(
+                "INSERT INTO deliveries(bundle_key, platform, status, updated_at) "
+                "VALUES (?, ?, 'pending', ?)",
+                (bundle_key, platform, now),
+            )
         return bundle_key
 
     def _normalize_bundle_files(
@@ -1118,7 +1291,9 @@ class StateRepository:
         for item in files:
             name = _relative_member_name(item.relative_name)
             if name.casefold() in names:
-                raise StateValidationError("bundle file names collide case-insensitively")
+                raise StateValidationError(
+                    "bundle file names collide case-insensitively"
+                )
             names.add(name.casefold())
             if not item.role or len(item.role) > 32:
                 raise StateValidationError("bundle file role is invalid")
@@ -1207,9 +1382,7 @@ class StateRepository:
         )
         return tuple(self._bundle_from_row(row) for row in rows)
 
-    def list_failed_deliveries(
-        self, profile_id: str
-    ) -> tuple[DeliveryRecord, ...]:
+    def list_failed_deliveries(self, profile_id: str) -> tuple[DeliveryRecord, ...]:
         """Return every failed delivery owned by one profile deterministically."""
 
         self._require_profile(profile_id)
@@ -1280,9 +1453,7 @@ class StateRepository:
         self._delivery_row(bundle_key, platform)
         if attempt_count is not None and attempt_count <= 0:
             raise StateValidationError("artifact attempt count must be positive")
-        query = (
-            "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ?"
-        )
+        query = "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ?"
         parameters: tuple[object, ...] = (bundle_key, platform)
         if attempt_count is not None:
             query += " AND attempt_count = ?"
@@ -1318,9 +1489,7 @@ class StateRepository:
             raise StateError("bundle source validation failed without a drift reason")
         raise ConflictError(drift_message)
 
-    def assert_target_snapshot(
-        self, bundle_key: int, snapshot: TargetSnapshot
-    ) -> None:
+    def assert_target_snapshot(self, bundle_key: int, snapshot: TargetSnapshot) -> None:
         normalized = self._normalize_target_snapshots((snapshot,))[0]
         platform = cast(str, normalized[0])
         expected_hash = cast(str, normalized[-1])
@@ -1360,7 +1529,9 @@ class StateRepository:
                 (bundle_key,),
             ).fetchone()
             if unpublished is not None:
-                raise TransitionError("all target deliveries must be published before archiving")
+                raise TransitionError(
+                    "all target deliveries must be published before archiving"
+                )
             now = self._now_text()
             self._connection.execute(
                 "UPDATE bundles SET status = 'archiving', revision = revision + 1, "
@@ -1404,7 +1575,9 @@ class StateRepository:
                 (bundle_key, relative_name),
             ).fetchone()
             if member is None:
-                raise StateValidationError("archive member is not in the exact manifest")
+                raise StateValidationError(
+                    "archive member is not in the exact manifest"
+                )
             if str(member["sha256"]) != sha256:
                 raise ConflictError("archive member hash does not match snapshot")
             self._connection.execute(
@@ -1473,9 +1646,13 @@ class StateRepository:
             delivery = self._delivery_row(bundle_key, platform)
             status = str(delivery["status"])
             if status == "ambiguous":
-                raise TransitionError("ambiguous delivery cannot be retried automatically")
+                raise TransitionError(
+                    "ambiguous delivery cannot be retried automatically"
+                )
             if str(bundle["status"]) != "active":
-                raise TransitionError("delivery cannot be claimed while bundle is not active")
+                raise TransitionError(
+                    "delivery cannot be claimed while bundle is not active"
+                )
             if status != "pending":
                 if status == "failed" and bool(delivery["safe_to_retry"]):
                     due = _optional_datetime(delivery["next_attempt_at"])
@@ -1567,9 +1744,13 @@ class StateRepository:
                 raise StateValidationError("remote artifact checkpoint requires an ID")
             _validate_identifier(external_id, "remote artifact ID")
             if relative_path is not None or sha256 is not None:
-                raise StateValidationError("remote artifact cannot contain a staging path")
+                raise StateValidationError(
+                    "remote artifact cannot contain a staging path"
+                )
             if expires_at is None:
-                raise StateValidationError("remote artifact checkpoint requires an expiry")
+                raise StateValidationError(
+                    "remote artifact checkpoint requires an expiry"
+                )
         if kind in {"staged_private", "staged_public"}:
             if relative_path is None or sha256 is None:
                 raise StateValidationError("staged checkpoint requires path and hash")
@@ -1697,7 +1878,9 @@ class StateRepository:
         )
         replacement_expiry = None if expires_at is None else _timestamp(expires_at)
         if expires_at is not None and expires_at.astimezone(UTC) <= self._now():
-            raise StateValidationError("artifact processing expiry must be in the future")
+            raise StateValidationError(
+                "artifact processing expiry must be in the future"
+            )
         with self._transaction():
             delivery = self._delivery_row(bundle_key, platform)
             self._require_delivery_claim(delivery, claim_token, attempt_count)
@@ -1788,7 +1971,9 @@ class StateRepository:
         _validate_identifier(external_id, "remote artifact ID")
         expiry = _timestamp(expires_at)
         if expires_at.astimezone(UTC) <= self._now():
-            raise StateValidationError("replacement artifact expiry must be in the future")
+            raise StateValidationError(
+                "replacement artifact expiry must be in the future"
+            )
         metadata_json = self._processing_metadata_json(processing_metadata)
         with self._transaction():
             delivery = self._delivery_row(bundle_key, platform)
@@ -1929,7 +2114,10 @@ class StateRepository:
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
             self._require_delivery_claim(row, claim_token, attempt_count)
-            if str(row["status"]) != "in_flight" or str(row["phase"]) != "final_dispatch_started":
+            if (
+                str(row["status"]) != "in_flight"
+                or str(row["phase"]) != "final_dispatch_started"
+            ):
                 raise TransitionError(
                     "publication result requires a durable final-dispatch phase"
                 )
@@ -1968,7 +2156,7 @@ class StateRepository:
         claim_token: str,
         attempt_count: int,
     ) -> DeliveryRecord:
-        """Persist an uncertain final-create result without permitting a retry."""
+        """Persist explicit ambiguity evidence without permitting a retry."""
 
         platform = _validate_platform(platform)
         error_code = self._safe_text(error_code, "delivery error code", maximum=64)
@@ -1976,13 +2164,8 @@ class StateRepository:
         with self._transaction():
             row = self._delivery_row(bundle_key, platform)
             self._require_delivery_claim(row, claim_token, attempt_count)
-            if (
-                str(row["status"]) != "in_flight"
-                or str(row["phase"]) != "final_dispatch_started"
-            ):
-                raise TransitionError(
-                    "only an uncertain final-dispatch result can become ambiguous"
-                )
+            if str(row["status"]) != "in_flight":
+                raise TransitionError("only an in-flight delivery can become ambiguous")
             self._mark_ambiguous_locked(
                 bundle_key,
                 platform,
@@ -1993,17 +2176,78 @@ class StateRepository:
             )
         return self.get_delivery(bundle_key, platform)
 
+    def reject_final_delivery(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        error_code: str,
+        error_message: str,
+        claim_token: str,
+        attempt_count: int,
+    ) -> DeliveryRecord:
+        """Persist a definite permanent rejection after one final request."""
+
+        platform = _validate_platform(platform)
+        error_code = self._safe_text(error_code, "delivery error code", maximum=64)
+        error_message = self._safe_text(error_message, "delivery error message")
+        with self._transaction():
+            row = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(row, claim_token, attempt_count)
+            if str(row["phase"]) != "final_dispatch_started":
+                raise TransitionError(
+                    "final rejection requires a durable final-dispatch phase"
+                )
+            now = self._now_text()
+            updated = self._connection.execute(
+                "UPDATE deliveries SET status = 'failed', phase = NULL, "
+                "consecutive_failures = consecutive_failures + 1, safe_to_retry = 0, "
+                "next_attempt_at = NULL, claim_token = NULL, error_code = ?, "
+                "error_message = ?, revision = revision + 1, updated_at = ? "
+                "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                "AND claim_token = ? AND attempt_count = ?",
+                (
+                    error_code,
+                    error_message,
+                    now,
+                    bundle_key,
+                    platform,
+                    claim_token,
+                    attempt_count,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("delivery claim became stale")
+            self._block_bundle_locked(bundle_key, error_code)
+            self._insert_event_locked(
+                bundle_key,
+                platform,
+                "delivery_failed",
+                f"delivery_failed:{attempt_count}",
+                {"error_code": error_code, "retryable": False},
+            )
+        return self.get_delivery(bundle_key, platform)
+
     def recover_stale(
-        self, stale_before: datetime
+        self,
+        stale_before: datetime,
+        *,
+        profile_id: str,
+        reclaim_token: str | None = None,
     ) -> tuple[tuple[int, Platform, str], ...]:
+        _validate_profile_id(profile_id)
+        if reclaim_token is not None:
+            _validate_identifier(reclaim_token, "recovery claim token")
         cutoff = _timestamp(stale_before)
         recovered: list[tuple[int, Platform, str]] = []
         with self._transaction():
             rows = tuple(
                 self._connection.execute(
-                    "SELECT * FROM deliveries WHERE status = 'in_flight' "
-                    "AND updated_at <= ? ORDER BY bundle_key, platform",
-                    (cutoff,),
+                    "SELECT d.* FROM deliveries d JOIN bundles b "
+                    "ON b.bundle_key = d.bundle_key WHERE b.profile_id = ? "
+                    "AND d.status = 'in_flight' AND d.updated_at <= ? "
+                    "ORDER BY d.bundle_key, d.platform",
+                    (profile_id, cutoff),
                 )
             )
             for row in rows:
@@ -2019,6 +2263,24 @@ class StateRepository:
                         attempt_count=int(row["attempt_count"]),
                     )
                     recovered.append((bundle_key, platform, "ambiguous"))
+                    continue
+                if reclaim_token is not None:
+                    updated = self._connection.execute(
+                        "UPDATE deliveries SET claim_token = ?, revision = revision + 1, "
+                        "updated_at = ? WHERE bundle_key = ? AND platform = ? "
+                        "AND status = 'in_flight' AND claim_token = ? AND attempt_count = ?",
+                        (
+                            reclaim_token,
+                            self._now_text(),
+                            bundle_key,
+                            platform,
+                            str(row["claim_token"]),
+                            int(row["attempt_count"]),
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConflictError("stale delivery recovery lost its claim")
+                    recovered.append((bundle_key, platform, "resumed"))
                     continue
                 failures = int(row["consecutive_failures"]) + 1
                 retryable = failures < 5
@@ -2063,8 +2325,13 @@ class StateRepository:
             bundle = self._bundle_row(bundle_key)
             self._require_revision(bundle, expected_bundle_revision, "bundle")
             delivery = self._delivery_row(bundle_key, platform)
-            if str(bundle["status"]) != "blocked" or str(delivery["status"]) != "failed":
-                raise TransitionError("operator retry requires a blocked failed delivery")
+            if (
+                str(bundle["status"]) != "blocked"
+                or str(delivery["status"]) != "failed"
+            ):
+                raise TransitionError(
+                    "operator retry requires a blocked failed delivery"
+                )
             now = self._now_text()
             self._connection.execute(
                 "UPDATE deliveries SET phase = NULL, consecutive_failures = 0, "
@@ -2161,7 +2428,9 @@ class StateRepository:
         bucket = _validate_bucket(bucket)
         weekdays_tuple = tuple(sorted(set(weekdays)))
         if not weekdays_tuple or any(day < 0 or day > 6 for day in weekdays_tuple):
-            raise StateValidationError("schedule weekdays must be integers from 0 through 6")
+            raise StateValidationError(
+                "schedule weekdays must be integers from 0 through 6"
+            )
         _validate_timezone(timezone)
         _validate_local_time(local_time)
         if not 0 <= misfire_grace_seconds <= 86400:
@@ -2300,7 +2569,9 @@ class StateRepository:
                     )
                 )
                 if stored != expected:
-                    raise ConflictError("schedule occurrence already has a different claim")
+                    raise ConflictError(
+                        "schedule occurrence already has a different claim"
+                    )
                 return self._schedule_run_from_row(existing)
             schedule = self._schedule_row(schedule_key)
             if not bool(schedule["enabled"]):
@@ -2436,31 +2707,44 @@ class StateRepository:
     def next_selection_counter(self, profile_id: str) -> int:
         with self._transaction():
             self._require_profile(profile_id)
-            row = self._connection.execute(
-                "SELECT lifetime_counter FROM selection_counters WHERE profile_id = ?",
-                (profile_id,),
-            ).fetchone()
-            current = 0 if row is None else int(row[0])
-            if row is None:
-                self._connection.execute(
-                    "INSERT INTO selection_counters(profile_id, lifetime_counter, updated_at) "
-                    "VALUES (?, 1, ?)",
-                    (profile_id, self._now_text()),
-                )
-            else:
-                self._connection.execute(
-                    "UPDATE selection_counters SET lifetime_counter = lifetime_counter + 1, "
-                    "updated_at = ? WHERE profile_id = ?",
-                    (self._now_text(), profile_id),
-                )
+            current = self._selection_counter_locked(profile_id)
+            self._write_selection_counter_locked(profile_id, current + 1)
         return current
+
+    def selection_counter(self, profile_id: str) -> int:
+        """Read the persisted RANDOM selection counter without consuming it."""
+
+        self._require_profile(profile_id)
+        return self._selection_counter_locked(profile_id)
+
+    def _selection_counter_locked(self, profile_id: str) -> int:
+        row = self._connection.execute(
+            "SELECT lifetime_counter FROM selection_counters WHERE profile_id = ?",
+            (profile_id,),
+        ).fetchone()
+        return 0 if row is None else int(row[0])
+
+    def _write_selection_counter_locked(self, profile_id: str, value: int) -> None:
+        updated = self._connection.execute(
+            "UPDATE selection_counters SET lifetime_counter = ?, updated_at = ? "
+            "WHERE profile_id = ?",
+            (value, self._now_text(), profile_id),
+        )
+        if updated.rowcount == 0:
+            self._connection.execute(
+                "INSERT INTO selection_counters(profile_id, lifetime_counter, updated_at) "
+                "VALUES (?, ?, ?)",
+                (profile_id, value, self._now_text()),
+            )
 
     def set_paused(self, paused: bool, *, expected_revision: int) -> PauseRecord:
         with self._transaction():
             row = self._connection.execute(
                 "SELECT * FROM pause_state WHERE singleton = 1"
             ).fetchone()
-            self._require_revision(cast(sqlite3.Row, row), expected_revision, "pause state")
+            self._require_revision(
+                cast(sqlite3.Row, row), expected_revision, "pause state"
+            )
             self._connection.execute(
                 "UPDATE pause_state SET paused = ?, revision = revision + 1, updated_at = ? "
                 "WHERE singleton = 1",
@@ -2548,7 +2832,9 @@ class StateRepository:
         if confirmation_required and (
             approved_intent_id is None or approved_intent_id != intent_id
         ):
-            raise TransitionError("run request requires an approved confirmation intent")
+            raise TransitionError(
+                "run request requires an approved confirmation intent"
+            )
         if not confirmation_required and intent_id is not None:
             raise StateValidationError(
                 "run request action does not accept a confirmation intent"
@@ -2620,7 +2906,10 @@ class StateRepository:
         result_json = self._safe_json(result)
         with self._transaction():
             row = self._request_row(request_id)
-            if str(row["status"]) != "claimed" or str(row["worker_token"]) != worker_token:
+            if (
+                str(row["status"]) != "claimed"
+                or str(row["worker_token"]) != worker_token
+            ):
                 raise TransitionError("run request is not claimed by this worker")
             self._connection.execute(
                 "UPDATE run_requests SET status = ?, result_json = ?, "
@@ -2656,10 +2945,14 @@ class StateRepository:
             raise StateValidationError("resource revision must be non-negative")
         if fingerprint is not None:
             _validate_sha256(fingerprint, "confirmation fingerprint")
-        consequence = self._safe_text(consequence, "confirmation consequence", maximum=512)
+        consequence = self._safe_text(
+            consequence, "confirmation consequence", maximum=512
+        )
         expires_text = _timestamp(expires_at)
         if _parse_timestamp(expires_text) <= self._now():
-            raise StateValidationError("confirmation intent expiry must be in the future")
+            raise StateValidationError(
+                "confirmation intent expiry must be in the future"
+            )
         arguments_json = self._safe_json(arguments)
         intent_id = secrets.token_hex(16)
         nonce = secrets.token_hex(32)
@@ -2726,7 +3019,9 @@ class StateRepository:
             row = self._intent_row(intent_id)
             self._require_revision(row, expected_revision, "confirmation intent")
             if str(row["state"]) != "pending":
-                raise TransitionError("only a pending confirmation intent can be approved")
+                raise TransitionError(
+                    "only a pending confirmation intent can be approved"
+                )
             if _parse_timestamp(str(row["expires_at"])) <= self._now():
                 self._expire_intent_locked(intent_id)
                 expired = True
@@ -2828,7 +3123,9 @@ class StateRepository:
                         ),
                     )
                     if consumed.rowcount != 1:
-                        raise ConflictError("confirmation intent consumption became stale")
+                        raise ConflictError(
+                            "confirmation intent consumption became stale"
+                        )
         if expired:
             raise TransitionError("confirmation intent expired")
         return cast(RunRequestRecord, result)
@@ -2878,7 +3175,9 @@ class StateRepository:
                     )
                 )
                 if stored != expected:
-                    raise ConflictError("admission journal conflicts with existing bundle")
+                    raise ConflictError(
+                        "admission journal conflicts with existing bundle"
+                    )
                 return self._admission_from_row(existing)
             now = self._now_text()
             try:
@@ -2999,10 +3298,10 @@ class StateRepository:
             if phase == "rolled_back":
                 allowed = True
             else:
-                allowed = (
-                    (current, phase)
-                    in {("copying", "ready_installed"), ("ready_installed", "installed")}
-                )
+                allowed = (current, phase) in {
+                    ("copying", "ready_installed"),
+                    ("ready_installed", "installed"),
+                }
             if not allowed:
                 raise TransitionError("admission phase cannot move backward")
             if phase == "ready_installed":
@@ -3125,9 +3424,13 @@ class StateRepository:
     def _processing_metadata_json(self, metadata: Mapping[str, object]) -> str:
         unknown = set(metadata) - _PROCESSING_METADATA_KEYS
         if unknown:
-            raise StateValidationError("processing metadata contains unsupported fields")
+            raise StateValidationError(
+                "processing metadata contains unsupported fields"
+            )
         for key, value in metadata.items():
-            if not isinstance(value, (str, int, float, bool)) or isinstance(value, complex):
+            if not isinstance(value, (str, int, float, bool)) or isinstance(
+                value, complex
+            ):
                 raise StateValidationError("processing metadata values must be scalar")
             if isinstance(value, str) and len(value) > 256:
                 raise StateValidationError("processing metadata value is too long")
@@ -3163,7 +3466,9 @@ class StateRepository:
                 try:
                     parsed = _parse_timestamp(value)
                 except (TypeError, ValueError, OverflowError):
-                    raise StateValidationError("processing deadline is invalid") from None
+                    raise StateValidationError(
+                        "processing deadline is invalid"
+                    ) from None
                 if _timestamp(parsed) != value:
                     raise StateValidationError("processing deadline is invalid")
         return self._safe_json(dict(metadata))
@@ -3178,7 +3483,9 @@ class StateRepository:
                 allow_nan=False,
             )
         except (TypeError, ValueError):
-            raise StateValidationError("durable metadata must be bounded JSON") from None
+            raise StateValidationError(
+                "durable metadata must be bounded JSON"
+            ) from None
         if len(rendered.encode("utf-8")) > 65536:
             raise StateValidationError("durable metadata exceeds the size limit")
         self._reject_secret(rendered)
@@ -3188,7 +3495,9 @@ class StateRepository:
         if (
             not value
             or len(value) > maximum
-            or any(ord(character) < 32 and character not in "\t\n" for character in value)
+            or any(
+                ord(character) < 32 and character not in "\t\n" for character in value
+            )
         ):
             raise StateValidationError(f"{label} is invalid")
         self._reject_secret(value)
@@ -3196,7 +3505,9 @@ class StateRepository:
 
     def _reject_secret(self, rendered: str) -> None:
         if any(secret in rendered for secret in self._secrets):
-            raise StateValidationError("durable operator context contains a configured secret")
+            raise StateValidationError(
+                "durable operator context contains a configured secret"
+            )
 
     def _intent_binding(
         self,
@@ -3253,13 +3564,15 @@ class StateRepository:
         else:
             raise StateValidationError("run request action is not allow-listed")
 
-        if bundle_key is not None and str(
-            self._bundle_row(bundle_key)["profile_id"]
-        ) != profile_id:
+        if (
+            bundle_key is not None
+            and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id
+        ):
             raise ConflictError("run request bundle belongs to another profile")
-        if schedule_key is not None and str(
-            self._schedule_row(schedule_key)["profile_id"]
-        ) != profile_id:
+        if (
+            schedule_key is not None
+            and str(self._schedule_row(schedule_key)["profile_id"]) != profile_id
+        ):
             raise ConflictError("run request schedule belongs to another profile")
 
         if action in _ALWAYS_CONFIRMED_ACTIONS:
@@ -3273,9 +3586,11 @@ class StateRepository:
                 "AND state IN ('queued', 'due', 'dispatching') LIMIT 1",
                 (schedule_key,),
             ).fetchone()
-            return bool(schedule["enabled"]) or due is not None or arguments.get(
-                "enabled"
-            ) is True
+            return (
+                bool(schedule["enabled"])
+                or due is not None
+                or arguments.get("enabled") is True
+            )
         return False
 
     def _assert_request_resource_revision_locked(
@@ -3339,9 +3654,7 @@ class StateRepository:
             schedule = self._schedule_row(schedule_key)
             if str(schedule["profile_id"]) != profile_id:
                 raise ConflictError("confirmation schedule belongs to another profile")
-            self._require_revision(
-                schedule, resource_revision, "confirmation schedule"
-            )
+            self._require_revision(schedule, resource_revision, "confirmation schedule")
             if fingerprint is None or str(schedule["config_hash"]) != fingerprint:
                 raise ConflictError("confirmation schedule fingerprint drift")
             return
@@ -3437,9 +3750,12 @@ class StateRepository:
         return cast(sqlite3.Row, row)
 
     def _require_profile(self, profile_id: str) -> None:
-        if self._connection.execute(
-            "SELECT 1 FROM profiles WHERE profile_id = ?", (profile_id,)
-        ).fetchone() is None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM profiles WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
+            is None
+        ):
             raise StateValidationError("unknown profile")
 
     @staticmethod
@@ -3510,6 +3826,8 @@ class StateRepository:
             archive_path=cast(str | None, row["archive_path"]),
             ready_marker_name=str(row["ready_marker_name"]),
             ready_marker_archived=bool(row["ready_marker_archived"]),
+            claimed_by_type=cast(str | None, row["claimed_by_type"]),
+            claimed_by_id=cast(str | None, row["claimed_by_id"]),
         )
 
     def _bundle_file_from_row(self, row: sqlite3.Row) -> BundleFileSnapshot:
@@ -3603,7 +3921,9 @@ class StateRepository:
             request_id=int(row["request_id"]),
             profile_id=str(row["profile_id"]),
             action=str(row["action"]),
-            arguments=cast(Mapping[str, object], json.loads(str(row["arguments_json"]))),
+            arguments=cast(
+                Mapping[str, object], json.loads(str(row["arguments_json"]))
+            ),
             idempotency_key=str(row["idempotency_key"]),
             expected_revision=int(row["expected_revision"]),
             bundle_key=cast(int | None, row["bundle_key"]),
@@ -3622,7 +3942,9 @@ class StateRepository:
         return ConfirmationIntentRecord(
             intent_id=str(row["intent_id"]),
             action=str(row["action"]),
-            arguments=cast(Mapping[str, object], json.loads(str(row["arguments_json"]))),
+            arguments=cast(
+                Mapping[str, object], json.loads(str(row["arguments_json"]))
+            ),
             profile_id=str(row["profile_id"]),
             bundle_key=cast(int | None, row["bundle_key"]),
             schedule_key=cast(int | None, row["schedule_key"]),
@@ -3742,7 +4064,9 @@ def _validate_local_time(value: str) -> None:
 def _timestamp(value: datetime | None) -> str:
     if value is None or value.tzinfo is None or value.utcoffset() is None:
         raise StateValidationError("timestamp must be timezone-aware")
-    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return (
+        value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -3764,11 +4088,28 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _random_selection_score(
+    profile_id: str, counter: int, candidate: BundleAdmissionCandidate
+) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(_RANDOM_SELECTION_DOMAIN)
+    for value in (
+        profile_id.encode("utf-8"),
+        str(counter).encode("ascii"),
+        candidate.bundle_id.encode("utf-8"),
+        candidate.fingerprint.encode("ascii"),
+    ):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.digest()
+
+
 __all__ = [
     "AdmissionMemberRecord",
     "AdmissionRecord",
     "ArtifactRecord",
     "BundleFileSnapshot",
+    "BundleAdmissionCandidate",
     "BundleRecord",
     "ConfirmationIntentRecord",
     "ConflictError",

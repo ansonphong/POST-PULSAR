@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 from pathlib import Path
 
@@ -239,6 +240,22 @@ def test_publishable_buckets_require_ready_and_exclude_drafts(tmp_path: Path) ->
     queued = next(item for item in scan.bundles if item.directory == queue)
     assert ".ready" not in [member.name for member in queued.content.members]
     assert queued.content.fingerprint == scan_inbox(queue).bundles[0].fingerprint
+    image_snapshot = queued.content.member_snapshots[0]
+    assert image_snapshot.relative_name == "Zulu.jpg"
+    assert image_snapshot.role == "image"
+    assert image_snapshot.size_bytes == len(b"media")
+    assert image_snapshot.sha256 == hashlib.sha256(b"media").hexdigest()
+
+
+def test_nonempty_ready_marker_is_rejected_before_publication(tmp_path: Path) -> None:
+    root = tmp_path / "account"
+    directory = _ready_bundle(root, "QUEUE", "post", "post.jpg")
+    (directory / ".ready").write_bytes(b"not-empty")
+
+    scan = scan_account_root(root)
+
+    assert scan.bundles == ()
+    assert "unsafe_ready_marker" in _codes(scan)
 
 
 @pytest.mark.parametrize(

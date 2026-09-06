@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from post_pulsar.state import (
+    BundleAdmissionCandidate,
     BundleFileSnapshot,
     ConflictError,
     MigrationRequiredError,
@@ -144,6 +145,15 @@ def test_schema_initialization_reopen_and_pragmas_are_idempotent(
         assert repository.schema_version == 1
 
 
+def test_open_existing_never_initializes_missing_state(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "post_pulsar.sqlite3"
+
+    with pytest.raises(MigrationRequiredError, match="does not exist"):
+        StateRepository.open_existing(path)
+
+    assert not path.exists()
+
+
 def test_public_readers_reconstruct_profile_work_after_reopen(tmp_path: Path) -> None:
     clock = FakeClock()
     path = tmp_path / "reconstruct.sqlite3"
@@ -260,15 +270,19 @@ def test_profile_identity_and_active_root_snapshot_are_immutable(
 
     claim = _claim(repository, bundle_key, "x", "archive-claim")
     repository.advance_delivery_phase(
-        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
     )
     repository.publish_delivery(
-        bundle_key, "x", remote_id="tweet-archive", **claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        remote_id="tweet-archive",
+        **claim,  # type: ignore[arg-type]
     )
     repository.begin_archiving(bundle_key, expected_revision=1)
-    repository.checkpoint_archive_member(
-        bundle_key, "post.jpg", sha256="a" * 64
-    )
+    repository.checkpoint_archive_member(bundle_key, "post.jpg", sha256="a" * 64)
     repository.checkpoint_archive_member(
         bundle_key, ".ready", sha256=hashlib.sha256(b"").hexdigest()
     )
@@ -291,7 +305,10 @@ def test_archive_conflict_can_transition_archiving_bundle_to_blocked(
     bundle_key = _bundle(repository)
     claim = _claim(repository, bundle_key, "x", "archive-block-claim")
     repository.advance_delivery_phase(
-        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
     )
     repository.publish_delivery(
         bundle_key,
@@ -712,10 +729,16 @@ def test_published_resets_consecutive_failures_and_preserves_lifetime_attempts(
     )
     second_claim = _claim(repository, bundle_key, "x", "two")
     repository.advance_delivery_phase(
-        bundle_key, "x", "final_dispatch_started", **second_claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **second_claim,  # type: ignore[arg-type]
     )
     delivery = repository.publish_delivery(
-        bundle_key, "x", remote_id="tweet-1", **second_claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        remote_id="tweet-1",
+        **second_claim,  # type: ignore[arg-type]
     )
 
     assert delivery.status == "published"
@@ -731,11 +754,16 @@ def test_stale_final_dispatch_is_ambiguous_and_never_auto_retried(
     bundle_key = _bundle(repository)
     claim = _claim(repository, bundle_key, "x", "claim")
     repository.advance_delivery_phase(
-        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
     )
     clock.advance(hours=1)
 
-    recovered = repository.recover_stale(clock() - timedelta(minutes=30))
+    recovered = repository.recover_stale(
+        clock() - timedelta(minutes=30), profile_id="ansonphong"
+    )
 
     assert recovered == ((bundle_key, "x", "ambiguous"),)
     assert repository.get_delivery(bundle_key, "x").status == "ambiguous"
@@ -752,7 +780,10 @@ def test_uncertain_final_result_can_be_marked_ambiguous_transactionally(
     bundle_key = _bundle(repository)
     claim = _claim(repository, bundle_key, "x", "claim")
     repository.advance_delivery_phase(
-        bundle_key, "x", "final_dispatch_started", **claim  # type: ignore[arg-type]
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
     )
 
     delivery = repository.mark_delivery_ambiguous(
@@ -778,16 +809,110 @@ def test_stale_pre_final_attempt_becomes_safely_retryable_failure(
     claim = _claim(repository, bundle_key, "x", "claim")
     if phase != "preparing":
         repository.advance_delivery_phase(
-            bundle_key, "x", phase, **claim  # type: ignore[arg-type]
+            bundle_key,
+            "x",
+            phase,
+            **claim,  # type: ignore[arg-type]
         )
     clock.advance(hours=1)
 
-    recovered = repository.recover_stale(clock() - timedelta(minutes=30))
+    recovered = repository.recover_stale(
+        clock() - timedelta(minutes=30), profile_id="ansonphong"
+    )
 
     assert recovered == ((bundle_key, "x", "failed"),)
     delivery = repository.get_delivery(bundle_key, "x")
     assert delivery.safe_to_retry
     assert delivery.consecutive_failures == 1
+
+
+def test_profile_scoped_stale_recovery_reclaims_same_attempt_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    first = _bundle(repository)
+    claim = _claim(repository, first, "x", "old-claim")
+    artifact = repository.checkpoint_artifact(
+        first,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="resume-media",
+        expires_at=clock() + timedelta(hours=2),
+        **claim,  # type: ignore[arg-type]
+    )
+    repository.register_profile(
+        "second",
+        tmp_path / "accounts/second",
+        (
+            ProfileTargetSnapshot(
+                "x", "30001", "second", "POST_PULSAR_X_SECOND_USER_ACCESS_TOKEN", {}
+            ),
+        ),
+        config_hash="9" * 64,
+    )
+    second = repository.add_bundle(
+        profile_id="second",
+        bundle_id="other",
+        fingerprint="d" * 64,
+        source_bucket="QUEUE",
+        files=(_file("other.jpg"),),
+        targets=(
+            TargetSnapshot(
+                "x",
+                "30001",
+                "second",
+                "POST_PULSAR_X_SECOND_USER_ACCESS_TOKEN",
+                "2",
+                1,
+                {},
+            ),
+        ),
+    )
+    second_claim = _claim(repository, second, "x", "other-claim")
+    clock.advance(hours=1)
+
+    recovered = repository.recover_stale(
+        clock() - timedelta(minutes=30),
+        profile_id="ansonphong",
+        reclaim_token="new-claim",
+    )
+
+    assert recovered == ((first, "x", "resumed"),)
+    resumed = repository.get_delivery(first, "x")
+    assert resumed.attempt_count == claim["attempt_count"]
+    assert repository.list_delivery_artifacts(first, "x") == (artifact,)
+    assert (
+        repository.get_delivery(second, "x").attempt_count
+        == second_claim["attempt_count"]
+    )
+
+
+def test_definite_final_rejection_is_failed_and_guarded_not_ambiguous(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository)
+    claim = _claim(repository, bundle_key, "x", "final-reject")
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
+    )
+
+    rejected = repository.reject_final_delivery(
+        bundle_key,
+        "x",
+        error_code="permission_denied",
+        error_message="The platform rejected publication.",
+        **claim,  # type: ignore[arg-type]
+    )
+
+    assert rejected.status == "failed"
+    assert not rejected.safe_to_retry
+    assert repository.get_bundle(bundle_key).status == "blocked"
 
 
 def test_operator_retry_is_guarded_and_resets_only_consecutive_failures(
@@ -897,6 +1022,104 @@ def test_schedule_occurrence_content_claim_and_random_counter_are_atomic(
     assert repository.next_selection_counter("ansonphong") == 1
 
 
+def test_transactional_random_admission_selects_fixed_sha256_score_and_links_trigger(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    candidates = (
+        BundleAdmissionCandidate("Zulu", "b" * 64, (_file("Zulu.jpg"),)),
+        BundleAdmissionCandidate("alpha", "c" * 64, (_file("alpha.jpg"),)),
+    )
+
+    admitted = repository.admit_selected_bundle(
+        profile_id="ansonphong",
+        source_bucket="RANDOM",
+        candidates=candidates,
+        targets=(_target(),),
+        trigger_id="manual-42",
+    )
+
+    def score(candidate: BundleAdmissionCandidate) -> bytes:
+        digest = hashlib.sha256()
+        digest.update(b"POST-PULSAR-RANDOM-SELECTION\x00V1\x00")
+        for value in (
+            "ansonphong".encode(),
+            b"0",
+            candidate.bundle_id.encode(),
+            candidate.fingerprint.encode(),
+        ):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        return digest.digest()
+
+    expected = min(
+        candidates,
+        key=lambda item: (score(item), item.bundle_id.casefold(), item.bundle_id),
+    )
+    assert admitted.bundle_id == expected.bundle_id
+    assert admitted.claimed_by_type == "run_once"
+    assert admitted.claimed_by_id == "manual-42"
+    assert repository.selection_counter("ansonphong") == 1
+    replay = repository.admit_selected_bundle(
+        profile_id="ansonphong",
+        source_bucket="RANDOM",
+        candidates=candidates,
+        targets=(_target(),),
+        trigger_id="manual-42",
+    )
+    assert replay == admitted
+    assert repository.selection_counter("ansonphong") == 1
+
+
+def test_transactional_admission_rolls_back_selection_counter_on_snapshot_conflict(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    candidate = BundleAdmissionCandidate("post", "b" * 64, (_file("post.jpg"),))
+    mismatched = TargetSnapshot(
+        platform="x",
+        expected_remote_user_id="99999",
+        expected_username="ansonphong",
+        token_env_var="POST_PULSAR_X_ANSONPHONG_USER_ACCESS_TOKEN",
+        api_version="2",
+        adapter_version=1,
+        request_settings={"timeout": 30, "chunk_size": 4194304},
+    )
+
+    with pytest.raises(ConflictError, match="target snapshot"):
+        repository.admit_selected_bundle(
+            profile_id="ansonphong",
+            source_bucket="RANDOM",
+            candidates=(candidate,),
+            targets=(mismatched,),
+            trigger_id="manual-42",
+        )
+
+    assert repository.selection_counter("ansonphong") == 0
+    assert repository.list_active_bundles("ansonphong") == ()
+
+
+@pytest.mark.parametrize("bucket", ["QUEUE", "REELS"])
+def test_transactional_ordered_admission_uses_casefolded_id_without_consuming_random_counter(
+    tmp_path: Path, bucket: str
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    admitted = repository.admit_selected_bundle(
+        profile_id="ansonphong",
+        source_bucket=bucket,  # type: ignore[arg-type]
+        candidates=(
+            BundleAdmissionCandidate("Zulu", "b" * 64, (_file("Zulu.jpg"),)),
+            BundleAdmissionCandidate("alpha", "c" * 64, (_file("alpha.jpg"),)),
+        ),
+        targets=(_target(),),
+        trigger_id="scheduler-7",
+    )
+
+    assert admitted.bundle_id == "alpha"
+    assert admitted.claimed_by_id == "scheduler-7"
+    assert repository.selection_counter("ansonphong") == 0
+
+
 def test_schedule_and_pause_revisions_reject_stale_writes(tmp_path: Path) -> None:
     repository = _repository(tmp_path, FakeClock())
     schedule = repository.create_schedule(
@@ -935,13 +1158,16 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
         idempotency_key="request-1",
         expected_revision=1,
     )
-    assert repository.create_run_request(
-        profile_id="ansonphong",
-        action="pause",
-        arguments={},
-        idempotency_key="request-1",
-        expected_revision=1,
-    ) == request
+    assert (
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="pause",
+            arguments={},
+            idempotency_key="request-1",
+            expected_revision=1,
+        )
+        == request
+    )
     with pytest.raises(ConflictError, match="idempotency"):
         repository.create_run_request(
             profile_id="ansonphong",
@@ -1064,14 +1290,17 @@ def test_nonconfirmed_request_revision_is_atomic_and_replay_is_canonical(
         schedule.schedule_key, True, expected_revision=schedule.revision
     )
 
-    assert repository.create_run_request(
-        profile_id="ansonphong",
-        action="schedule_disable",
-        arguments={"enabled": False},
-        idempotency_key="disable-revision-1",
-        expected_revision=schedule.revision,
-        schedule_key=schedule.schedule_key,
-    ) == request
+    assert (
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="schedule_disable",
+            arguments={"enabled": False},
+            idempotency_key="disable-revision-1",
+            expected_revision=schedule.revision,
+            schedule_key=schedule.schedule_key,
+        )
+        == request
+    )
     with pytest.raises(ConflictError, match="revision"):
         repository.create_run_request(
             profile_id="ansonphong",
@@ -1235,7 +1464,10 @@ def test_stale_delivery_worker_cannot_mutate_a_new_attempt(tmp_path: Path) -> No
 
     with pytest.raises(ConflictError, match="claim"):
         repository.advance_delivery_phase(
-            bundle_key, "x", "processing", **stale  # type: ignore[arg-type]
+            bundle_key,
+            "x",
+            "processing",
+            **stale,  # type: ignore[arg-type]
         )
     with pytest.raises(ConflictError, match="claim"):
         repository.checkpoint_artifact(
@@ -1303,13 +1535,16 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
             idempotency_key="missing-bundle",
             expected_revision=1,
         )
-    assert repository.create_run_request(
-        profile_id="ansonphong",
-        action="pause",
-        arguments={},
-        idempotency_key="safe-pause",
-        expected_revision=1,
-    ).status == "queued"
+    assert (
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="pause",
+            arguments={},
+            idempotency_key="safe-pause",
+            expected_revision=1,
+        ).status
+        == "queued"
+    )
 
     intent = repository.create_confirmation_intent(
         action="run_now",
@@ -1455,9 +1690,12 @@ def test_admission_members_are_immutable_monotonic_and_verified_before_ready(
         "ready_installed",
         expected_revision=repository.get_admission(journal.journal_id).revision,
     )
-    assert repository.advance_admission(
-        journal.journal_id, "installed", expected_revision=ready.revision
-    ).phase == "installed"
+    assert (
+        repository.advance_admission(
+            journal.journal_id, "installed", expected_revision=ready.revision
+        ).phase
+        == "installed"
+    )
 
 
 def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> None:
@@ -1496,9 +1734,12 @@ def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> N
         utc_offset_minutes=0,
         schedule_hash=schedule.config_hash,
     )
-    assert repository.transition_schedule_run(
-        second.run_id, "missed", expected_revision=second.revision
-    ).state == "missed"
+    assert (
+        repository.transition_schedule_run(
+            second.run_id, "missed", expected_revision=second.revision
+        ).state
+        == "missed"
+    )
 
     third = repository.create_schedule_occurrence(
         schedule.schedule_key,
@@ -1520,9 +1761,12 @@ def test_schedule_runs_expose_every_recoverable_graph_state(tmp_path: Path) -> N
     still_dispatching = repository.get_schedule_run(third.run_id)
     assert still_dispatching.state == "dispatching"
     assert still_dispatching.bundle_key == bundle_key
-    assert repository.transition_schedule_run(
-        third.run_id, "failed", expected_revision=still_dispatching.revision
-    ).state == "failed"
+    assert (
+        repository.transition_schedule_run(
+            third.run_id, "failed", expected_revision=still_dispatching.revision
+        ).state
+        == "failed"
+    )
 
 
 @pytest.mark.parametrize(

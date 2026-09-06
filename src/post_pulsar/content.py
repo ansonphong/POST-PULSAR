@@ -46,7 +46,21 @@ class ContentBundle:
     images: tuple[Path, ...]
     video: Path | None
     members: tuple[Path, ...]
+    member_snapshots: tuple[ContentMemberSnapshot, ...]
     fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContentMemberSnapshot:
+    """Hash and semantics captured from the same bytes used by the fingerprint."""
+
+    relative_name: str
+    role: str
+    ordinal: int | None
+    media_kind: str | None
+    mime_type: str | None
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,8 +280,12 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
     return InboxScan(bundles=tuple(bundles), issues=tuple(issues))
 
 
-def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
-    """Discover ready immediate bundle directories without inspecting DRAFTS."""
+def scan_account_root(
+    directory: str | os.PathLike[str],
+    *,
+    buckets: tuple[SourceBucket, ...] | None = None,
+) -> AccountScan:
+    """Discover ready bundle directories in all or selected publishable buckets."""
 
     supplied_root = Path(directory).expanduser()
     if supplied_root.is_symlink():
@@ -279,6 +297,13 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
     root_before = os.lstat(root)
     if not stat.S_ISDIR(root_before.st_mode):
         raise NotADirectoryError(root)
+
+    selected_buckets = _PUBLISHABLE_BUCKETS if buckets is None else buckets
+    if not selected_buckets or any(
+        bucket not in _PUBLISHABLE_BUCKETS for bucket in selected_buckets
+    ):
+        raise ValueError("publishable bucket selection is invalid")
+    selected_buckets = tuple(dict.fromkeys(selected_buckets))
 
     issues: list[InboxIssue] = []
     candidates: list[PublishableBundle] = []
@@ -309,7 +334,7 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
                 "The ready marker is valid only inside a bundle directory.",
             )
         )
-    for bucket in _PUBLISHABLE_BUCKETS:
+    for bucket in selected_buckets:
         bucket_path = root / bucket
         try:
             bucket_before = os.lstat(bucket_path)
@@ -393,7 +418,7 @@ def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
     issues.sort(key=_issue_sort_key)
     if any(issue.severity == "error" for issue in issues):
         return AccountScan(bundles=(), issues=tuple(issues))
-    bucket_order = {name: index for index, name in enumerate(_PUBLISHABLE_BUCKETS)}
+    bucket_order = {name: index for index, name in enumerate(selected_buckets)}
     candidates.sort(
         key=lambda item: (
             bucket_order[item.bucket],
@@ -518,7 +543,7 @@ def _scan_bundle_directory(
             )
             continue
         if entry.name == ".ready":
-            if stat.S_ISREG(entry_stat.st_mode):
+            if stat.S_ISREG(entry_stat.st_mode) and entry_stat.st_size == 0:
                 ready_before = entry_stat
             else:
                 issues.append(
@@ -526,7 +551,7 @@ def _scan_bundle_directory(
                         "unsafe_ready_marker",
                         entry,
                         bundle_id,
-                        "The canonical ready marker must be a regular file.",
+                        "The canonical ready marker must be an empty regular file.",
                     )
                 )
             continue
@@ -619,6 +644,7 @@ def _scan_bundle_directory(
     if not (
         stat.S_ISDIR(directory_after.st_mode)
         and stat.S_ISREG(ready_after.st_mode)
+        and ready_after.st_size == 0
         and _same_file_identity(directory_before, directory_after)
         and _same_file_identity(cast(os.stat_result, ready_before), ready_after)
     ):
@@ -906,7 +932,9 @@ def _build_bundle(
     ordered_entries.extend(videos)
     members = tuple(entry.path for entry in ordered_entries)
     try:
-        fingerprint = _fingerprint(ordered_entries, captured_text_bytes)
+        fingerprint, member_snapshots = _fingerprint(
+            ordered_entries, captured_text_bytes
+        )
     except OSError:
         issue = _bundle_issue(
             "unreadable_member",
@@ -924,14 +952,18 @@ def _build_bundle(
             images=ordered_images,
             video=videos[0].path if videos else None,
             members=members,
+            member_snapshots=member_snapshots,
             fingerprint=fingerprint,
         ),
         (),
     )
 
 
-def _fingerprint(entries: list[_Member], captured_bytes: Mapping[Path, bytes]) -> str:
+def _fingerprint(
+    entries: list[_Member], captured_bytes: Mapping[Path, bytes]
+) -> tuple[str, tuple[ContentMemberSnapshot, ...]]:
     digest = hashlib.sha256()
+    snapshots: list[ContentMemberSnapshot] = []
     digest.update(_FINGERPRINT_DOMAIN)
     digest.update(len(entries).to_bytes(8, "big"))
     for entry in entries:
@@ -946,13 +978,43 @@ def _fingerprint(entries: list[_Member], captured_bytes: Mapping[Path, bytes]) -
         if captured is not None:
             digest.update(len(captured).to_bytes(8, "big"))
             digest.update(captured)
-            continue
-        with _open_regular(entry.path) as source:
-            size = os.fstat(source.fileno()).st_size
-            digest.update(size.to_bytes(8, "big"))
-            while chunk := source.read(_READ_CHUNK_SIZE):
-                digest.update(chunk)
-    return digest.hexdigest()
+            member_sha = hashlib.sha256(captured).hexdigest()
+            size = len(captured)
+        else:
+            member_digest = hashlib.sha256()
+            with _open_regular(entry.path) as source:
+                size = os.fstat(source.fileno()).st_size
+                digest.update(size.to_bytes(8, "big"))
+                while chunk := source.read(_READ_CHUNK_SIZE):
+                    digest.update(chunk)
+                    member_digest.update(chunk)
+            member_sha = member_digest.hexdigest()
+        media_kind = entry.role if entry.role in {"image", "video"} else None
+        snapshots.append(
+            ContentMemberSnapshot(
+                relative_name=entry.path.name,
+                role=entry.role,
+                ordinal=entry.ordinal,
+                media_kind=media_kind,
+                mime_type=_member_mime_type(entry),
+                size_bytes=size,
+                sha256=member_sha,
+            )
+        )
+    return digest.hexdigest(), tuple(snapshots)
+
+
+def _member_mime_type(entry: _Member) -> str | None:
+    if entry.role in {"caption", "alt_text"}:
+        return "text/plain"
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+    }.get(entry.path.suffix.casefold())
 
 
 def _hash_field(digest: _Hasher, value: bytes) -> None:
@@ -1041,6 +1103,7 @@ def _issue_sort_key(issue: InboxIssue) -> tuple[str, str, int, str, str]:
 __all__ = [
     "AccountScan",
     "ContentBundle",
+    "ContentMemberSnapshot",
     "InboxIssue",
     "InboxScan",
     "PublishableBundle",
