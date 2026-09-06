@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75.6"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,7 +16,7 @@ dependencies = [
     "Pillow>=12.3.0,<13",
     "platformdirs>=4.11.7,<5",
     "pydantic>=2.13.5,<3",
-    "tzdata>=2025.3",
+    "tzdata>=2026.3",
 ]
 
 [project.scripts]
@@ -32,7 +32,9 @@ dev = [
     "pytest-socket>=0.8.1,<1",
     "respx>=0.23.1,<1",
     "ruff>=0.16.6,<1",
+    "setuptools==84.0.0",
     "uv==0.12.10",
+    "wheel>=0.46.1,<1",
 ]
 
 [dependency-groups]
@@ -45,8 +47,14 @@ dev = [
     "pytest-socket>=0.8.1,<1",
     "respx>=0.23.1,<1",
     "ruff>=0.16.6,<1",
+    "setuptools==84.0.0",
     "uv==0.12.10",
+    "wheel>=0.46.1,<1",
 ]
+
+[tool.uv]
+# Lock resolution refreshed on 2026-09-05; exclude later uploads.
+exclude-newer = "2026-09-06T00:00:00Z"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -57,7 +65,10 @@ line-length = 88
 src = ["src"]
 
 [tool.ruff.lint]
-select = ["ALL"]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "S", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "S108", "S311"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -71,3 +82,12 @@ packages = ["post_pulsar"]
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "--disable-socket"]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["post_pulsar"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true

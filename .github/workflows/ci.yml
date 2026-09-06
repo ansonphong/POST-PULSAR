@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.10"
+          enable-cache: false
+      - name: Install frozen dependencies
+        run: uv sync --frozen --all-extras --dev
+      - name: Check lock consistency
+        run: uv lock --check
+        env:
+          UV_OFFLINE: "true"
+      - name: Check formatting
+        run: uv run --frozen ruff format --check .
+        env:
+          UV_OFFLINE: "true"
+      - name: Lint
+        run: uv run --frozen ruff check .
+        env:
+          UV_OFFLINE: "true"
+      - name: Type check
+        run: uv run --frozen mypy
+        env:
+          UV_OFFLINE: "true"
+      - name: Test without sockets and collect coverage
+        run: uv run --frozen pytest --disable-socket --cov=post_pulsar --cov-report=term-missing tests
+        env:
+          UV_OFFLINE: "true"
+      - name: Build package
+        run: uv run --frozen python -m build --no-isolation
+        env:
+          UV_OFFLINE: "true"
+      - name: Audit the locked dependency graph
+        run: uv run --frozen pip-audit --locked .
