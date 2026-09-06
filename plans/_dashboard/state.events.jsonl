@@ -36,3 +36,9 @@
 {"event":"commit","sha":"dab484e","message":"fix(media): close failed public staging descriptors","time":"2026-09-06T04:42:18Z"}
 {"event":"commit","sha":"d7e0382","message":"fix(state): expose durable recovery readers","time":"2026-09-06T04:42:55Z"}
 {"event":"commit","sha":"ba71b88","message":"chore(plan): mark T2.1 DONE","time":"2026-09-06T04:43:02Z"}
+{"event":"commit","sha":"c76d33a","message":"chore(plan): mark T2.2 DONE","time":"2026-09-06T04:45:37Z"}
+{"event":"commit","sha":"4227f8f","message":"feat(state): add archive member checkpoints","time":"2026-09-06T04:48:32Z"}
+{"event":"commit","sha":"680e3ca","message":"fix(state): block unsafe archive recovery","time":"2026-09-06T04:57:21Z"}
+{"event":"commit","sha":"4abfc83","message":"feat(platforms): define safe adapter transport contracts","time":"2026-09-06T05:03:29Z"}
+{"event":"commit","sha":"1e9574b","message":"feat(archive): add crash-safe exact archival","time":"2026-09-06T05:03:42Z"}
+{"event":"commit","sha":"62645a2","message":"fix(platforms): reject retryable post-final results","time":"2026-09-06T05:10:35Z"}
