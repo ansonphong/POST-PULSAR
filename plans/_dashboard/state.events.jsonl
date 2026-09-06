@@ -8,3 +8,7 @@
 {"event":"commit","sha":"eaa7830","message":"feat: establish post-pulsar package baseline","time":"2026-09-06T02:05:58Z"}
 {"event":"commit","sha":"a1433dc","message":"fix(packaging): declare supported dependencies","time":"2026-09-06T02:10:54Z"}
 {"event":"commit","sha":"a1433dc","message":"fix(packaging): declare supported dependencies","time":"2026-09-06T02:11:20Z"}
+{"event":"commit","sha":"0d480b9","message":"chore(plan): mark T1.1 DONE","time":"2026-09-06T02:11:30Z"}
+{"event":"commit","sha":"1110bd5","message":"feat: add secure local configuration","time":"2026-09-06T02:12:30Z"}
+{"event":"commit","sha":"f3cdabe","message":"feat(content): implement exact bundle discovery","time":"2026-09-06T02:13:15Z"}
+{"event":"commit","sha":"dfb32e9","message":"fix: keep credential scan strict","time":"2026-09-06T02:13:22Z"}

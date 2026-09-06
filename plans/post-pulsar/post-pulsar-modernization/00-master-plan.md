@@ -18,7 +18,7 @@ stage_state: active
 
 - [x] #0195 `T1.1` **Task T1.1:** Establish package and identity baseline
 - [ ] #ae4a `T1.2` **Task T1.2:** Replace configuration and secret loading
-- [ ] #9b81 `T1.3` **Task T1.3:** Implement exact content bundle parsing
+- [x] #9b81 `T1.3` **Task T1.3:** Implement exact content bundle parsing
 
 ### Phase 2: Media and Durable Delivery Safety ([`02-media-and-durable-delivery-safety.md`](02-media-and-durable-delivery-safety.md))
 
