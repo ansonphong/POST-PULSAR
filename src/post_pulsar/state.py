@@ -686,14 +686,14 @@ class StateRepository:
                     changed = changed or self._stored_profile_targets(profile_id) != normalized_targets
                     if not changed:
                         return self._profile_from_row(existing)
-                    if expected_revision != int(existing["revision"]):
-                        raise ConflictError("profile revision conflict")
                     if current_root != str(root) and self._profile_has_protected_work(
                         profile_id
                     ):
                         raise ConflictError(
                             "profile root drift is blocked while durable work references it"
                         )
+                    if expected_revision != int(existing["revision"]):
+                        raise ConflictError("profile revision conflict")
                     self._connection.execute(
                         "UPDATE profiles SET account_root = ?, config_hash = ?, "
                         "revision = revision + 1, updated_at = ? WHERE profile_id = ?",
