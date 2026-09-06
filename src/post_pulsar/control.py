@@ -22,6 +22,7 @@ from post_pulsar import __version__
 from post_pulsar.content import scan_inbox
 from post_pulsar.state import (
     SCHEMA_VERSION,
+    BundleRecord,
     ConflictError,
     ProfileRecord,
     StateError,
@@ -89,6 +90,7 @@ _OPERATIONS: Final = (
     "confirmationStatus",
     "consumeConfirmation",
     "operatorApprove",
+    "operatorCreateConfirmation",
 )
 
 
@@ -301,6 +303,25 @@ class ControlApplication:
             }, 200
         if method == "GET" and route in {("status",), ("dashboard",)}:
             pause = repository.get_pause_state()
+            profile_filter = _one(query, "profile_id")
+            bundle_filter = _one(query, "bundle_key")
+            if profile_filter is not None:
+                profile = repository.get_profile(profile_filter)
+                if bundle_filter is None:
+                    bundles = repository.list_protected_bundles(profile.profile_id)
+                else:
+                    bundle = repository.get_bundle(_positive(bundle_filter))
+                    if bundle.profile_id != profile.profile_id:
+                        raise StateValidationError(
+                            "bundle does not belong to requested profile"
+                        )
+                    bundles = (bundle,)
+                return {
+                    "profile_id": profile.profile_id,
+                    "bundles": [_bundle(repository, item) for item in bundles],
+                }, 200
+            if bundle_filter is not None:
+                raise StateValidationError("bundle filter requires exact profile")
             return {
                 "paused": pause.paused,
                 "revision": pause.revision,
@@ -371,7 +392,7 @@ class ControlApplication:
             values = repository.list_schedules(
                 profile_id=profile_id,
                 after_schedule_key=_query_cursor(query),
-                limit=_page_limit(query, self._max_results)
+                limit=_page_limit(query, self._max_results),
             )
             return _page(
                 [_schedule(item) for item in values],
@@ -382,7 +403,7 @@ class ControlApplication:
             values = repository.list_run_requests(
                 profile_id=profile_id,
                 after_request_id=_query_cursor(query),
-                limit=_page_limit(query, self._max_results)
+                limit=_page_limit(query, self._max_results),
             )
             return _page(
                 [_request(item) for item in values],
@@ -412,6 +433,30 @@ class ControlApplication:
                 bundle_key=_optional_integer(body, "bundle_key"),
                 schedule_key=_optional_integer(body, "schedule_key"),
                 idempotency_key=key,
+                origin="agent",
+            )
+            return _intent(intent), 201
+        if method == "POST" and route == ("operator", "confirmations"):
+            if headers.get("x-post-pulsar-principal") != "operator":
+                raise ControlSecurityError("operator principal is required")
+            self._operator_auth(headers)
+            action = _text(body, "action")
+            key, revision = _write_headers(headers)
+            resource_revision = _integer(body, "resource_revision")
+            if revision != resource_revision:
+                raise ConflictError("intent revision header drift")
+            intent = repository.create_confirmation_intent(
+                action=action,
+                arguments=_object(body, "arguments", default={}),
+                profile_id=_text(body, "profile_id"),
+                resource_revision=resource_revision,
+                fingerprint=_optional_text(body, "fingerprint"),
+                consequence=_text(body, "consequence"),
+                expires_at=datetime.now(UTC) + timedelta(seconds=self._intent_ttl),
+                bundle_key=_optional_integer(body, "bundle_key"),
+                schedule_key=_optional_integer(body, "schedule_key"),
+                idempotency_key=key,
+                origin="operator",
             )
             return _intent(intent), 201
         if (
@@ -445,6 +490,13 @@ class ControlApplication:
         ):
             key, revision = _write_headers(headers)
             action = _text(body, "action")
+            intent = repository.get_confirmation_intent(route[1])
+            if (
+                action in _PUBLISH_ACTIONS
+                and intent.origin == "agent"
+                and not self._allow_agent_publish
+            ):
+                return {"code": "agent_publish_disabled"}, 403
             result = repository.consume_intent_with_request(
                 intent_id=route[1],
                 action=action,
@@ -473,6 +525,20 @@ class ControlApplication:
                     if not isinstance(text_value, str) or len(text_value) > 10000:
                         raise StateValidationError("text is invalid")
                     arguments["text"] = text_value
+                if action in {"edit_caption", "edit_alt"}:
+                    draft_scan = scan_inbox(
+                        repository.get_profile(profile_id).account_root / "DRAFTS"
+                    )
+                    matches = [
+                        item
+                        for item in draft_scan.bundles
+                        if item.bundle_id == route[5]
+                    ]
+                    if len(matches) != 1:
+                        raise StateValidationError(
+                            "draft bundle is missing or ambiguous"
+                        )
+                    arguments["fingerprint"] = matches[0].fingerprint
             schedule_key = _optional_integer(body, "schedule_key")
             route_schedule_key = _route_schedule_key(route)
             if route_schedule_key is not None:
@@ -832,6 +898,35 @@ def _schedule(value: object) -> Mapping[str, object]:
 
 def _request(value: object) -> Mapping[str, object]:
     return asdict(value)  # type: ignore[arg-type]
+
+
+def _bundle(repository: StateRepository, item: BundleRecord) -> Mapping[str, object]:
+    return {
+        "bundle_key": item.bundle_key,
+        "bundle_id": item.bundle_id,
+        "bucket": item.source_bucket,
+        "status": item.status,
+        "revision": item.revision,
+        "archive_path": item.archive_path,
+        "warnings": sorted(
+            {
+                event["event_code"]
+                for event in repository.list_events(item.bundle_key)
+                if event["event_type"] == "warning"
+            }
+        ),
+        "deliveries": [
+            {
+                **asdict(delivery),
+                "next_attempt_at": (
+                    None
+                    if delivery.next_attempt_at is None
+                    else delivery.next_attempt_at.isoformat()
+                ),
+            }
+            for delivery in repository.list_bundle_deliveries(item.bundle_key)
+        ],
+    }
 
 
 def _intent(value: object) -> Mapping[str, object]:

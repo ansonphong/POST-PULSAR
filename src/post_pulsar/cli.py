@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -148,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--trigger-id", required=True)
 
     status = commands.add_parser("status", help="read durable local state")
-    status.add_argument("--profile", required=True)
+    status.add_argument("--profile", required=True, type=_profile_id)
     status.add_argument("--bundle-key", type=_positive_integer)
 
     retry = commands.add_parser("retry", help="enqueue one exact approved retry")
@@ -418,11 +419,12 @@ def _dispatch(
 ) -> tuple[Mapping[str, object], int]:
     command = cast(str, arguments.command)
     if command == "status":
-        remote = _control_call(
-            settings, "GET", "/control/v1/status", transport=control_transport
-        )
+        target = f"/control/v1/status?profile_id={arguments.profile}"
+        if arguments.bundle_key is not None:
+            target += f"&bundle_key={arguments.bundle_key}"
+        remote = _control_call(settings, "GET", target, transport=control_transport)
         if remote is not None:
-            return {"profile_id": arguments.profile, "daemon": remote}, EXIT_OK
+            return remote, EXIT_OK
         return _status(settings, arguments.profile, arguments.bundle_key), EXIT_OK
     if command == "run":
         outcome = _run(
@@ -957,9 +959,7 @@ def _cancel_pending(
         ):
             raise TransitionError("bundle is not pristine pending work")
         if any(
-            repository.list_delivery_artifacts(
-                arguments.bundle_key, delivery.platform
-            )
+            repository.list_delivery_artifacts(arguments.bundle_key, delivery.platform)
             for delivery in deliveries
         ):
             raise TransitionError("bundle has durable delivery artifacts")
@@ -1178,6 +1178,63 @@ def _daemon_foreground(
     )
     holder: dict[str, ForegroundDaemon] = {}
 
+    def recover() -> None:
+        from post_pulsar.admission import DraftAdmissionService
+
+        protected: list[BundleRecord] = []
+        with StateRepository.open_existing(database, clock=clock) as repository:
+            repository.recover_claimed_run_requests(holder["daemon"]._worker_token)
+            for profile in settings.profiles:
+                DraftAdmissionService(repository, profile.account_root).recover()
+                protected.extend(repository.list_protected_bundles(profile.profile_id))
+        daemon = holder["daemon"]
+        lease = daemon._lease
+        if lease is None:
+            raise StateError("daemon instance lease is unavailable")
+        for bundle in protected:
+            OneRunApplication(
+                settings.config_path,
+                locks=daemon._locks,
+                instance_lease=lease,
+                environ=environ,
+                clock=clock,
+                adapter_factory=adapter_factory,
+            ).run_once(
+                RunOnceRequest(
+                    bundle.profile_id,
+                    bundle.source_bucket,
+                    f"daemon-recovery-{bundle.bundle_key}",
+                    expected_bundle_key=bundle.bundle_key,
+                    expected_fingerprint=bundle.fingerprint,
+                )
+            )
+
+    def admit_schedules() -> None:
+        from post_pulsar.scheduler import DeterministicScheduler
+
+        with StateRepository.open_existing(database, clock=clock) as repository:
+            work = DeterministicScheduler(repository, wall_clock=clock).tick()
+        daemon = holder["daemon"]
+        lease = daemon._lease
+        if lease is None:
+            raise StateError("daemon instance lease is unavailable")
+        for item in work:
+            OneRunApplication(
+                settings.config_path,
+                locks=daemon._locks,
+                instance_lease=lease,
+                environ=environ,
+                clock=clock,
+                adapter_factory=adapter_factory,
+            ).run_once(
+                RunOnceRequest(
+                    item.profile_id,
+                    item.bucket,
+                    f"schedule-{item.run_id}",
+                    schedule_run_id=item.run_id,
+                )
+            )
+
     def execute(request: RunRequestRecord) -> Mapping[str, object]:
         return _execute_daemon_request(
             settings,
@@ -1197,6 +1254,8 @@ def _daemon_foreground(
         settings.app.control_port,
         control_application=control,
         agent_capability_file=settings.app.agent_capability_file,
+        recovery=recover,
+        schedule_admission=admit_schedules,
         request_executor=execute,
     )
     holder["daemon"] = daemon
@@ -1215,7 +1274,7 @@ def _execute_daemon_request(
     clock: Callable[[], datetime],
 ) -> Mapping[str, object]:
     database = settings.app.state_directory / "post_pulsar.sqlite3"
-    if request.action == "run_now":
+    if request.action in {"enqueue", "run_now", "publish_now"}:
         lease = daemon._lease
         if lease is None:
             raise StateError("daemon instance lease is unavailable")
@@ -1234,6 +1293,8 @@ def _execute_daemon_request(
                     request.arguments["bucket"],
                 ),
                 cast(str, request.arguments["trigger_id"]),
+                expected_bundle_key=request.bundle_key,
+                expected_fingerprint=cast(str, request.arguments["fingerprint"]),
             )
         )
         return _run_result(outcome)
@@ -1244,6 +1305,39 @@ def _execute_daemon_request(
         daemon._locks.acquire_profiles(lease, (request.profile_id,)),
         StateRepository.open_existing(database, clock=clock) as repository,
     ):
+        pause_blocked = request.action in {
+            "admit_draft",
+            "enqueue",
+            "publish_now",
+            "retry",
+            "schedule_enable",
+        } or (
+            request.action in {"schedule_create", "schedule_update"}
+            and request.arguments.get("enabled") is True
+        )
+        if pause_blocked and repository.get_pause_state().paused:
+            raise TransitionError("new publication admission is paused")
+        if request.action == "admit_draft":
+            from post_pulsar.admission import DraftAdmissionService
+
+            if request.intent_id is None:
+                raise StateError("draft admission lost its confirmation intent")
+            intent = repository.get_confirmation_intent(request.intent_id)
+            record = DraftAdmissionService(
+                repository, settings.profile(request.profile_id).account_root
+            ).admit(
+                profile_id=request.profile_id,
+                bucket=cast(
+                    "Literal['QUEUE', 'RANDOM', 'REELS']",
+                    request.arguments["bucket"],
+                ),
+                bundle_id=cast(str, request.arguments["bundle_id"]),
+                expected_fingerprint=cast(str, intent.fingerprint),
+                intent_id=request.intent_id,
+            )
+            return asdict(record)
+        if request.action in {"edit_caption", "edit_alt"}:
+            return _edit_draft_text(settings, request)
         if request.action in {"pause", "resume"}:
             pause_record = repository.set_paused(
                 request.action == "pause", expected_revision=request.expected_revision
@@ -1320,7 +1414,9 @@ def _execute_daemon_request(
             snapshot = _target_snapshot(repository, request.bundle_key, platform)
             current = _configured_target_snapshot(profile, platform)
             if current != snapshot:
-                raise ConflictError("current target configuration differs from snapshot")
+                raise ConflictError(
+                    "current target configuration differs from snapshot"
+                )
             credentials = validate_publishing_credentials(
                 settings, request.profile_id, (platform,), environ
             )
@@ -1359,6 +1455,59 @@ def _execute_daemon_request(
             )
             return _delivery_document(delivery)
     raise StateError("daemon request action is unsupported")
+
+
+def _edit_draft_text(
+    settings: LocalSettings, request: RunRequestRecord
+) -> Mapping[str, object]:
+    from post_pulsar.content import scan_inbox
+
+    profile = settings.profile(request.profile_id)
+    drafts = profile.account_root / "DRAFTS"
+    scan = scan_inbox(drafts)
+    matches = [
+        item
+        for item in scan.bundles
+        if item.bundle_id == request.arguments.get("bundle_id")
+    ]
+    if len(matches) != 1 or matches[0].fingerprint != request.arguments.get(
+        "fingerprint"
+    ):
+        raise ConflictError("draft identity changed before edit")
+    suffix = ".txt" if request.action == "edit_caption" else "-alt.txt"
+    destination = drafts / f"{matches[0].bundle_id}{suffix}"
+    payload = cast(str, request.arguments["text"]).encode("utf-8")
+    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(destination, flags)
+    except FileNotFoundError:
+        descriptor = os.open(destination, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise StateError("draft text member is unsafe")
+        os.ftruncate(descriptor, 0)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise StateError("draft text edit could not make progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    edited = [
+        item
+        for item in scan_inbox(drafts).bundles
+        if item.bundle_id == matches[0].bundle_id
+    ]
+    if len(edited) != 1:
+        raise StateError("draft edit produced invalid content")
+    return {
+        "profile_id": request.profile_id,
+        "bundle_id": edited[0].bundle_id,
+        "fingerprint": edited[0].fingerprint,
+    }
 
 
 def _assert_request_bundle_identity(

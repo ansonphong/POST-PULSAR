@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 
 from post_pulsar.scheduler import DeterministicScheduler, evaluate_schedule
 from post_pulsar.state import ScheduleRecord, ScheduleRunRecord
@@ -202,3 +203,14 @@ def test_wait_recomputes_wall_after_monotonic_sleep() -> None:
     assert sleeps == [60.0]
     assert wall.reads == 1
     assert work
+
+
+def test_paused_scheduler_does_not_admit_or_recover_work() -> None:
+    repository = _Repository()
+    repository.get_pause_state = lambda: SimpleNamespace(paused=True)  # type: ignore[attr-defined]
+    scheduler = DeterministicScheduler(
+        repository,  # type: ignore[arg-type]
+        wall_clock=lambda: datetime(2026, 9, 7, 9, 5, tzinfo=UTC),
+    )
+    assert scheduler.tick() == ()
+    assert repository.runs == {}

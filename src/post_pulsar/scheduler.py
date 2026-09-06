@@ -148,6 +148,9 @@ class DeterministicScheduler:
         """Re-read wall time, persist today's occurrences, and return due work."""
 
         now = _aware_utc(self._wall_clock())
+        pause = getattr(self._repository, "get_pause_state", lambda: None)()
+        if pause is not None and bool(getattr(pause, "paused", False)):
+            return ()
         retries = tuple(
             self._work(run, self._repository.get_schedule(run.schedule_key), True)
             for run in self._repository.list_recoverable_schedule_runs(now)

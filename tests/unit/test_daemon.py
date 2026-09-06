@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,3 +100,49 @@ def test_daemon_holds_instance_lease_and_cleans_only_its_endpoint(
     endpoint.write_text(json.dumps({"startup_nonce": "not-owner"}), encoding="utf-8")
     daemon.stop()
     assert endpoint.exists()
+
+
+def test_endpoint_record_rejects_hardlinks(tmp_path: Path) -> None:
+    endpoint = tmp_path / "endpoint.json"
+    record = EndpointRecord(
+        "post-pulsar.control/v1", "127.0.0.1:1", os.getpid(), 1, "n", {}
+    )
+    record.write(endpoint)
+    alias = tmp_path / "alias.json"
+    os.link(endpoint, alias)
+    with pytest.raises(RuntimeError, match="unsafe"):
+        EndpointRecord.read(endpoint)
+    with pytest.raises(RuntimeError, match="unsafe"):
+        record.write(endpoint)
+
+
+def test_daemon_stops_worker_admission_before_http_shutdown(tmp_path: Path) -> None:
+    order: list[str] = []
+    reevaluated = threading.Event()
+
+    def schedule() -> None:
+        order.append("schedule")
+        if order.count("schedule") >= 3:
+            reevaluated.set()
+
+    class Server(_Server):
+        def shutdown(self) -> None:
+            order.append("http")
+            super().shutdown()
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        recovery=lambda: order.append("recover"),
+        schedule_admission=schedule,
+        server_factory=lambda *args: Server(*args),
+        poll_seconds=0.01,
+    )
+    daemon.start()
+    assert reevaluated.wait(0.5)
+    daemon.stop()
+    assert order[:2] == ["recover", "schedule"]
+    assert daemon._stop.is_set()
+    assert order.index("http") >= 2

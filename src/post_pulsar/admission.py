@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 import shutil
@@ -167,7 +169,8 @@ class DraftAdmissionService:
             journal.journal_id, "ready_installed", expected_revision=journal.revision
         )
         self._inject("after_ready_install")
-        os.rename(temporary, destination)
+        self._inject("before_atomic_rename")
+        _rename_no_replace(temporary, destination)
         _fsync_directory(bucket_root)
         self._inject("after_atomic_rename")
         journal = self._repository.advance_admission(
@@ -195,7 +198,7 @@ class DraftAdmissionService:
                 and journal.phase == "ready_installed"
             ):
                 self._verify_installed(temporary, journal.fingerprint)
-                os.rename(temporary, destination)
+                _rename_no_replace(temporary, destination)
                 _fsync_directory(destination.parent)
                 journal = self._repository.advance_admission(
                     journal.journal_id, "installed", expected_revision=journal.revision
@@ -280,6 +283,36 @@ def _fsync_directory(path: Path) -> None:
 
 def _no_follow() -> int:
     return cast(int, getattr(os, "O_NOFOLLOW", 0))
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically install a directory without replacing an existing entry."""
+
+    if os.name == "nt":
+        try:
+            os.rename(source, destination)
+        except FileExistsError:
+            raise ConflictError("admission destination already exists") from None
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise AdmissionError("atomic no-replace rename is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ConflictError("admission destination already exists")
+    raise AdmissionError("atomic admission install failed")
 
 
 __all__ = ["AdmissionError", "DraftAdmissionService"]

@@ -356,6 +356,7 @@ class ConfirmationIntentRecord:
     resource_revision: int
     fingerprint: str | None
     consequence: str
+    origin: str
     expires_at: datetime
     state: str
     revision: int
@@ -1797,8 +1798,14 @@ class StateRepository:
                 "AND state = 'dispatching' LIMIT 1",
                 (bundle_key,),
             ).fetchone()
-            if nonpristine is not None or artifact is not None or dispatching is not None:
-                raise TransitionError("only pristine non-in-flight work can be terminalized")
+            if (
+                nonpristine is not None
+                or artifact is not None
+                or dispatching is not None
+            ):
+                raise TransitionError(
+                    "only pristine non-in-flight work can be terminalized"
+                )
             now = self._now_text()
             updated = self._connection.execute(
                 "UPDATE bundles SET status = ?, block_reason = NULL, "
@@ -2875,12 +2882,12 @@ class StateRepository:
                 retained_phase = "ready" if remote is not None else None
                 updated = self._connection.execute(
                     "UPDATE deliveries SET status = 'failed', phase = ?, "
-                    "safe_to_retry = 1, next_attempt_at = ?, claim_token = NULL, "
+                    "safe_to_retry = 0, next_attempt_at = NULL, claim_token = NULL, "
                     "remote_id = NULL, error_code = 'reconciled_not_published', "
                     "error_message = 'Operator confirmed no publication exists.', "
                     "revision = revision + 1, updated_at = ? "
                     "WHERE bundle_key = ? AND platform = ? AND status = 'ambiguous'",
-                    (retained_phase, now, now, bundle_key, platform),
+                    (retained_phase, now, bundle_key, platform),
                 )
                 resolution = "not_published"
             if updated.rowcount != 1:
@@ -2890,7 +2897,7 @@ class StateRepository:
                 "AND (status = 'ambiguous' OR (status = 'failed' AND safe_to_retry = 0))",
                 (bundle_key, platform),
             ).fetchone()
-            if other_block is None:
+            if other_block is None and published_remote_id is not None:
                 self._connection.execute(
                     "UPDATE bundles SET status = 'active', block_reason = NULL, "
                     "revision = revision + 1, updated_at = ? WHERE bundle_key = ?",
@@ -3218,6 +3225,12 @@ class StateRepository:
             schedule = self._schedule_row(schedule_key)
             if not bool(schedule["enabled"]):
                 raise TransitionError("disabled schedule cannot claim an occurrence")
+            if bool(
+                self._connection.execute(
+                    "SELECT paused FROM pause_state WHERE singleton = 1"
+                ).fetchone()[0]
+            ):
+                raise TransitionError("publication admission is paused")
             if str(schedule["config_hash"]) != schedule_hash:
                 raise ConflictError("schedule hash drift")
             now = self._now_text()
@@ -3659,6 +3672,14 @@ class StateRepository:
             schedule_key=schedule_key,
             expected_revision=expected_revision,
         )
+        if self._request_admits_publication_locked(
+            action, json.loads(arguments_json), schedule_key
+        ) and bool(
+            self._connection.execute(
+                "SELECT paused FROM pause_state WHERE singleton = 1"
+            ).fetchone()[0]
+        ):
+            raise TransitionError("new publication admission is paused")
         now = self._now_text()
         cursor = self._connection.execute(
             "INSERT INTO run_requests(profile_id, action, arguments_json, request_sha256, "
@@ -3707,6 +3728,48 @@ class StateRepository:
                 (int(row["request_id"]),),
             ).fetchone()
             return self._request_from_row(cast(sqlite3.Row, claimed))
+
+    def recover_claimed_run_requests(
+        self, current_worker_token: str
+    ) -> tuple[RunRequestRecord, ...]:
+        """Resolve dead-incarnation claims before accepting new work."""
+
+        _validate_identifier(current_worker_token, "worker token")
+        unsafe = {"enqueue", "run_now", "publish_now"}
+        recovered: list[int] = []
+        with self._transaction():
+            rows = tuple(
+                self._connection.execute(
+                    "SELECT * FROM run_requests WHERE status = 'claimed' "
+                    "AND worker_token != ? ORDER BY request_id",
+                    (current_worker_token,),
+                )
+            )
+            now = self._now_text()
+            for row in rows:
+                request_id = int(row["request_id"])
+                if str(row["action"]) in unsafe:
+                    self._connection.execute(
+                        "UPDATE run_requests SET status = 'failed', result_json = ?, "
+                        "worker_token = NULL, revision = revision + 1, updated_at = ? "
+                        "WHERE request_id = ? AND status = 'claimed'",
+                        (
+                            self._safe_json(
+                                {"code": "daemon_restart_unknown", "outcome": "blocked"}
+                            ),
+                            now,
+                            request_id,
+                        ),
+                    )
+                else:
+                    self._connection.execute(
+                        "UPDATE run_requests SET status = 'queued', worker_token = NULL, "
+                        "revision = revision + 1, updated_at = ? "
+                        "WHERE request_id = ? AND status = 'claimed'",
+                        (now, request_id),
+                    )
+                recovered.append(request_id)
+        return tuple(self.get_run_request(item) for item in recovered)
 
     def complete_run_request(
         self,
@@ -3778,6 +3841,7 @@ class StateRepository:
         bundle_key: int | None = None,
         schedule_key: int | None = None,
         idempotency_key: str | None = None,
+        origin: str = "operator",
     ) -> ConfirmationIntentRecord:
         if action not in _REQUEST_ACTIONS:
             raise StateValidationError("confirmation action is not allow-listed")
@@ -3788,6 +3852,8 @@ class StateRepository:
         consequence = self._safe_text(
             consequence, "confirmation consequence", maximum=512
         )
+        if origin not in {"agent", "operator"}:
+            raise StateValidationError("confirmation origin is invalid")
         expires_text = _timestamp(expires_at)
         if _parse_timestamp(expires_text) <= self._now():
             raise StateValidationError(
@@ -3797,11 +3863,13 @@ class StateRepository:
         if idempotency_key is not None:
             _validate_identifier(idempotency_key, "idempotency key")
         intent_id = (
-            _sha256_text("post-pulsar.control/v1\0" + idempotency_key)[:32]
+            _sha256_text("post-pulsar.control/v1\0" + origin + "\0" + idempotency_key)[
+                :32
+            ]
             if idempotency_key is not None
             else secrets.token_hex(16)
         )
-        nonce = secrets.token_hex(32)
+        nonce = f"{origin}:{secrets.token_hex(32)}"
         now = self._now_text()
         with self._transaction():
             self._require_profile(profile_id)
@@ -4456,6 +4524,23 @@ class StateRepository:
                     raise StateValidationError("reconcile remote post ID is invalid")
                 _validate_identifier(remote_id, "remote post ID")
 
+        if action in {"edit_caption", "edit_alt"}:
+            if set(arguments) != {"bucket", "bundle_id", "fingerprint", "text"}:
+                raise StateValidationError("draft edit arguments are not exact")
+            if arguments.get("bucket") != "DRAFTS":
+                raise StateValidationError("draft edit bucket is invalid")
+            if not isinstance(arguments.get("bundle_id"), str):
+                raise StateValidationError("draft edit bundle ID is invalid")
+            _validate_bundle_id(cast(str, arguments["bundle_id"]))
+            if not isinstance(arguments.get("fingerprint"), str):
+                raise StateValidationError("draft edit fingerprint is invalid")
+            _validate_sha256(cast(str, arguments["fingerprint"]), "draft fingerprint")
+            if (
+                not isinstance(arguments.get("text"), str)
+                or len(cast(str, arguments["text"])) > 10000
+            ):
+                raise StateValidationError("draft edit text is invalid")
+
         if (
             bundle_key is not None
             and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id
@@ -4496,6 +4581,30 @@ class StateRepository:
                 bool(schedule["enabled"])
                 or due is not None
                 or arguments.get("enabled") is True
+            )
+        return False
+
+    def _request_admits_publication_locked(
+        self,
+        action: str,
+        arguments: Mapping[str, object],
+        schedule_key: int | None,
+    ) -> bool:
+        if action in {
+            "admit_draft",
+            "enqueue",
+            "run_now",
+            "publish_now",
+            "retry",
+            "schedule_enable",
+        }:
+            return True
+        if action == "schedule_create":
+            return arguments.get("enabled") is True
+        if action == "schedule_update":
+            return arguments.get("enabled") is True or (
+                schedule_key is not None
+                and bool(self._schedule_row(schedule_key)["enabled"])
             )
         return False
 
@@ -4857,6 +4966,11 @@ class StateRepository:
             resource_revision=int(row["resource_revision"]),
             fingerprint=cast(str | None, row["fingerprint"]),
             consequence=str(row["consequence"]),
+            origin=(
+                str(row["nonce"]).split(":", 1)[0]
+                if ":" in str(row["nonce"])
+                else "operator"
+            ),
             expires_at=_parse_timestamp(str(row["expires_at"])),
             state=str(row["state"]),
             revision=int(row["revision"]),
@@ -4988,12 +5102,16 @@ def _normalize_schedule_settings(
     if isinstance(weekdays, (str, bytes)) or any(
         isinstance(day, bool) or not isinstance(day, int) for day in weekdays
     ):
-        raise StateValidationError("schedule weekdays must be integers from 0 through 6")
+        raise StateValidationError(
+            "schedule weekdays must be integers from 0 through 6"
+        )
     normalized_weekdays = tuple(sorted(set(weekdays)))
     if not normalized_weekdays or any(
         day < 0 or day > 6 for day in normalized_weekdays
     ):
-        raise StateValidationError("schedule weekdays must be integers from 0 through 6")
+        raise StateValidationError(
+            "schedule weekdays must be integers from 0 through 6"
+        )
     _validate_timezone(timezone)
     _validate_local_time(local_time)
     if (

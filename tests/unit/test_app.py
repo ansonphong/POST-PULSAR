@@ -20,6 +20,7 @@ from post_pulsar.app import (
 from post_pulsar.config import SecretValue
 from post_pulsar.content import scan_account_root
 from post_pulsar.locking import LockContentionError, LockLease, LockManager
+from post_pulsar.media import MediaWarning, prepare_bundle_media
 from post_pulsar.platforms.base import (
     ArtifactCheckpoint,
     CheckpointWriter,
@@ -32,7 +33,6 @@ from post_pulsar.platforms.base import (
 )
 from post_pulsar.platforms.http import HTTPPolicy, PlatformHTTPClient
 from post_pulsar.platforms.x import XAdapter
-from post_pulsar.media import MediaWarning, prepare_bundle_media
 from post_pulsar.state import (
     BundleFileSnapshot,
     DeliveryRecord,
@@ -994,6 +994,51 @@ def test_unrelated_invalid_bucket_does_not_block_requested_queue(
     assert outcome.status == "archived"
     assert outcome.bundle_id == "post"
     assert invalid.is_dir()
+    instance.release()
+
+
+def test_exact_run_request_never_falls_back_to_another_protected_bundle(
+    tmp_path: Path,
+) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    _bundle(tmp_path, "wanted")
+    _bundle(tmp_path, "other")
+    wanted = scan_account_root(tmp_path / "accounts/operator").bundles[1]
+    with StateRepository.open_existing(
+        tmp_path / "state/post_pulsar.sqlite3", clock=lambda: NOW
+    ) as repository:
+        other_key = repository.add_bundle(
+            profile_id="operator",
+            bundle_id="other",
+            fingerprint="a" * 64,
+            source_bucket="QUEUE",
+            files=(
+                BundleFileSnapshot(
+                    "other.jpg", "image", None, "image", "image/jpeg", 1, "b" * 64
+                ),
+            ),
+            targets=(_target("x", tmp_path),),
+        )
+    adapters: list[FakeAdapter] = []
+    outcome = OneRunApplication(
+        config,
+        locks=locks,
+        instance_lease=instance,
+        environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
+        clock=lambda: NOW,
+        adapter_factory=_factory(adapters),
+    ).run_once(
+        RunOnceRequest(
+            "operator",
+            "QUEUE",
+            "exact",
+            expected_bundle_key=other_key,
+            expected_fingerprint=wanted.fingerprint,
+        )
+    )
+
+    assert outcome.status == "invalid" and outcome.code == "exact_bundle_conflict"
+    assert adapters == []
     instance.release()
 
 

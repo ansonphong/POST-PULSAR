@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+
+from jsonschema import Draft202012Validator
+from openapi_spec_validator import validate
 
 from post_pulsar.control import (
     ControlApplication,
     ControlRequest,
+    initialize_operator_secret,
     rotate_agent_capability,
 )
 from post_pulsar.state import ProfileTargetSnapshot, StateRepository
@@ -110,6 +115,72 @@ def test_writes_need_revision_idempotency_and_publish_permission(
     assert blocked.status == 403
 
 
+def test_operator_can_originate_and_consume_intent_when_agent_publish_is_off(
+    tmp_path: Path,
+) -> None:
+    class TTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    app = _application(tmp_path)
+    verifier = tmp_path / "operator"
+    initialize_operator_secret(verifier, input_stream=TTY("operator secret phrase\n"))
+    app = ControlApplication(
+        tmp_path / "state.sqlite3",
+        tmp_path / "agent",
+        operator_verifier_file=verifier,
+        allow_agent_publish=False,
+    )
+    token = (tmp_path / "agent").read_text(encoding="ascii").strip()
+    headers = {
+        "Idempotency-Key": "operator-intent",
+        "If-Match": '"1"',
+        "X-Post-Pulsar-Principal": "operator",
+        "X-Post-Pulsar-Operator-Secret": "operator secret phrase",
+    }
+    created = _call(
+        app,
+        "POST",
+        "/control/v1/operator/confirmations",
+        token=token,
+        headers=headers,
+        body={
+            "action": "admit_draft",
+            "profile_id": "profile",
+            "resource_revision": 1,
+            "fingerprint": "a" * 64,
+            "consequence": "Publish exact content.",
+            "arguments": {"bucket": "QUEUE", "bundle_id": "draft"},
+        },
+    )
+    assert created.status == 201
+    document = json.loads(created.body)["data"]
+    assert document["origin"] == "operator"
+    approved = _call(
+        app,
+        "POST",
+        f"/control/v1/operator/confirmations/{document['intent_id']}/approve",
+        token=token,
+        headers={**headers, "Idempotency-Key": "operator-approve"},
+    )
+    assert approved.status == 200
+    consumed = _call(
+        app,
+        "POST",
+        f"/control/v1/confirmations/{document['intent_id']}/consume",
+        token=token,
+        headers={"Idempotency-Key": "operator-consume", "If-Match": '"1"'},
+        body={
+            "action": "admit_draft",
+            "profile_id": "profile",
+            "resource_revision": 1,
+            "fingerprint": "a" * 64,
+            "arguments": {"bucket": "QUEUE", "bundle_id": "draft"},
+        },
+    )
+    assert consumed.status == 202
+
+
 def test_keyed_schedule_routes_execute_and_reject_path_body_drift(
     tmp_path: Path,
 ) -> None:
@@ -163,13 +234,30 @@ def test_keyed_schedule_routes_execute_and_reject_path_body_drift(
     assert drifted.status == 422
 
 
+def test_status_accepts_exact_profile_and_bundle_filters(tmp_path: Path) -> None:
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text(encoding="ascii").strip()
+    response = _call(app, "GET", "/control/v1/status?profile_id=profile", token=token)
+    assert response.status == 200
+    assert json.loads(response.body)["data"] == {"profile_id": "profile", "bundles": []}
+    invalid = _call(app, "GET", "/control/v1/status?bundle_key=1", token=token)
+    assert invalid.status == 422
+
+
 def test_openapi_is_authoritative_and_has_every_operation() -> None:
     path = Path(__file__).parents[2] / "api/control-v1.openapi.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["openapi"] == "3.1.0"
+    path_items = []
+    for path_item in document["paths"].values():
+        if "$ref" in path_item:
+            path_item = document["components"]["pathItems"][
+                path_item["$ref"].rsplit("/", 1)[1]
+            ]
+        path_items.append(path_item)
     operation_ids = {
         operation["operationId"]
-        for path_item in document["paths"].values()
+        for path_item in path_items
         for operation in path_item.values()
         if isinstance(operation, dict) and "operationId" in operation
     }
@@ -200,3 +288,16 @@ def test_openapi_is_authoritative_and_has_every_operation() -> None:
         "consumeConfirmation",
         "operatorApprove",
     } <= operation_ids
+    validate(document)
+    schema = document["components"]["schemas"]["Confirmation"]
+    Draft202012Validator(schema).validate(
+        {
+            "action": "run_now",
+            "profile_id": "profile",
+            "resource_revision": 1,
+            "bundle_key": 1,
+            "fingerprint": "a" * 64,
+            "arguments": {},
+            "consequence": "Publish the exact bundle.",
+        }
+    )

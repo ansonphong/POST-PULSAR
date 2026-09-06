@@ -1501,6 +1501,79 @@ def test_run_requests_are_claimed_once_and_retain_canonical_results(
     assert replay.result == completed.result
 
 
+def test_pause_blocks_new_publish_admission_and_claim_recovery_is_action_specific(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository)
+    safe = repository.create_run_request(
+        profile_id="ansonphong",
+        action="pause",
+        arguments={},
+        idempotency_key="safe",
+        expected_revision=1,
+    )
+    repository.claim_next_run_request("old-incarnation")
+    publish = repository.create_confirmation_intent(
+        action="run_now",
+        arguments={
+            "bucket": "QUEUE",
+            "bundle_id": "post",
+            "fingerprint": "b" * 64,
+            "trigger_id": "publish",
+        },
+        profile_id="ansonphong",
+        resource_revision=1,
+        fingerprint="b" * 64,
+        consequence="Publish exact bundle.",
+        expires_at=FakeClock()() + timedelta(minutes=5),
+        bundle_key=bundle_key,
+    )
+    repository.approve_confirmation_intent(publish.intent_id, expected_revision=1)
+    repository.consume_intent_with_request(
+        intent_id=publish.intent_id,
+        action="run_now",
+        arguments=publish.arguments,
+        profile_id="ansonphong",
+        resource_revision=1,
+        fingerprint="b" * 64,
+        idempotency_key="publish",
+        bundle_key=bundle_key,
+    )
+    claimed_publish = repository.claim_next_run_request("old-incarnation")
+    assert claimed_publish is not None
+
+    recovered = repository.recover_claimed_run_requests("new-incarnation")
+    assert repository.get_run_request(safe.request_id).status == "queued"
+    assert repository.get_run_request(claimed_publish.request_id).status == "failed"
+    assert len(recovered) == 2
+
+    pause = repository.set_paused(True, expected_revision=1)
+    paused_intent = repository.create_confirmation_intent(
+        action="run_now",
+        arguments=publish.arguments,
+        profile_id="ansonphong",
+        resource_revision=1,
+        fingerprint="b" * 64,
+        consequence="Publish exact bundle.",
+        expires_at=FakeClock()() + timedelta(minutes=5),
+        bundle_key=bundle_key,
+    )
+    repository.approve_confirmation_intent(paused_intent.intent_id, expected_revision=1)
+    with pytest.raises(TransitionError, match="paused"):
+        repository.consume_intent_with_request(
+            intent_id=paused_intent.intent_id,
+            action="run_now",
+            arguments=publish.arguments,
+            profile_id="ansonphong",
+            resource_revision=1,
+            fingerprint="b" * 64,
+            idempotency_key="publish-while-paused",
+            bundle_key=bundle_key,
+        )
+    assert pause.paused
+
+
 def test_resume_requires_confirmation_exactly_when_work_is_due(
     tmp_path: Path,
 ) -> None:
@@ -1764,6 +1837,34 @@ def test_final_dispatch_failure_is_always_ambiguous_and_nonretryable(
     assert repository.get_bundle(bundle_key).status == "blocked"
 
 
+def test_reconcile_not_published_remains_blocked_until_explicit_retry(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository)
+    claim = _claim(repository, bundle_key, "x", "unknown")
+    repository.advance_delivery_phase(
+        bundle_key, "x", "final_dispatch_started", **claim
+    )  # type: ignore[arg-type]
+    repository.mark_delivery_ambiguous(
+        bundle_key,
+        "x",
+        error_code="unknown",
+        error_message="Unknown.",
+        **claim,  # type: ignore[arg-type]
+    )
+    bundle = repository.get_bundle(bundle_key)
+    delivery = repository.operator_reconcile(
+        bundle_key,
+        "x",
+        published_remote_id=None,
+        expected_bundle_revision=bundle.revision,
+    )
+    assert delivery.status == "failed" and not delivery.safe_to_retry
+    assert delivery.next_attempt_at is None
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
 def test_stale_delivery_worker_cannot_mutate_a_new_attempt(tmp_path: Path) -> None:
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
@@ -1945,7 +2046,10 @@ def test_pristine_pending_bundle_becomes_revisioned_terminal_tombstone(
     assert tombstone.revision == 2
     assert repository.list_bundle_files(bundle_key) == before_files
     assert repository.list_bundle_deliveries(bundle_key)[0].status == "pending"
-    assert repository.list_events(bundle_key)[-1]["event_type"] == f"bundle_{tombstone.status}"
+    assert (
+        repository.list_events(bundle_key)[-1]["event_type"]
+        == f"bundle_{tombstone.status}"
+    )
 
 
 def test_pending_tombstone_rejects_nonpristine_or_drifted_bundle(

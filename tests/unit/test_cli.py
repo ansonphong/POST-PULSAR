@@ -24,6 +24,7 @@ from post_pulsar.cli import (
     main,
 )
 from post_pulsar.config import SecretValue, load_local_settings
+from post_pulsar.content import scan_inbox
 from post_pulsar.daemon import ForegroundDaemon
 from post_pulsar.locking import LockManager
 from post_pulsar.platforms.base import (
@@ -568,9 +569,7 @@ def test_daemon_retry_executor_revalidates_remote_identity(tmp_path: Path) -> No
 
     locks = LockManager(tmp_path / "state")
     with locks.acquire_instance() as lease:
-        daemon = cast(
-            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
-        )
+        daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))
         result = _execute_daemon_request(
             load_local_settings(config),
             request,
@@ -615,9 +614,7 @@ def test_daemon_reconcile_executor_is_offline(tmp_path: Path) -> None:
         )
     locks = LockManager(tmp_path / "state")
     with locks.acquire_instance() as lease:
-        daemon = cast(
-            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
-        )
+        daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))
         result = _execute_daemon_request(
             load_local_settings(config),
             request,
@@ -672,21 +669,108 @@ def test_daemon_pending_terminal_executor_preserves_source_media(
         )
     locks = LockManager(tmp_path / "state")
     with locks.acquire_instance() as lease:
-        daemon = cast(
-            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
-        )
+        daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))
         result = _execute_daemon_request(
             load_local_settings(config),
             request,
             daemon=daemon,
             environ={},
             adapter_factory=None,
-            identity_verifier=lambda *_args: pytest.fail("terminal action used network"),
+            identity_verifier=lambda *_args: pytest.fail(
+                "terminal action used network"
+            ),
             clock=lambda: datetime.now(UTC),
         )
 
     assert result["status"] == ("cancelled" if action == "cancel" else "deleted")
     assert source.read_bytes() == b"source-media"
+
+
+def test_daemon_draft_admission_executor_reaches_journaled_service(
+    tmp_path: Path,
+) -> None:
+    config, database = _setup(tmp_path)
+    drafts = tmp_path / "accounts/operator/DRAFTS"
+    drafts.mkdir(parents=True)
+    (drafts / "draft.txt").write_text("caption", encoding="utf-8")
+    (drafts / "draft.jpg").write_bytes(b"image")
+    fingerprint = scan_inbox(drafts).bundles[0].fingerprint
+    arguments = {"bucket": "QUEUE", "bundle_id": "draft"}
+    with StateRepository.open_existing(database) as repository:
+        intent = repository.create_confirmation_intent(
+            action="admit_draft",
+            arguments=arguments,
+            profile_id="operator",
+            resource_revision=1,
+            fingerprint=fingerprint,
+            consequence="Promote exact draft.",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        repository.approve_confirmation_intent(
+            intent.intent_id, expected_revision=intent.revision
+        )
+        request = repository.consume_intent_with_request(
+            intent_id=intent.intent_id,
+            action="admit_draft",
+            arguments=arguments,
+            profile_id="operator",
+            resource_revision=1,
+            fingerprint=fingerprint,
+            idempotency_key="admit-executor",
+        )
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as lease:
+        daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))
+        result = _execute_daemon_request(
+            load_local_settings(config),
+            request,
+            daemon=daemon,
+            environ={},
+            adapter_factory=None,
+            identity_verifier=lambda *_args: pytest.fail("admission used network"),
+            clock=lambda: datetime.now(UTC),
+        )
+    assert result["phase"] == "installed"
+    assert (tmp_path / "accounts/operator/QUEUE/draft/.ready").exists()
+
+
+def test_daemon_draft_edit_executor_requires_the_exact_fingerprint(
+    tmp_path: Path,
+) -> None:
+    config, database = _setup(tmp_path)
+    drafts = tmp_path / "accounts/operator/DRAFTS"
+    drafts.mkdir(parents=True)
+    caption = drafts / "draft.txt"
+    caption.write_text("old", encoding="utf-8")
+    (drafts / "draft.jpg").write_bytes(b"image")
+    fingerprint = scan_inbox(drafts).bundles[0].fingerprint
+    with StateRepository.open_existing(database) as repository:
+        request = repository.create_run_request(
+            profile_id="operator",
+            action="edit_caption",
+            arguments={
+                "bucket": "DRAFTS",
+                "bundle_id": "draft",
+                "fingerprint": fingerprint,
+                "text": "new caption",
+            },
+            idempotency_key="edit-executor",
+            expected_revision=1,
+        )
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as lease:
+        daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))
+        result = _execute_daemon_request(
+            load_local_settings(config),
+            request,
+            daemon=daemon,
+            environ={},
+            adapter_factory=None,
+            identity_verifier=lambda *_args: pytest.fail("edit used network"),
+            clock=lambda: datetime.now(UTC),
+        )
+    assert caption.read_text(encoding="utf-8") == "new caption"
+    assert result["fingerprint"] != fingerprint
 
 
 def test_module_entrypoint_returns_the_package_main_exit_code(

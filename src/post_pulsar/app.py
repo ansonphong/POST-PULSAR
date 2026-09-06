@@ -82,6 +82,8 @@ class RunOnceRequest:
     bucket: SourceBucket
     trigger_id: str
     schedule_run_id: int | None = None
+    expected_bundle_key: int | None = None
+    expected_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +207,32 @@ class OneRunApplication:
             if triggered is not None and triggered.status == "archived":
                 return _outcome("archived", triggered)
             protected = repository.list_protected_bundles(request.profile_id)
-            if schedule_run is not None and schedule_run.bundle_key is not None:
+            exact_requested = (
+                request.expected_bundle_key is not None
+                or request.expected_fingerprint is not None
+            )
+            if exact_requested and (
+                request.expected_bundle_key is None
+                or request.expected_fingerprint is None
+                or schedule_run is not None
+            ):
+                return RunOutcome("invalid", code="exact_bundle_conflict")
+            if exact_requested:
+                try:
+                    exact = repository.get_bundle(
+                        cast(int, request.expected_bundle_key)
+                    )
+                except StateValidationError:
+                    return RunOutcome("invalid", code="exact_bundle_conflict")
+                if (
+                    exact.profile_id != request.profile_id
+                    or exact.source_bucket != request.bucket
+                    or exact.fingerprint != request.expected_fingerprint
+                    or exact not in protected
+                ):
+                    return RunOutcome("invalid", code="exact_bundle_conflict")
+                bundle = exact
+            elif schedule_run is not None and schedule_run.bundle_key is not None:
                 bundle = repository.get_bundle(schedule_run.bundle_key)
             elif schedule_run is not None:
                 bundle = None
@@ -215,6 +242,23 @@ class OneRunApplication:
                 bundle = protected[0] if protected else None
             selected: PublishableBundle | None = None
             media: PreparedMedia | None = None
+
+            if repository.get_pause_state().paused:
+                crossed_safe_boundary = False
+                if bundle is not None:
+                    paused_deliveries = repository.list_bundle_deliveries(
+                        bundle.bundle_key
+                    )
+                    crossed_safe_boundary = (
+                        bundle.status == "archiving"
+                        or all(item.status == "published" for item in paused_deliveries)
+                        or any(
+                            item.phase == "final_dispatch_started"
+                            for item in paused_deliveries
+                        )
+                    )
+                if not crossed_safe_boundary:
+                    return RunOutcome("blocked", code="publication_paused")
 
             if bundle is not None and bundle.status == "archiving":
                 return self._archive(repository, bundle, profile_lease=profile_lease)

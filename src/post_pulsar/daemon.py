@@ -49,6 +49,8 @@ class EndpointRecord:
         metadata = source.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("endpoint record is unsafe")
+        if metadata.st_nlink != 1:
+            raise RuntimeError("endpoint record is unsafe")
         if os.name != "nt" and metadata.st_mode & 0o077:
             raise RuntimeError("endpoint record permissions are too broad")
         value = json.loads(source.read_text(encoding="utf-8"))
@@ -74,6 +76,7 @@ class EndpointRecord:
         if existing is not None and (
             stat.S_ISLNK(existing.st_mode)
             or not stat.S_ISREG(existing.st_mode)
+            or existing.st_nlink != 1
             or existing.st_mode & 0o077
         ):
             raise RuntimeError("endpoint record replacement is unsafe")
@@ -88,6 +91,8 @@ class EndpointRecord:
         finally:
             os.close(descriptor)
         os.replace(temporary, destination)
+        if destination.lstat().st_nlink != 1:
+            raise RuntimeError("endpoint record replacement is unsafe")
         destination.chmod(0o600)
         _fsync_parent(destination)
 
@@ -142,7 +147,9 @@ class ForegroundDaemon:
         self._http_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._claim_gate = threading.Lock()
         self._nonce = secrets.token_hex(32)
+        self._worker_token = f"daemon-{self._nonce[:16]}"
         self._started_at = _process_start_identity(os.getpid())
 
     def start(self) -> None:
@@ -212,11 +219,12 @@ class ForegroundDaemon:
         """Stop admission, then wait for the current sequential safe boundary."""
         if self._lease is None:
             return
+        with self._claim_gate:
+            self._stop.set()
         if self._server is not None:
             self._server.shutdown()
         if self._http_thread is not None:
             self._http_thread.join()
-        self._stop.set()
         if self._worker_thread is not None:
             self._worker_thread.join()
         self._cleanup_runtime()
@@ -224,13 +232,18 @@ class ForegroundDaemon:
     def _worker(self) -> None:
         database = self._state / "post_pulsar.sqlite3"
         while not self._stop.is_set():
+            if self._schedule_admission is not None:
+                self._schedule_admission()
+            if self._stop.is_set():
+                break
             if self._executor is None or not database.exists():
                 self._stop.wait(self._poll)
                 continue
             with StateRepository.open_existing(database) as repository:
-                request = repository.claim_next_run_request(
-                    f"daemon-{self._nonce[:16]}"
-                )
+                with self._claim_gate:
+                    if self._stop.is_set():
+                        break
+                    request = repository.claim_next_run_request(self._worker_token)
                 if request is None:
                     self._stop.wait(self._poll)
                     continue
@@ -239,14 +252,14 @@ class ForegroundDaemon:
                 except Exception:
                     repository.complete_run_request(
                         request.request_id,
-                        worker_token=f"daemon-{self._nonce[:16]}",
+                        worker_token=self._worker_token,
                         result={"code": "request_failed"},
                         failed=True,
                     )
                 else:
                     repository.complete_run_request(
                         request.request_id,
-                        worker_token=f"daemon-{self._nonce[:16]}",
+                        worker_token=self._worker_token,
                         result=result,
                     )
 

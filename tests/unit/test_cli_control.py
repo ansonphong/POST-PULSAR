@@ -483,3 +483,31 @@ def test_operator_approved_intent_consumes_when_agent_publish_is_disabled(
     )
     assert code == EXIT_OK, error
     assert json.loads(output)["result"]["request"]["intent_id"] == intent.intent_id
+
+
+def test_foreground_daemon_receives_recovery_and_periodic_schedule_callbacks(
+    tmp_path: Path,
+) -> None:
+    config, _database = _setup(tmp_path)
+    capability = tmp_path / "state/control/agent-capability"
+    capability.parent.mkdir(parents=True, exist_ok=True)
+    capability.write_text("c" * 64 + "\n", encoding="ascii")
+    capability.chmod(0o600)
+    captured: dict[str, object] = {}
+
+    class Daemon:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args
+            captured.update(kwargs)
+
+        def run_forever(self) -> None:
+            return None
+
+    code, _output, error = _invoke(
+        ["daemon", "foreground", "--config", str(config), "--json"],
+        daemon_factory=Daemon,
+    )
+    assert code == EXIT_OK, error
+    assert callable(captured["recovery"])
+    assert callable(captured["schedule_admission"])
+    assert callable(captured["request_executor"])

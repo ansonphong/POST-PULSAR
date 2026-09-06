@@ -9,7 +9,7 @@ import pytest
 
 from post_pulsar.admission import AdmissionError, DraftAdmissionService
 from post_pulsar.content import scan_inbox
-from post_pulsar.state import ProfileTargetSnapshot, StateRepository
+from post_pulsar.state import ConflictError, ProfileTargetSnapshot, StateRepository
 
 
 def _repository(tmp_path: Path) -> StateRepository:
@@ -141,3 +141,25 @@ def test_restart_recovers_every_admission_boundary(
     assert (recovered.phase == "installed") is installed
     assert (root / "QUEUE/hello/.ready").exists() is installed
     assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+
+
+def test_atomic_install_never_replaces_a_concurrent_destination(tmp_path: Path) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+
+    def race(boundary: str) -> None:
+        if boundary == "before_atomic_rename":
+            destination = root / "QUEUE/hello"
+            destination.mkdir()
+            (destination / "competitor").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ConflictError, match="destination"):
+        DraftAdmissionService(repository, root, fault_injector=race).admit(
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            expected_fingerprint=fingerprint,
+            intent_id=intent_id,
+        )
+    assert (root / "QUEUE/hello/competitor").read_text(encoding="utf-8") == "keep"
