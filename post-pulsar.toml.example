@@ -1,0 +1,24 @@
+# POST PULSAR non-secret settings.
+# Copy this file to post-pulsar.toml. Paths are relative to that file.
+
+[app]
+posts_directory = "posts"
+state_directory = ".post-pulsar"
+log_file = "post_pulsar.log"
+log_max_bytes = 5242880
+log_backups = 3
+
+[x]
+enabled = false
+user_id = ""
+request_timeout_seconds = 30
+processing_timeout_seconds = 300
+chunk_size_bytes = 4194304
+
+[instagram]
+enabled = false
+user_id = ""
+media_directory = "public-media"
+media_base_url = ""
+request_timeout_seconds = 30
+processing_timeout_seconds = 300
