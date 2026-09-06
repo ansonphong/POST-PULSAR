@@ -1157,17 +1157,18 @@ def test_operator_reconcile_resolves_only_ambiguous_delivery(
         expected_bundle_revision=blocked.revision,
     )
 
-    assert repository.get_bundle(bundle_key).status == "active"
     if published:
+        assert repository.get_bundle(bundle_key).status == "active"
         assert reconciled.status == "published"
         assert reconciled.remote_id == "93001"
     else:
+        assert repository.get_bundle(bundle_key).status == "blocked"
         assert reconciled.status == "failed"
-        assert reconciled.safe_to_retry
+        assert not reconciled.safe_to_retry
+        assert reconciled.next_attempt_at is None
         assert reconciled.phase == "ready"
-        resumed = repository.claim_delivery(bundle_key, "x", "resume")
-        assert resumed.attempt_count == claim.attempt_count
-        assert resumed.phase == "ready"
+        with pytest.raises(TransitionError):
+            repository.claim_delivery(bundle_key, "x", "resume")
         assert remote in repository.list_delivery_artifacts(bundle_key, "x")
 
 
