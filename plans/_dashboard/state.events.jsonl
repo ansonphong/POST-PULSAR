@@ -47,3 +47,12 @@
 {"event":"commit","sha":"5dc0bf7","message":"fix(archive): close lock and filesystem races","time":"2026-09-06T05:26:18Z"}
 {"event":"commit","sha":"5c4d682","message":"feat(instagram): add official publishing adapter","time":"2026-09-06T05:26:18Z"}
 {"event":"commit","sha":"e5b24a2","message":"feat(platforms): add official X v2 adapter","time":"2026-09-06T05:26:32Z"}
+{"event":"commit","sha":"fcd000b","message":"chore(plan): mark T2.3 DONE","time":"2026-09-06T05:29:55Z"}
+{"event":"commit","sha":"d6b3880","message":"fix(state): support resumable remote artifacts","time":"2026-09-06T05:36:30Z"}
+{"event":"commit","sha":"c30dc67","message":"fix(instagram): harden publishing lifecycle","time":"2026-09-06T05:46:44Z"}
+{"event":"commit","sha":"5efdd07","message":"feat: add journaled legacy migration","time":"2026-09-06T05:48:33Z"}
+{"event":"commit","sha":"1a260b7","message":"fix(x): harden resumable publishing","time":"2026-09-06T05:50:29Z"}
+{"event":"commit","sha":"e64a892","message":"fix(instagram): preserve resumable container state","time":"2026-09-06T06:09:15Z"}
+{"event":"commit","sha":"0ca898d","message":"fix(migration): bind durable cutover state","time":"2026-09-06T06:10:22Z"}
+{"event":"commit","sha":"44d39f8","message":"fix(migration): keep completed dry runs immutable","time":"2026-09-06T06:18:26Z"}
+{"event":"commit","sha":"bc7ab0f","message":"fix(platforms): close durable publishing boundaries","time":"2026-09-06T06:20:40Z"}

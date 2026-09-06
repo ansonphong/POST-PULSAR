@@ -32,7 +32,7 @@ stage_state: active
 
 - [x] #a30f `T3.1` **Task T3.1:** Define sanitized adapter and HTTP contracts
 - [ ] #bb50 `T3.2` **Task T3.2:** Implement the official X API v2 adapter
-- [ ] #25de `T3.3` **Task T3.3:** Implement the official Instagram adapter
+- [x] #25de `T3.3` **Task T3.3:** Implement the official Instagram adapter
 
 ### Phase 4: Orchestration, CLI, and Supply Chain ([`04-orchestration-cli-and-supply-chain.md`](04-orchestration-cli-and-supply-chain.md))
 
