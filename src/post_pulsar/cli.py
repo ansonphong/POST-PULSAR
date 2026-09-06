@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import getpass
+import getpass as tty_prompt
 import hashlib
 import ipaddress
 import json
@@ -1367,7 +1367,9 @@ class _GetpassInput:
         return self._stream.isatty()
 
     def readline(self) -> str:
-        return getpass.getpass("Operator approval secret: ", stream=sys.stderr) + "\n"
+        return (
+            tty_prompt.getpass("Operator approval secret: ", stream=sys.stderr) + "\n"
+        )
 
 
 def _secret_input(stream: IO[str]) -> IO[str] | _GetpassInput:
