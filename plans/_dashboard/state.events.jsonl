@@ -80,3 +80,12 @@
 {"event":"commit","sha":"75f6067","message":"style(cli): keep stub scan unambiguous","time":"2026-09-06T09:12:14Z"}
 {"event":"commit","sha":"ab5c1c1","message":"docs(plan): repair T4.6 control scope","time":"2026-09-06T09:17:59Z"}
 {"event":"commit","sha":"46ad023","message":"fix(control): complete durable control actions","time":"2026-09-06T09:33:45Z"}
+{"event":"commit","sha":"3f13a37","message":"chore(plan): mark T4.6 DONE","time":"2026-09-06T09:35:34Z"}
+{"event":"commit","sha":"bfa36d7","message":"fix(phase4): close daemon admission safety gaps","time":"2026-09-06T10:02:20Z"}
+{"event":"commit","sha":"f6a1e04","message":"test(state): require retry after negative reconciliation","time":"2026-09-06T10:04:17Z"}
+{"event":"commit","sha":"ddbf455","message":"docs(plan): add shared secure-file boundary","time":"2026-09-06T10:15:06Z"}
+{"event":"commit","sha":"a5eb623","message":"test: capture remaining control recovery and filesystem regressions","time":"2026-09-06T10:19:00Z"}
+{"event":"commit","sha":"023d86d","message":"fix: complete durable control recovery and private filesystem boundaries","time":"2026-09-06T10:30:49Z"}
+{"event":"commit","sha":"070fb49","message":"fix: recover explicit retries and verify operator completion end to end","time":"2026-09-06T10:34:33Z"}
+{"event":"commit","sha":"b5950f0","message":"test: retain paused scheduler assertion in its original case","time":"2026-09-06T10:35:37Z"}
+{"event":"commit","sha":"b540a54","message":"fix: restrict admission recovery to its recorded profile root","time":"2026-09-06T10:36:25Z"}
