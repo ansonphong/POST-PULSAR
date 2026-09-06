@@ -296,6 +296,8 @@ class PlatformAdapter(Protocol):
     @property
     def snapshot(self) -> PublicationSnapshot: ...
 
+    def verify_identity(self) -> None: ...
+
     def preflight(
         self, publication: PublicationRequest
     ) -> tuple[ValidationIssue, ...]: ...
@@ -342,6 +344,11 @@ class BasePlatformAdapter(ABC):
         if not self._closed:
             self._closed = True
             self._closer.close()
+
+    def verify_identity(self) -> None:
+        """Validate the configured remote account through a read-only request."""
+        self._assert_open()
+        self._verify_expected_identity()
 
     def preflight(self, publication: PublicationRequest) -> tuple[ValidationIssue, ...]:
         self._assert_publication(publication)

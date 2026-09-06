@@ -172,6 +172,27 @@ def test_open_existing_delete_race_never_recreates_database(
     assert not path.exists()
 
 
+def test_read_only_repository_cannot_mutate_canonical_state(tmp_path: Path) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    path = repository.path
+    repository.close()
+    before = path.stat()
+
+    with StateRepository.open_read_only(path, clock=clock) as reader:
+        assert reader.get_profile("ansonphong").profile_id == "ansonphong"
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.register_profile(
+                "second",
+                tmp_path / "accounts/second",
+                (),
+                config_hash="2" * 64,
+            )
+
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
 def test_public_readers_reconstruct_profile_work_after_reopen(tmp_path: Path) -> None:
     clock = FakeClock()
     path = tmp_path / "reconstruct.sqlite3"
@@ -588,6 +609,16 @@ def test_fifth_resumable_failure_blocks_without_discarding_remote_evidence(
     assert not failed.safe_to_retry
     assert repository.get_bundle(bundle_key).status == "blocked"
     assert repository.list_delivery_artifacts(bundle_key, "x") == (artifact,)
+    enabled = repository.operator_retry(
+        bundle_key,
+        "x",
+        expected_bundle_revision=repository.get_bundle(bundle_key).revision,
+        validated_snapshot=_target(),
+    )
+    assert enabled.phase == "processing"
+    resumed = repository.claim_delivery(bundle_key, "x", "operator-resume")
+    assert resumed.attempt_count == 1
+    assert resumed.phase == "processing"
 
 
 def test_artifact_checkpoint_is_idempotent_but_not_mutable(tmp_path: Path) -> None:
@@ -1062,6 +1093,70 @@ def test_operator_retry_is_guarded_and_resets_only_consecutive_failures(
     assert after.status == "failed"
     assert after.safe_to_retry
     assert repository.get_bundle(bundle_key).status == "active"
+
+
+@pytest.mark.parametrize("published", [True, False])
+def test_operator_reconcile_resolves_only_ambiguous_delivery(
+    tmp_path: Path, published: bool
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    claim = repository.claim_delivery(bundle_key, "x", "uncertain")
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "processing",
+        claim_token="uncertain",
+        attempt_count=claim.attempt_count,
+    )
+    remote = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="92001",
+        expires_at=clock() + timedelta(hours=1),
+        processing_metadata={"state": "succeeded"},
+        claim_token="uncertain",
+        attempt_count=claim.attempt_count,
+    )
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        claim_token="uncertain",
+        attempt_count=claim.attempt_count,
+    )
+    repository.mark_delivery_ambiguous(
+        bundle_key,
+        "x",
+        error_code="dispatch_uncertain",
+        error_message="Final result is unknown.",
+        claim_token="uncertain",
+        attempt_count=claim.attempt_count,
+    )
+    blocked = repository.get_bundle(bundle_key)
+
+    reconciled = repository.operator_reconcile(
+        bundle_key,
+        "x",
+        published_remote_id="93001" if published else None,
+        expected_bundle_revision=blocked.revision,
+    )
+
+    assert repository.get_bundle(bundle_key).status == "active"
+    if published:
+        assert reconciled.status == "published"
+        assert reconciled.remote_id == "93001"
+    else:
+        assert reconciled.status == "failed"
+        assert reconciled.safe_to_retry
+        assert reconciled.phase == "ready"
+        resumed = repository.claim_delivery(bundle_key, "x", "resume")
+        assert resumed.attempt_count == claim.attempt_count
+        assert resumed.phase == "ready"
+        assert remote in repository.list_delivery_artifacts(bundle_key, "x")
 
 
 def test_warning_events_are_allowlisted_deduplicated_and_secret_safe(

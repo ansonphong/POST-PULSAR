@@ -92,6 +92,7 @@ _EVENT_TYPES: Final = frozenset(
         "operator_retry_enabled",
         "delivery_failed",
         "delivery_ambiguous",
+        "delivery_reconciled",
         "fingerprint_drift",
         "profile_root_drift",
         "bundle_blocked",
@@ -705,6 +706,7 @@ class StateRepository:
         secret_values: Iterable[str] = (),
         busy_timeout_ms: int = 5000,
         _existing_only: bool = False,
+        _read_only: bool = False,
     ) -> None:
         if busy_timeout_ms < 1000:
             raise StateValidationError(
@@ -731,7 +733,8 @@ class StateRepository:
                 raise MigrationRequiredError(
                     "migration required: state database path is unsafe"
                 )
-            connect_target = f"{self.path.absolute().as_uri()}?mode=rw"
+            mode = "ro" if _read_only else "rw"
+            connect_target = f"{self.path.absolute().as_uri()}?mode={mode}"
             connect_as_uri = True
         try:
             self._connection = sqlite3.connect(
@@ -755,10 +758,13 @@ class StateRepository:
             self._initialize_schema()
             if expected_identity is not None:
                 self._verify_open_database_identity(expected_identity)
-            try:
-                self._connection.execute("PRAGMA journal_mode = WAL").fetchone()
-            except sqlite3.OperationalError:
-                return
+            if _read_only:
+                self._connection.execute("PRAGMA query_only = ON")
+            else:
+                try:
+                    self._connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                except sqlite3.OperationalError:
+                    return
         except BaseException:
             self._connection.close()
             raise
@@ -780,6 +786,25 @@ class StateRepository:
             secret_values=secret_values,
             busy_timeout_ms=busy_timeout_ms,
             _existing_only=True,
+        )
+
+    @classmethod
+    def open_read_only(
+        cls,
+        database_path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        secret_values: Iterable[str] = (),
+        busy_timeout_ms: int = 5000,
+    ) -> StateRepository:
+        """Open a canonical existing database through SQLite's read-only mode."""
+        return cls(
+            database_path,
+            clock=clock,
+            secret_values=secret_values,
+            busy_timeout_ms=busy_timeout_ms,
+            _existing_only=True,
+            _read_only=True,
         )
 
     def _verify_open_database_identity(self, expected: os.stat_result) -> None:
@@ -808,6 +833,18 @@ class StateRepository:
 
     def close(self) -> None:
         self._connection.close()
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """Hold one consistent deferred read transaction without write intent."""
+        self._connection.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     @property
     def schema_version(self) -> int:
@@ -2638,13 +2675,25 @@ class StateRepository:
                 raise TransitionError(
                     "operator retry requires a blocked failed delivery"
                 )
+            remote = self._connection.execute(
+                "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? "
+                "AND platform = ? AND attempt_count = ? "
+                "AND kind NOT IN ('staged_private', 'staged_public')",
+                (bundle_key, platform, int(delivery["attempt_count"])),
+            ).fetchone()
+            retained_phase = (
+                str(delivery["phase"])
+                if remote is not None
+                and str(delivery["phase"]) in {"preparing", "processing", "ready"}
+                else None
+            )
             now = self._now_text()
             self._connection.execute(
-                "UPDATE deliveries SET phase = NULL, consecutive_failures = 0, "
+                "UPDATE deliveries SET phase = ?, consecutive_failures = 0, "
                 "safe_to_retry = 1, next_attempt_at = ?, error_code = NULL, "
                 "error_message = NULL, revision = revision + 1, updated_at = ? "
                 "WHERE bundle_key = ? AND platform = ?",
-                (now, now, bundle_key, platform),
+                (retained_phase, now, now, bundle_key, platform),
             )
             other_block = self._connection.execute(
                 "SELECT 1 FROM deliveries WHERE bundle_key = ? AND platform != ? "
@@ -2663,6 +2712,86 @@ class StateRepository:
                 "operator_retry_enabled",
                 f"operator_retry:{int(delivery['attempt_count'])}",
                 {},
+            )
+        return self.get_delivery(bundle_key, platform)
+
+    def operator_reconcile(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        published_remote_id: str | None,
+        expected_bundle_revision: int,
+    ) -> DeliveryRecord:
+        """Resolve one ambiguous delivery from explicit operator evidence only."""
+        platform = _validate_platform(platform)
+        if published_remote_id is not None:
+            _validate_identifier(published_remote_id, "remote post ID")
+        with self._transaction():
+            bundle = self._bundle_row(bundle_key)
+            self._require_revision(bundle, expected_bundle_revision, "bundle")
+            delivery = self._delivery_row(bundle_key, platform)
+            if (
+                str(bundle["status"]) != "blocked"
+                or str(delivery["status"]) != "ambiguous"
+            ):
+                raise TransitionError(
+                    "operator reconcile requires a blocked ambiguous delivery"
+                )
+            now = self._now_text()
+            if published_remote_id is not None:
+                try:
+                    updated = self._connection.execute(
+                        "UPDATE deliveries SET status = 'published', phase = NULL, "
+                        "consecutive_failures = 0, safe_to_retry = 0, "
+                        "next_attempt_at = NULL, claim_token = NULL, "
+                        "remote_id = ?, error_code = NULL, error_message = NULL, "
+                        "revision = revision + 1, updated_at = ? "
+                        "WHERE bundle_key = ? AND platform = ? AND status = 'ambiguous'",
+                        (published_remote_id, now, bundle_key, platform),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ConflictError(
+                        "remote publication identity conflicts with durable state"
+                    ) from None
+                resolution = "published"
+            else:
+                remote = self._connection.execute(
+                    "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? "
+                    "AND platform = ? AND attempt_count = ? "
+                    "AND kind NOT IN ('staged_private', 'staged_public')",
+                    (bundle_key, platform, int(delivery["attempt_count"])),
+                ).fetchone()
+                retained_phase = "ready" if remote is not None else None
+                updated = self._connection.execute(
+                    "UPDATE deliveries SET status = 'failed', phase = ?, "
+                    "safe_to_retry = 1, next_attempt_at = ?, claim_token = NULL, "
+                    "remote_id = NULL, error_code = 'reconciled_not_published', "
+                    "error_message = 'Operator confirmed no publication exists.', "
+                    "revision = revision + 1, updated_at = ? "
+                    "WHERE bundle_key = ? AND platform = ? AND status = 'ambiguous'",
+                    (retained_phase, now, now, bundle_key, platform),
+                )
+                resolution = "not_published"
+            if updated.rowcount != 1:
+                raise ConflictError("ambiguous delivery changed during reconciliation")
+            other_block = self._connection.execute(
+                "SELECT 1 FROM deliveries WHERE bundle_key = ? AND platform != ? "
+                "AND (status = 'ambiguous' OR (status = 'failed' AND safe_to_retry = 0))",
+                (bundle_key, platform),
+            ).fetchone()
+            if other_block is None:
+                self._connection.execute(
+                    "UPDATE bundles SET status = 'active', block_reason = NULL, "
+                    "revision = revision + 1, updated_at = ? WHERE bundle_key = ?",
+                    (now, bundle_key),
+                )
+            self._insert_event_locked(
+                bundle_key,
+                platform,
+                "delivery_reconciled",
+                f"delivery_reconciled:{int(delivery['attempt_count'])}",
+                {"resolution": resolution},
             )
         return self.get_delivery(bundle_key, platform)
 
