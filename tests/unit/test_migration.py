@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 from post_pulsar.config import ProfileSettings
 from post_pulsar.locking import LockContentionError, LockManager
@@ -22,6 +23,18 @@ from post_pulsar.migration import (
 from post_pulsar.state import SCHEMA_VERSION, StateRepository
 
 CONFIG_HASH = "c" * 64
+
+
+def _resign_journal(document: dict[str, object]) -> None:
+    plan = {
+        key: value
+        for key, value in document.items()
+        if key not in {"version", "plan_sha256"}
+    }
+    payload = json.dumps(
+        plan, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    document["plan_sha256"] = hashlib.sha256(payload).hexdigest()
 
 
 def _profile(tmp_path: Path) -> ProfileSettings:
@@ -186,6 +199,23 @@ def test_unknown_database_schema_is_byte_for_byte_untouched(tmp_path: Path) -> N
     assert not (tmp_path / "state/legacy-migration-v1.json").exists()
 
 
+def test_dry_run_rejects_unknown_database_without_writes(tmp_path: Path) -> None:
+    root = _legacy(tmp_path)
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    database.parent.mkdir()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 99")
+    before_database = database.read_bytes()
+    before_source = (root / "cat.jpg").read_bytes()
+
+    with pytest.raises(MigrationError, match="schema"):
+        _run(tmp_path, mode="dry-run")
+
+    assert database.read_bytes() == before_database
+    assert (root / "cat.jpg").read_bytes() == before_source
+    assert not (tmp_path / "state/legacy-migration-v1.json").exists()
+
+
 def test_current_database_is_backed_up_owner_only_before_import(tmp_path: Path) -> None:
     _legacy(tmp_path)
     database = tmp_path / "state/post_pulsar.sqlite3"
@@ -199,6 +229,57 @@ def test_current_database_is_backed_up_owner_only_before_import(tmp_path: Path) 
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("boundary", ["after_journal_created", "after_state_ready"])
+def test_current_database_backup_binding_resumes_after_crash(
+    tmp_path: Path, boundary: str
+) -> None:
+    _legacy(tmp_path)
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    with StateRepository(database):
+        pass
+
+    def crash(candidate: str) -> None:
+        if candidate == boundary:
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+
+    report = _run(tmp_path, mode="apply")
+
+    assert report.phase == "complete"
+    assert (tmp_path / "state/post_pulsar.pre-migration-v1.sqlite3").is_file()
+
+
+@pytest.mark.parametrize("mode", ["dry-run", "apply"])
+def test_foreign_preexisting_backup_is_rejected_before_mutation(
+    tmp_path: Path, mode: str
+) -> None:
+    root = _legacy(tmp_path)
+    state = tmp_path / "state"
+    database = state / "post_pulsar.sqlite3"
+    with StateRepository(database):
+        pass
+    foreign = tmp_path / "foreign.sqlite3"
+    with StateRepository(foreign) as repository:
+        repository.register_profile(
+            "foreign", tmp_path / "foreign-account", (), config_hash="f" * 64
+        )
+    backup = state / "post_pulsar.pre-migration-v1.sqlite3"
+    backup.write_bytes(foreign.read_bytes())
+    backup.chmod(0o600)
+    before_database = database.read_bytes()
+    before_backup = backup.read_bytes()
+
+    with pytest.raises(MigrationError, match="backup"):
+        _run(tmp_path, mode=mode)
+
+    assert database.read_bytes() == before_database
+    assert backup.read_bytes() == before_backup
+    assert (root / "cat.jpg").exists()
+    assert not (state / "legacy-migration-v1.json").exists()
 
 
 def test_symlinked_member_and_profile_mismatch_fail_without_external_mutation(
@@ -234,6 +315,34 @@ def test_daemon_instance_contention_stops_before_migration(tmp_path: Path) -> No
 
     assert (root / "cat.jpg").exists()
     assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
+
+
+def test_profile_contention_stops_before_cutover_and_lease_is_released(
+    tmp_path: Path,
+) -> None:
+    root = _legacy(tmp_path)
+    state = tmp_path / "state"
+    LockManager(state)
+    external = FileLock(state / "locks/profiles/operator.lock")
+    external.acquire(timeout=0)
+    try:
+        with pytest.raises(LockContentionError):
+            _run(tmp_path, mode="apply")
+    finally:
+        external.release()
+
+    assert (root / "cat.jpg").exists()
+    assert not (state / "post_pulsar.sqlite3").exists()
+    assert not (state / "legacy-migration-v1.json").exists()
+
+    _run(tmp_path, mode="apply")
+    locks = LockManager(state)
+    with locks.acquire_instance() as instance:
+        with locks.acquire_maintenance(instance) as maintenance:
+            with locks.acquire_profiles(
+                instance, ("operator",), maintenance=maintenance
+            ):
+                pass
 
 
 def test_journal_does_not_contain_legacy_secret_file_contents(tmp_path: Path) -> None:
@@ -290,7 +399,128 @@ def test_tampered_journal_paths_are_rejected_before_mutation(tmp_path: Path) -> 
     journal.write_text(json.dumps(document), encoding="utf-8")
     journal.chmod(0o600)
 
-    with pytest.raises(MigrationError, match="journal item"):
+    with pytest.raises(MigrationError, match="journal"):
+        _run(tmp_path, mode="apply")
+
+    assert (root / "cat.jpg").exists()
+    assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
+
+
+def test_journal_member_manifest_is_rebound_before_any_mutation(tmp_path: Path) -> None:
+    root = _legacy(tmp_path)
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_journal_created":
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+    journal = tmp_path / "state/legacy-migration-v1.json"
+    document = json.loads(journal.read_text("utf-8"))
+    config = root / "config.json"
+    document["items"][0]["members"].append(
+        {
+            "relative_name": "config.json",
+            "role": "caption",
+            "sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "size_bytes": config.stat().st_size,
+        }
+    )
+    _resign_journal(document)
+    journal.write_text(json.dumps(document), encoding="utf-8")
+    journal.chmod(0o600)
+
+    with pytest.raises(MigrationError, match="journal"):
+        _run(tmp_path, mode="apply")
+
+    assert config.read_text("utf-8") == "do-not-read"
+    assert not tuple(_profile(tmp_path).account_root.rglob("config.json"))
+    assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
+
+
+def test_resigned_journal_cannot_alias_a_member_from_another_bundle(
+    tmp_path: Path,
+) -> None:
+    root = _legacy(tmp_path)
+    catalog = root / "catalog.jpg"
+    catalog.write_bytes(b"catalog-image")
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_journal_created":
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+    journal = tmp_path / "state/legacy-migration-v1.json"
+    document = json.loads(journal.read_text("utf-8"))
+    cat_item = next(item for item in document["items"] if item["bundle_id"] == "cat")
+    cat_item["members"].append(
+        {
+            "relative_name": "catalog.jpg",
+            "role": "image",
+            "sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+            "size_bytes": catalog.stat().st_size,
+        }
+    )
+    cat_item["members"].sort(key=lambda member: member["relative_name"])
+    _resign_journal(document)
+    journal.write_text(json.dumps(document), encoding="utf-8")
+    journal.chmod(0o600)
+
+    with pytest.raises(MigrationError, match="manifest"):
+        _run(tmp_path, mode="apply")
+
+    assert catalog.read_bytes() == b"catalog-image"
+    assert not tuple(
+        path
+        for path in _profile(tmp_path).account_root.rglob("catalog.jpg")
+        if path.parent.name.startswith(".cat.") or path.parent.name == "cat"
+    )
+    assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
+
+
+def test_journal_unknown_fields_are_rejected_before_mutation(tmp_path: Path) -> None:
+    root = _legacy(tmp_path)
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_journal_created":
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+    journal = tmp_path / "state/legacy-migration-v1.json"
+    document = json.loads(journal.read_text("utf-8"))
+    document["unexpected"] = "ignored-by-old-parser"
+    _resign_journal(document)
+    journal.write_text(json.dumps(document), encoding="utf-8")
+    journal.chmod(0o600)
+
+    with pytest.raises(MigrationError, match="journal"):
+        _run(tmp_path, mode="apply")
+
+    assert (root / "cat.jpg").exists()
+    assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
+
+
+def test_journal_unknown_member_role_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    root = _legacy(tmp_path)
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_journal_created":
+            raise RuntimeError("injected crash")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _run(tmp_path, mode="apply", fault=crash)
+    journal = tmp_path / "state/legacy-migration-v1.json"
+    document = json.loads(journal.read_text("utf-8"))
+    document["items"][0]["members"][0]["role"] = "credential"
+    _resign_journal(document)
+    journal.write_text(json.dumps(document), encoding="utf-8")
+    journal.chmod(0o600)
+
+    with pytest.raises(MigrationError, match="journal"):
         _run(tmp_path, mode="apply")
 
     assert (root / "cat.jpg").exists()

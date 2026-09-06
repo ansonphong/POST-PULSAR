@@ -37,6 +37,7 @@ from post_pulsar.state import (
 
 MigrationMode = Literal["dry-run", "apply"]
 MigrationDisposition = Literal["active", "archived"]
+MigrationMemberRole = Literal["caption", "alt_text", "image", "video"]
 
 _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_RE: Final = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?\Z")
@@ -44,7 +45,7 @@ _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 _JOURNAL_NAME: Final = "legacy-migration-v1.json"
 _BACKUP_NAME: Final = "post_pulsar.pre-migration-v1.sqlite3"
 _DATABASE_NAME: Final = "post_pulsar.sqlite3"
-_JOURNAL_VERSION: Final = 1
+_JOURNAL_VERSION: Final = 2
 _COPY_BYTES: Final = 1024 * 1024
 
 
@@ -63,6 +64,7 @@ class MigrationMember:
     """One immutable legacy source member."""
 
     relative_name: str
+    role: MigrationMemberRole
     sha256: str
     size_bytes: int
 
@@ -100,6 +102,7 @@ class _MigrationPlan:
     account_root: str
     state_directory: str
     config_hash: str
+    database_sha256: str | None
     phase: str
     items: tuple[MigrationItem, ...]
     untouched: tuple[str, ...]
@@ -128,7 +131,7 @@ def migrate_legacy_layout(
     _reject_path_overlap(legacy_root, state_root, "state destination")
     journal_path = state_root / _JOURNAL_NAME
 
-    journal_existed = journal_path.exists()
+    journal_existed = os.path.lexists(journal_path)
     if journal_existed:
         plan = _load_plan(journal_path)
         _assert_plan_binding(
@@ -139,6 +142,7 @@ def migrate_legacy_layout(
             state_root,
             config_hash,
         )
+        _rebind_semantic_plan(plan, legacy_root, account_root)
     else:
         plan = _build_plan(
             selected_profile_id,
@@ -149,51 +153,56 @@ def migrate_legacy_layout(
         )
         _validate_destinations(plan, allow_existing=False)
 
+    database = state_root / _DATABASE_NAME
+    backup = state_root / _BACKUP_NAME
     if normalized_mode == "dry-run":
+        plan = _preflight_state(plan, database, backup, resuming=journal_existed)
         return _report(plan, "dry-run")
 
     injector = cast(MigrationFaultInjector | None, fault_injector)
     locks = LockManager(state_root)
     with locks.acquire_instance() as instance:
-        with locks.acquire_maintenance(instance):
-            database = state_root / _DATABASE_NAME
-            database_existed = database.exists()
-            _inspect_database(database)
-            _validate_state_compatibility(database, plan, resuming=journal_existed)
-            _validate_destinations(plan, allow_existing=journal_existed)
-            if plan.phase == "complete":
-                _validate_completed(plan, database, legacy_root, account_root)
-                return _report(plan, "apply")
-            if not journal_existed:
-                _write_plan(journal_path, plan)
-                _inject(injector, "after_journal_created")
-            if database_existed:
-                _ensure_backup(database, state_root / _BACKUP_NAME)
-
-            with StateRepository(database) as repository:
-                repository.register_profile(
-                    profile.profile_id,
-                    account_root,
-                    _profile_targets(profile),
-                    config_hash=config_hash,
+        with locks.acquire_maintenance(instance) as maintenance:
+            with locks.acquire_profiles(
+                instance, (selected_profile_id,), maintenance=maintenance
+            ):
+                database_existed = os.path.lexists(database)
+                plan = _preflight_state(
+                    plan, database, backup, resuming=journal_existed
                 )
-                if plan.phase == "planned":
-                    plan = _replace_phase(plan, "state_ready")
+                if plan.phase == "complete":
+                    _validate_completed(plan, database, legacy_root, account_root)
+                    return _report(plan, "apply")
+                if not journal_existed:
                     _write_plan(journal_path, plan)
-                    _inject(injector, "after_state_ready")
-                _apply_items(
-                    plan,
-                    repository,
-                    legacy_root,
-                    account_root,
-                    selected_profile_id,
-                    injector,
-                )
+                    _inject(injector, "after_journal_created")
+                if database_existed and plan.database_sha256 is not None:
+                    _ensure_backup(database, backup, plan.database_sha256)
 
-            _validate_current_state(database, selected_profile_id, len(plan.items))
-            plan = _replace_phase(plan, "complete")
-            _write_plan(journal_path, plan)
-            _inject(injector, "after_migration_complete")
+                with StateRepository(database) as repository:
+                    repository.register_profile(
+                        profile.profile_id,
+                        account_root,
+                        _profile_targets(profile),
+                        config_hash=config_hash,
+                    )
+                    if plan.phase == "planned":
+                        plan = _replace_phase(plan, "state_ready")
+                        _write_plan(journal_path, plan)
+                        _inject(injector, "after_state_ready")
+                    _apply_items(
+                        plan,
+                        repository,
+                        legacy_root,
+                        account_root,
+                        selected_profile_id,
+                        injector,
+                    )
+
+                _validate_current_state(database, selected_profile_id, len(plan.items))
+                plan = _replace_phase(plan, "complete")
+                _write_plan(journal_path, plan)
+                _inject(injector, "after_migration_complete")
     return _report(plan, "apply")
 
 
@@ -318,6 +327,7 @@ def _build_plan(
         str(account_root),
         str(state_root),
         config_hash,
+        None,
         "planned",
         tuple(items),
         untouched,
@@ -346,7 +356,19 @@ def _capture_member(path: Path, root: Path) -> MigrationMember:
     if path.parent != root:
         raise MigrationError("legacy bundle member escaped its flat source")
     digest, size, _identity = _hash_regular(root, path.name)
-    return MigrationMember(path.name, digest, size)
+    return MigrationMember(path.name, _member_role(path.name), digest, size)
+
+
+def _member_role(name: str) -> MigrationMemberRole:
+    path = Path(name)
+    extension = path.suffix.casefold()
+    if extension == ".txt":
+        return "alt_text" if path.stem.casefold().endswith("-alt") else "caption"
+    if extension in {".jpg", ".jpeg", ".png", ".gif"}:
+        return "image"
+    if extension in {".mp4", ".mov"}:
+        return "video"
+    raise MigrationError("migration journal member role is invalid")
 
 
 def _fingerprint_from_source(root: Path, bundle_id: str) -> str:
@@ -375,6 +397,72 @@ def _validate_destinations(plan: _MigrationPlan, *, allow_existing: bool) -> Non
             _verify_destination(final, item, require_ready=True)
         if allow_existing and os.path.lexists(staging):
             _validate_staging_checkpoint(staging, item)
+
+
+def _rebind_semantic_plan(
+    plan: _MigrationPlan, legacy_root: Path, account_root: Path
+) -> None:
+    """Prove every journal item is still an exact parser-produced bundle."""
+
+    scans: dict[str, tuple[ContentBundle, ...]] = {}
+    represented: dict[str, set[str]] = {"root": set(), "posted": set()}
+    for source_relative in ("root", "posted"):
+        source = legacy_root if source_relative == "root" else legacy_root / "posted"
+        if source_relative == "posted" and not os.path.lexists(source):
+            scans[source_relative] = ()
+            continue
+        bundles, _issues = _scan_legacy_location(
+            source,
+            excluded_directory="posted" if source_relative == "root" else None,
+        )
+        scans[source_relative] = bundles
+
+    expected_by_source = {
+        (item.source_relative, item.bundle_id): item for item in plan.items
+    }
+    for source_relative, bundles in scans.items():
+        for bundle in bundles:
+            key = (source_relative, bundle.bundle_id)
+            item = expected_by_source.get(key)
+            if item is None:
+                raise MigrationError("migration journal omits a source bundle")
+            represented[source_relative].add(bundle.bundle_id)
+            _compare_bundle_manifest(bundle, item, legacy_root)
+
+    for item in plan.items:
+        destination = account_root / item.destination_relative
+        if os.path.lexists(destination):
+            _verify_destination(destination, item, require_ready=True)
+            continue
+        if item.bundle_id not in represented[item.source_relative]:
+            raise MigrationError("migration journal bundle no longer matches source")
+
+
+def _compare_bundle_manifest(
+    bundle: ContentBundle, item: MigrationItem, legacy_root: Path
+) -> None:
+    source = (
+        legacy_root
+        if item.source_relative == "root"
+        else legacy_root / item.source_relative
+    )
+    expected = tuple(
+        (member.relative_name, member.role, member.sha256, member.size_bytes)
+        for member in item.members
+    )
+    actual = tuple(
+        (
+            path.name,
+            _member_role(path.name),
+            *_hash_regular(source, path.name)[:2],
+        )
+        for path in sorted(
+            bundle.members,
+            key=lambda candidate: (candidate.name.casefold(), candidate.name),
+        )
+    )
+    if bundle.fingerprint != item.fingerprint or actual != expected:
+        raise MigrationError("migration journal member manifest conflicts with source")
 
 
 def _validate_staging_checkpoint(staging: Path, item: MigrationItem) -> None:
@@ -754,6 +842,36 @@ def _inspect_database(database: Path) -> None:
         ) from None
 
 
+def _preflight_state(
+    plan: _MigrationPlan,
+    database: Path,
+    backup: Path,
+    *,
+    resuming: bool,
+) -> _MigrationPlan:
+    """Run identical read-only state checks for dry-run and apply."""
+
+    _inspect_database(database)
+    if not resuming:
+        database_sha256 = (
+            _database_content_digest(database, label="database")
+            if os.path.lexists(database)
+            else None
+        )
+        plan = _replace_database_digest(plan, database_sha256)
+    elif plan.database_sha256 is not None and not _SHA256_RE.fullmatch(
+        plan.database_sha256
+    ):
+        raise MigrationError("migration database binding is invalid")
+    _validate_state_compatibility(database, plan, resuming=resuming)
+    _validate_destinations(plan, allow_existing=resuming)
+    if os.path.lexists(backup):
+        if plan.database_sha256 is None:
+            raise MigrationError("migration backup has no database binding")
+        _validate_backup(backup, plan.database_sha256)
+    return plan
+
+
 def _validate_state_compatibility(
     database: Path, plan: _MigrationPlan, *, resuming: bool
 ) -> None:
@@ -808,12 +926,12 @@ def _validate_state_compatibility(
         raise MigrationError("migration resume admissions conflict")
 
 
-def _ensure_backup(database: Path, backup: Path) -> None:
-    if backup.exists():
-        if stat.S_IMODE(backup.stat().st_mode) != 0o600:
-            raise MigrationError("migration backup permissions are unsafe")
-        _inspect_database(backup)
+def _ensure_backup(database: Path, backup: Path, expected_digest: str) -> None:
+    if os.path.lexists(backup):
+        _validate_backup(backup, expected_digest)
         return
+    if _database_content_digest(database, label="database") != expected_digest:
+        raise MigrationError("migration database changed before backup")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".migration-backup-", dir=backup.parent
     )
@@ -828,14 +946,87 @@ def _ensure_backup(database: Path, backup: Path) -> None:
             source.backup(destination)
         with temporary.open("rb") as copied:
             os.fsync(copied.fileno())
+        _validate_backup(temporary, expected_digest)
         os.link(temporary, backup, follow_symlinks=False)
         backup.chmod(0o600)
         _fsync_path(backup.parent)
+        _validate_backup(backup, expected_digest)
     except FileExistsError:
-        if not backup.is_file():
-            raise MigrationError("migration backup destination conflicts") from None
+        _validate_backup(backup, expected_digest)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _validate_backup(backup: Path, expected_digest: str) -> None:
+    try:
+        metadata = os.lstat(backup)
+    except OSError:
+        raise MigrationError("migration backup is unavailable") from None
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+    ):
+        raise MigrationError("migration backup permissions or identity are unsafe")
+    _inspect_database(backup)
+    if (
+        _database_content_digest(backup, label="backup", require_owner_only=True)
+        != expected_digest
+    ):
+        raise MigrationError(
+            "migration backup does not match the pre-migration database"
+        )
+
+
+def _database_content_digest(
+    database: Path, *, label: str, require_owner_only: bool = False
+) -> str:
+    """Hash canonical schema and rows while proving the named file stayed stable."""
+
+    try:
+        before = os.lstat(database)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(database, flags)
+    except OSError:
+        raise MigrationError(f"migration {label} identity is unsafe") from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or not os.path.samestat(before, opened)
+            or (
+                require_owner_only
+                and (
+                    stat.S_IMODE(opened.st_mode) != 0o600
+                    or (hasattr(os, "geteuid") and opened.st_uid != os.geteuid())
+                )
+            )
+        ):
+            raise MigrationError(f"migration {label} identity is unsafe")
+        digest = hashlib.sha256()
+        with _read_only_database(database) as connection:
+            connection.execute("BEGIN")
+            for statement in connection.iterdump():
+                encoded = statement.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+            connection.rollback()
+        after = os.lstat(database)
+        if not os.path.samestat(opened, after) or (
+            require_owner_only
+            and (
+                stat.S_IMODE(after.st_mode) != 0o600
+                or (hasattr(os, "geteuid") and after.st_uid != os.geteuid())
+            )
+        ):
+            raise MigrationError(f"migration {label} identity changed")
+        return digest.hexdigest()
+    except (OSError, sqlite3.DatabaseError, UnicodeError):
+        raise MigrationError(f"migration {label} could not be authenticated") from None
+    finally:
+        os.close(descriptor)
 
 
 def _validate_current_state(database: Path, profile_id: str, item_count: int) -> None:
@@ -895,7 +1086,12 @@ def _read_only_database(path: Path):  # type: ignore[no-untyped-def]
 
 
 def _write_plan(path: Path, plan: _MigrationPlan) -> None:
-    document = {"version": _JOURNAL_VERSION, **asdict(plan)}
+    plan_document = asdict(plan)
+    document = {
+        "version": _JOURNAL_VERSION,
+        "plan_sha256": _canonical_document_digest(plan_document),
+        **plan_document,
+    }
     payload = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
@@ -928,54 +1124,162 @@ def _load_plan(path: Path) -> _MigrationPlan:
     ):
         raise MigrationError("migration journal is unsafe")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, Mapping) or data.get("version") != _JOURNAL_VERSION:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            opened = os.fstat(source.fileno())
+            payload = source.read(1024 * 1024 + 1)
+        after = os.lstat(path)
+        if (
+            not os.path.samestat(metadata, opened)
+            or not os.path.samestat(opened, after)
+            or len(payload) > 1024 * 1024
+        ):
+            raise ValueError
+        data = json.loads(payload.decode("utf-8"))
+        root_keys = {
+            "version",
+            "plan_sha256",
+            "profile_id",
+            "legacy_root",
+            "account_root",
+            "state_directory",
+            "config_hash",
+            "database_sha256",
+            "phase",
+            "items",
+            "untouched",
+            "issues",
+        }
+        if (
+            not isinstance(data, Mapping)
+            or set(data) != root_keys
+            or data.get("version") != _JOURNAL_VERSION
+            or not isinstance(data.get("plan_sha256"), str)
+            or any(
+                not isinstance(data[key], str)
+                for key in {
+                    "profile_id",
+                    "legacy_root",
+                    "account_root",
+                    "state_directory",
+                    "config_hash",
+                    "phase",
+                }
+            )
+            or (
+                data["database_sha256"] is not None
+                and not isinstance(data["database_sha256"], str)
+            )
+            or not isinstance(data["items"], list)
+            or not isinstance(data["untouched"], list)
+            or any(not isinstance(value, str) for value in data["untouched"])
+            or not isinstance(data["issues"], list)
+            or any(not isinstance(value, str) for value in data["issues"])
+        ):
+            raise ValueError
+        plan_document = {
+            key: data[key] for key in root_keys - {"version", "plan_sha256"}
+        }
+        if (
+            not hashlib.sha256(
+                json.dumps(
+                    plan_document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode()
+            ).hexdigest()
+            == data["plan_sha256"]
+        ):
             raise ValueError
         raw_items = data["items"]
         if not isinstance(raw_items, list):
             raise ValueError
         items: list[MigrationItem] = []
         for raw_item in raw_items:
-            if not isinstance(raw_item, Mapping) or not isinstance(
-                raw_item.get("members"), list
+            if (
+                not isinstance(raw_item, Mapping)
+                or set(raw_item)
+                != {
+                    "bundle_id",
+                    "disposition",
+                    "source_relative",
+                    "destination_relative",
+                    "fingerprint",
+                    "members",
+                }
+                or not isinstance(raw_item.get("members"), list)
+                or any(
+                    not isinstance(raw_item[key], str)
+                    for key in {
+                        "bundle_id",
+                        "disposition",
+                        "source_relative",
+                        "destination_relative",
+                        "fingerprint",
+                    }
+                )
             ):
                 raise ValueError
-            members = tuple(
-                MigrationMember(
-                    str(member["relative_name"]),
-                    str(member["sha256"]),
-                    int(member["size_bytes"]),
+            members_list: list[MigrationMember] = []
+            for member in raw_item["members"]:
+                if (
+                    not isinstance(member, Mapping)
+                    or set(member) != {"relative_name", "role", "sha256", "size_bytes"}
+                    or not isinstance(member["relative_name"], str)
+                    or not isinstance(member["role"], str)
+                    or member["role"] not in {"caption", "alt_text", "image", "video"}
+                    or not isinstance(member["sha256"], str)
+                    or not isinstance(member["size_bytes"], int)
+                    or isinstance(member["size_bytes"], bool)
+                ):
+                    raise ValueError
+                members_list.append(
+                    MigrationMember(
+                        member["relative_name"],
+                        cast(MigrationMemberRole, member["role"]),
+                        member["sha256"],
+                        member["size_bytes"],
+                    )
                 )
-                for member in raw_item["members"]
-                if isinstance(member, Mapping)
-            )
-            if len(members) != len(raw_item["members"]):
-                raise ValueError
-            disposition = str(raw_item["disposition"])
+            members = tuple(members_list)
+            disposition = raw_item["disposition"]
             if disposition not in {"active", "archived"}:
                 raise ValueError
             items.append(
                 MigrationItem(
-                    str(raw_item["bundle_id"]),
+                    raw_item["bundle_id"],
                     cast(MigrationDisposition, disposition),
-                    str(raw_item["source_relative"]),
-                    str(raw_item["destination_relative"]),
-                    str(raw_item["fingerprint"]),
+                    raw_item["source_relative"],
+                    raw_item["destination_relative"],
+                    raw_item["fingerprint"],
                     members,
                 )
             )
         plan = _MigrationPlan(
-            str(data["profile_id"]),
-            str(data["legacy_root"]),
-            str(data["account_root"]),
-            str(data["state_directory"]),
-            str(data["config_hash"]),
-            str(data["phase"]),
+            data["profile_id"],
+            data["legacy_root"],
+            data["account_root"],
+            data["state_directory"],
+            data["config_hash"],
+            (
+                str(data["database_sha256"])
+                if data["database_sha256"] is not None
+                else None
+            ),
+            data["phase"],
             tuple(items),
             tuple(str(value) for value in data["untouched"]),
             tuple(str(value) for value in data["issues"]),
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeError):
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        UnicodeError,
+    ):
         raise MigrationError("migration journal is invalid") from None
     _validate_loaded_plan(plan)
     return plan
@@ -988,6 +1292,21 @@ def _validate_loaded_plan(plan: _MigrationPlan) -> None:
         plan.config_hash
     ):
         raise MigrationError("migration journal identity is invalid")
+    if plan.database_sha256 is not None and not _SHA256_RE.fullmatch(
+        plan.database_sha256
+    ):
+        raise MigrationError("migration journal database binding is invalid")
+    if not plan.items or plan.items != tuple(
+        sorted(
+            plan.items,
+            key=lambda item: (
+                item.disposition,
+                item.bundle_id.casefold(),
+                item.bundle_id,
+            ),
+        )
+    ):
+        raise MigrationError("migration journal item ordering is invalid")
     seen: set[str] = set()
     for item in plan.items:
         expected_source = "root" if item.disposition == "active" else "posted"
@@ -1007,6 +1326,16 @@ def _validate_loaded_plan(plan: _MigrationPlan) -> None:
             raise MigrationError("migration journal item is invalid")
         seen.add(item.bundle_id.casefold())
         names: set[str] = set()
+        if item.members != tuple(
+            sorted(
+                item.members,
+                key=lambda member: (
+                    member.relative_name.casefold(),
+                    member.relative_name,
+                ),
+            )
+        ):
+            raise MigrationError("migration journal member ordering is invalid")
         for member in item.members:
             if (
                 Path(member.relative_name).name != member.relative_name
@@ -1014,6 +1343,7 @@ def _validate_loaded_plan(plan: _MigrationPlan) -> None:
                 or member.relative_name.casefold() in names
                 or not _SHA256_RE.fullmatch(member.sha256)
                 or member.size_bytes <= 0
+                or member.role != _member_role(member.relative_name)
             ):
                 raise MigrationError("migration journal member is invalid")
             names.add(member.relative_name.casefold())
@@ -1021,6 +1351,10 @@ def _validate_loaded_plan(plan: _MigrationPlan) -> None:
         path = Path(value)
         if not value or path.is_absolute() or ".." in path.parts:
             raise MigrationError("migration journal untouched path is invalid")
+    if plan.untouched != tuple(
+        sorted(set(plan.untouched), key=lambda value: (value.casefold(), value))
+    ) or plan.issues != tuple(sorted(set(plan.issues))):
+        raise MigrationError("migration journal diagnostics are invalid")
 
 
 def _assert_plan_binding(
@@ -1050,11 +1384,36 @@ def _replace_phase(plan: _MigrationPlan, phase: str) -> _MigrationPlan:
         plan.account_root,
         plan.state_directory,
         plan.config_hash,
+        plan.database_sha256,
         phase,
         plan.items,
         plan.untouched,
         plan.issues,
     )
+
+
+def _replace_database_digest(
+    plan: _MigrationPlan, database_sha256: str | None
+) -> _MigrationPlan:
+    return _MigrationPlan(
+        plan.profile_id,
+        plan.legacy_root,
+        plan.account_root,
+        plan.state_directory,
+        plan.config_hash,
+        database_sha256,
+        plan.phase,
+        plan.items,
+        plan.untouched,
+        plan.issues,
+    )
+
+
+def _canonical_document_digest(document: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _report(plan: _MigrationPlan, mode: MigrationMode) -> MigrationReport:
