@@ -1,5 +1,5 @@
 ---
-stage: 4
+stage: 5
 target: standard
 repo: post-pulsar
 context: ["plans/post-pulsar-modernization/01-brainstorm.md", "plans/post-pulsar-modernization/02-design.md", "plans/post-pulsar-modernization/02-design-evaluation.md", "plans/post-pulsar-modernization/03-hardening-amendments.md"]
@@ -7,7 +7,7 @@ docs: ["README.md", "https://docs.x.com/x-api/media/initialize-media-upload", "h
 depends: none
 blocks: none
 why: "The relocated repository still contains the PHONG-BOT identity, fragile filename globbing, obsolete/private platform integrations, plaintext credential loading, broken X video upload, and no durable per-platform delivery state. This plan modernizes the existing two-platform publishing product without adding product features."
-stage_state: done
+stage_state: active
 ---
 
 # POST PULSAR Modernization — Master Plan
