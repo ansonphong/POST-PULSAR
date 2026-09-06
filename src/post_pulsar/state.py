@@ -74,6 +74,7 @@ _PROCESSING_METADATA_KEYS: Final = frozenset(
         "next_segment_index",
         "source_sha256",
         "media_type",
+        "processing_deadline",
     }
 )
 _WARNING_CODES: Final = frozenset(
@@ -1670,6 +1671,8 @@ class StateRepository:
         external_id: str,
         expected_processing_metadata: Mapping[str, object],
         processing_metadata: Mapping[str, object],
+        expected_expires_at: datetime | None = None,
+        expires_at: datetime | None = None,
         claim_token: str,
         attempt_count: int,
     ) -> ArtifactRecord:
@@ -1689,6 +1692,12 @@ class StateRepository:
         _validate_identifier(external_id, "remote artifact ID")
         expected_json = self._processing_metadata_json(expected_processing_metadata)
         metadata_json = self._processing_metadata_json(processing_metadata)
+        expected_expiry = (
+            None if expected_expires_at is None else _timestamp(expected_expires_at)
+        )
+        replacement_expiry = None if expires_at is None else _timestamp(expires_at)
+        if expires_at is not None and expires_at.astimezone(UTC) <= self._now():
+            raise StateValidationError("artifact processing expiry must be in the future")
         with self._transaction():
             delivery = self._delivery_row(bundle_key, platform)
             self._require_delivery_claim(delivery, claim_token, attempt_count)
@@ -1707,15 +1716,23 @@ class StateRepository:
                 raise ConflictError("artifact processing identity changed")
             if str(artifact["processing_metadata_json"]) != expected_json:
                 raise ConflictError("artifact processing metadata changed")
-            if metadata_json != expected_json:
+            stored_expiry = (
+                None if artifact["expires_at"] is None else str(artifact["expires_at"])
+            )
+            if expected_expiry is not None and stored_expiry != expected_expiry:
+                raise ConflictError("artifact processing expiry changed")
+            next_expiry = replacement_expiry or stored_expiry
+            if metadata_json != expected_json or next_expiry != stored_expiry:
                 now = self._now_text()
                 updated = self._connection.execute(
-                    "UPDATE delivery_artifacts SET processing_metadata_json = ?, "
+                    "UPDATE delivery_artifacts SET processing_metadata_json = ?, expires_at = ?, "
                     "updated_at = ? WHERE bundle_key = ? AND platform = ? "
                     "AND attempt_count = ? AND kind = ? AND ordinal = ? "
-                    "AND external_id = ? AND processing_metadata_json = ?",
+                    "AND external_id = ? AND processing_metadata_json = ? "
+                    "AND expires_at IS ?",
                     (
                         metadata_json,
+                        next_expiry,
                         now,
                         bundle_key,
                         platform,
@@ -1724,6 +1741,7 @@ class StateRepository:
                         ordinal,
                         external_id,
                         expected_json,
+                        stored_expiry,
                     ),
                 )
                 if updated.rowcount != 1:
@@ -3139,6 +3157,15 @@ class StateRepository:
                 not isinstance(value, str) or not _MIME_TYPE_RE.fullmatch(value)
             ):
                 raise StateValidationError("processing media type is invalid")
+            if key == "processing_deadline":
+                if not isinstance(value, str):
+                    raise StateValidationError("processing deadline is invalid")
+                try:
+                    parsed = _parse_timestamp(value)
+                except (TypeError, ValueError, OverflowError):
+                    raise StateValidationError("processing deadline is invalid") from None
+                if _timestamp(parsed) != value:
+                    raise StateValidationError("processing deadline is invalid")
         return self._safe_json(dict(metadata))
 
     def _safe_json(self, value: object) -> str:

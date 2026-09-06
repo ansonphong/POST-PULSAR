@@ -39,6 +39,9 @@ _URL_RE: Final = re.compile(
     r"(?:xn--[a-z0-9-]{2,59}|[a-z]{2,63})(?:/[^\s<>\]\[{}]*)?"
     r")"
 )
+_URL_DIRECTIONAL_CONTROLS: Final = frozenset(
+    chr(codepoint) for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
 _WEIGHT_ONE_RANGES: Final = (
     (0, 4351),
     (8192, 8205),
@@ -465,14 +468,37 @@ class XAdapter(BasePlatformAdapter):
                 item,
                 state="finalizing",
                 next_segment_index=segments,
+                processing_deadline=_aware_utc(self._clock())
+                + timedelta(seconds=self._processing_timeout),
             )
             return self._finalize_and_wait(record, item, checkpoints)
         if state == "finalizing":
+            processing_deadline = _processing_deadline(record)
+            if processing_deadline is None:
+                processing_deadline = _aware_utc(self._clock()) + timedelta(
+                    seconds=self._processing_timeout
+                )
+                record = self._transition_media(
+                    checkpoints,
+                    record,
+                    item,
+                    state="finalizing",
+                    next_segment_index=next_segment,
+                    processing_deadline=processing_deadline,
+                )
+            remaining = max(
+                0.0,
+                (processing_deadline - _aware_utc(self._clock())).total_seconds(),
+            )
+            if remaining <= 0:
+                raise AdapterContractError("X media processing timed out")
+            deadline = self._monotonic() + remaining
             try:
                 response = self._client.read_only_request(
                     "GET",
                     "/2/media/upload",
                     params={"command": "STATUS", "media_id": media_id},
+                    retry_budget_seconds=lambda: max(0.0, deadline - self._monotonic()),
                 )
             except PlatformHTTPError as error:
                 if (
@@ -481,6 +507,8 @@ class XAdapter(BasePlatformAdapter):
                 ):
                     return self._finalize_and_wait(record, item, checkpoints)
                 raise
+            if self._monotonic() >= deadline:
+                raise AdapterContractError("X media processing timed out")
             data = _response_data(response, "X media status response is invalid")
             if data.get("id") != media_id:
                 raise AdapterContractError("X media status response is invalid")
@@ -512,12 +540,21 @@ class XAdapter(BasePlatformAdapter):
         data = _response_data(response, "X media finalize response is invalid")
         if data.get("id") != media_id:
             raise AdapterContractError("X media finalize response is invalid")
+        now = _aware_utc(self._clock())
+        expiry = record.expires_at
+        if "expires_after_secs" in data:
+            expiry = _media_expiry(data, now)
+        processing_deadline = _processing_deadline(record) or (
+            now + timedelta(seconds=self._processing_timeout)
+        )
         record = self._transition_media(
             checkpoints,
             record,
             item,
             state="finalized",
             next_segment_index=segments,
+            expires_at=expiry,
+            processing_deadline=processing_deadline,
         )
         if "processing_info" not in data or data.get("processing_info") is None:
             return self._transition_media(
@@ -541,7 +578,26 @@ class XAdapter(BasePlatformAdapter):
     ) -> ArtifactRecord:
         media_id = cast(str, record.external_id)
         info = initial
-        deadline = self._monotonic() + self._processing_timeout
+        processing_deadline = _processing_deadline(record)
+        if processing_deadline is None:
+            processing_deadline = _aware_utc(self._clock()) + timedelta(
+                seconds=self._processing_timeout
+            )
+            record = self._transition_media(
+                checkpoints,
+                record,
+                item,
+                state=cast(str, record.processing_metadata.get("state")),
+                next_segment_index=record.processing_metadata.get("next_segment_index"),
+                processing_deadline=processing_deadline,
+            )
+        remaining = max(
+            0.0,
+            (processing_deadline - _aware_utc(self._clock())).total_seconds(),
+        )
+        deadline = self._monotonic() + remaining
+        if remaining <= 0:
+            raise AdapterContractError("X media processing timed out")
         for _poll in range(_MAX_PROCESSING_POLLS):
             if info is None:
                 resumed_state = record.processing_metadata.get("state")
@@ -615,17 +671,22 @@ class XAdapter(BasePlatformAdapter):
         state: str,
         next_segment_index: object,
         processing_info: Mapping[object, object] | None = None,
+        expires_at: datetime | None = None,
+        processing_deadline: datetime | None = None,
     ) -> ArtifactRecord:
+        if processing_deadline is None:
+            processing_deadline = _processing_deadline(current)
         checkpoint = ArtifactCheckpoint(
             current.kind,
             current.ordinal,
             external_id=current.external_id,
-            expires_at=current.expires_at,
+            expires_at=current.expires_at if expires_at is None else expires_at,
             processing_metadata=_media_processing_metadata(
                 item,
                 state=state,
                 next_segment_index=next_segment_index,
                 processing_info=processing_info,
+                processing_deadline=processing_deadline,
             ),
         )
         record = checkpoints.transition_artifact_processing(current, checkpoint)
@@ -703,6 +764,17 @@ class XAdapter(BasePlatformAdapter):
                 != item.private.mime_type
             ):
                 raise AdapterContractError("prepared X media checkpoint is invalid")
+            if record.processing_metadata.get("state") != "succeeded":
+                raise AdapterContractError("prepared X media is not ready")
+            if item.metadata.kind != "image" or item.private.mime_type == "image/gif":
+                expected_segments = math.ceil(
+                    item.private.size_bytes / self._chunk_size
+                )
+                if (
+                    record.processing_metadata.get("next_segment_index")
+                    != expected_segments
+                ):
+                    raise AdapterContractError("prepared X media is not ready")
             media_ids.append(record.external_id)
         return media_ids
 
@@ -727,8 +799,19 @@ def _media_identity(response: SafeHTTPResponse, now: datetime) -> tuple[str, dat
         or expires > 31_536_000
     ):
         raise AdapterContractError("X media upload response is invalid")
-    expiry = _aware_utc(now) + timedelta(seconds=expires - _EXPIRY_SKEW_SECONDS)
-    return media_id, expiry
+    return media_id, _media_expiry(data, now)
+
+
+def _media_expiry(data: Mapping[str, object], now: datetime) -> datetime:
+    expires = data.get("expires_after_secs")
+    if (
+        isinstance(expires, bool)
+        or not isinstance(expires, int)
+        or expires <= _EXPIRY_SKEW_SECONDS
+        or expires > 31_536_000
+    ):
+        raise AdapterContractError("X media upload response is invalid")
+    return _aware_utc(now) + timedelta(seconds=expires - _EXPIRY_SKEW_SECONDS)
 
 
 def _checkpoint_exact(
@@ -777,6 +860,7 @@ def _media_processing_metadata(
     state: str,
     next_segment_index: object = None,
     processing_info: Mapping[object, object] | None = None,
+    processing_deadline: datetime | None = None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "state": state,
@@ -791,6 +875,10 @@ def _media_processing_metadata(
         ):
             raise AdapterContractError("X media segment checkpoint is invalid")
         metadata["next_segment_index"] = next_segment_index
+    if processing_deadline is not None:
+        metadata["processing_deadline"] = _format_processing_deadline(
+            processing_deadline
+        )
     if processing_info is not None:
         progress = processing_info.get("progress_percent")
         if progress is not None:
@@ -865,12 +953,33 @@ def _weighted_text_length(value: str) -> int:
     cursor = 0
     for match in _URL_RE.finditer(normalized):
         raw_url = match.group(0)
+        if any(character in _URL_DIRECTIONAL_CONTROLS for character in raw_url):
+            continue
         url = raw_url.rstrip(".,!?;:")
         if not url:
             continue
         total += _weighted_codepoints(normalized[cursor : match.start()]) + 23
         cursor = match.start() + len(url)
     return total + _weighted_codepoints(normalized[cursor:])
+
+
+def _format_processing_deadline(value: datetime) -> str:
+    return _aware_utc(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _processing_deadline(record: ArtifactRecord) -> datetime | None:
+    value = record.processing_metadata.get("processing_deadline")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AdapterContractError("X media processing deadline is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        raise AdapterContractError("X media processing deadline is invalid") from None
+    if _format_processing_deadline(parsed) != value:
+        raise AdapterContractError("X media processing deadline is invalid")
+    return _aware_utc(parsed)
 
 
 def _weighted_codepoints(value: str) -> int:

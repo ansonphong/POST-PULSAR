@@ -1734,6 +1734,62 @@ def test_uncertain_publish_retry_after_cannot_overrun_monotonic_deadline() -> No
     assert publish.call_count == 1
 
 
+def test_late_finished_after_zero_retry_after_is_not_checkpointed() -> None:
+    snapshot = _snapshot(processing_timeout_seconds=5.0)
+    elapsed = 0.0
+    status_responses = 0
+
+    def monotonic() -> float:
+        return elapsed
+
+    def slow_finished(_request: httpx.Request) -> httpx.Response:
+        nonlocal elapsed
+        elapsed = 6.0
+        return httpx.Response(200, json={"status_code": "FINISHED"})
+
+    def status_response(request: httpx.Request) -> httpx.Response:
+        nonlocal status_responses
+        status_responses += 1
+        if status_responses == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return slow_finished(request)
+
+    writer = _Writer()
+    with respx.mock(assert_all_called=True) as router:
+        _identity(router, snapshot)
+        _quota(router, snapshot)
+        router.post(
+            f"{GRAPH}/{GRAPH_API_VERSION}/"
+            f"{snapshot.target.expected_remote_user_id}/media"
+        ).mock(return_value=httpx.Response(200, json={"id": "18911"}))
+        status = router.get(f"{GRAPH}/{GRAPH_API_VERSION}/18911").mock(
+            side_effect=status_response
+        )
+        client = PlatformHTTPClient(
+            snapshot,
+            SecretValue("instagram-token"),
+            base_url=GRAPH,
+            policy=HTTPPolicy(max_pre_final_attempts=2),
+            sleeper=lambda _seconds: None,
+        )
+        adapter = InstagramAdapter(
+            snapshot,
+            client,
+            public_verifier=_proof,
+            public_cleaner=_ignore_cleanup,
+            clock=lambda: NOW,
+            monotonic=monotonic,
+            sleeper=lambda _seconds: None,
+        )
+        with pytest.raises(InstagramAdapterError) as caught:
+            adapter.prepare(_request(snapshot=snapshot), prior=None, checkpoints=writer)
+        adapter.close()
+
+    assert caught.value.code == "instagram_container_timeout"
+    assert status.call_count == 2
+    assert writer.transitions == []
+
+
 def _artifact_state(prepared: PreparedPublication, kind: str) -> object:
     return next(
         artifact for artifact in prepared.artifacts if artifact.kind == kind

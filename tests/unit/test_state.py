@@ -517,10 +517,27 @@ def test_remote_artifact_processing_transitions_and_expired_replacement_are_guar
             "next_segment_index": 1,
             "source_sha256": source_hash,
             "media_type": "video/mp4",
+            "processing_deadline": "2026-09-05T12:02:00.000000Z",
         },
+        expected_expires_at=initialized.expires_at,
+        expires_at=clock() + timedelta(minutes=2),
         **claim,  # type: ignore[arg-type]
     )
     assert appending.processing_metadata["next_segment_index"] == 1
+    assert appending.expires_at == clock() + timedelta(minutes=2)
+    with pytest.raises(ConflictError, match="expiry"):
+        repository.transition_artifact_processing(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="media-old",
+            expected_processing_metadata=appending.processing_metadata,
+            processing_metadata=appending.processing_metadata,
+            expected_expires_at=initialized.expires_at,
+            expires_at=clock() + timedelta(minutes=3),
+            **claim,  # type: ignore[arg-type]
+        )
     with pytest.raises(ConflictError, match="processing metadata"):
         repository.transition_artifact_processing(
             bundle_key,

@@ -232,6 +232,9 @@ def test_read_only_retry_budget_caps_retry_after_and_aborts_before_repeat() -> N
 
     assert sleeps == [3.0]
     assert route.call_count == 1
+    request_timeouts = route.calls[0].request.extensions["timeout"]
+    assert isinstance(request_timeouts, dict)
+    assert all(float(value) <= 3.0 for value in request_timeouts.values())
 
 
 def test_final_dispatch_is_one_shot_and_uncertain_errors_are_sanitized() -> None:

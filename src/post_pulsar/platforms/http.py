@@ -300,6 +300,7 @@ class PlatformHTTPClient:
         attempts = 1 if stage == "final" else self.policy.max_pre_final_attempts
         for attempt in range(1, attempts + 1):
             try:
+                request_timeout = self._bounded_request_timeout(retry_budget_seconds)
                 with self._client.stream(
                     normalized_method,
                     normalized_path,
@@ -308,6 +309,7 @@ class PlatformHTTPClient:
                     data=form,
                     content=content,
                     files=files,
+                    timeout=request_timeout,
                 ) as response:
                     status = response.status_code
                     if status in _RETRYABLE_STATUS and attempt < attempts:
@@ -356,6 +358,26 @@ class PlatformHTTPClient:
                     _classification_for_stage(stage),
                 ) from None
         raise AdapterContractError("HTTP retry loop ended unexpectedly")
+
+    def _bounded_request_timeout(
+        self, retry_budget_seconds: Callable[[], float] | None
+    ) -> httpx.Timeout:
+        if retry_budget_seconds is None:
+            remaining = math.inf
+        else:
+            remaining = self._validated_retry_budget(retry_budget_seconds)
+            if remaining <= 0:
+                raise PlatformHTTPError(
+                    "retry_budget_exhausted",
+                    "request retry budget was exhausted",
+                    "safe_pre_final",
+                )
+        return httpx.Timeout(
+            connect=min(self.policy.connect_timeout_seconds, remaining),
+            read=min(self.policy.read_timeout_seconds, remaining),
+            write=min(self.policy.write_timeout_seconds, remaining),
+            pool=min(self.policy.pool_timeout_seconds, remaining),
+        )
 
     def _read_bounded(self, response: httpx.Response, stage: RequestStage) -> bytes:
         chunks: list[bytes] = []
@@ -420,14 +442,7 @@ class PlatformHTTPClient:
         if retry_budget_seconds is None:
             self._sleeper(delay)
             return
-        remaining = retry_budget_seconds()
-        if (
-            isinstance(remaining, bool)
-            or not isinstance(remaining, (int, float))
-            or not math.isfinite(float(remaining))
-            or remaining < 0
-        ):
-            raise AdapterContractError("HTTP retry budget is invalid")
+        remaining = self._validated_retry_budget(retry_budget_seconds)
         bounded = min(delay, float(remaining))
         if bounded > 0:
             self._sleeper(bounded)
@@ -437,6 +452,20 @@ class PlatformHTTPClient:
                 "request retry budget was exhausted",
                 "safe_pre_final",
             )
+
+    @staticmethod
+    def _validated_retry_budget(
+        retry_budget_seconds: Callable[[], float],
+    ) -> float:
+        remaining = retry_budget_seconds()
+        if (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, (int, float))
+            or not math.isfinite(float(remaining))
+            or remaining < 0
+        ):
+            raise AdapterContractError("HTTP retry budget is invalid")
+        return float(remaining)
 
     def _reject_credential_in_payload(self, *values: object) -> None:
         token = self._token

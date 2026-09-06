@@ -522,9 +522,9 @@ class InstagramAdapter(BasePlatformAdapter):
                     "Instagram media container status is invalid",
                     "safe_pre_final",
                 )
-            artifact = self._checkpoint_container_state(durable, artifact, status)
             if deadline - self._monotonic() <= 0:
                 break
+            artifact = self._checkpoint_container_state(durable, artifact, status)
             if status == _READY_STATUS:
                 return artifact
             if status == "IN_PROGRESS":

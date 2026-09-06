@@ -126,7 +126,7 @@ class Writer:
             current.external_id,
             current.relative_path,
             current.sha256,
-            current.expires_at,
+            checkpoint.expires_at,
             checkpoint.processing_metadata,
         )
         self.records[key] = record
@@ -205,6 +205,8 @@ class RepositoryWriter:
             external_id=checkpoint.external_id,
             expected_processing_metadata=current.processing_metadata,
             processing_metadata=checkpoint.processing_metadata,
+            expected_expires_at=current.expires_at,
+            expires_at=checkpoint.expires_at,
             claim_token=self.claim_token,
             attempt_count=self.attempt_count,
         )
@@ -364,6 +366,17 @@ def test_weighted_text_and_alt_text_preflight_boundaries(tmp_path: Path) -> None
         )
         == ()
     )
+    # Canonical twitter-text UnicodeDirectionalMarkerCounterTest fixture: this
+    # visually contains a URL, but the directional controls/domain make its
+    # official weighted length 31 rather than the transformed URL length 23.
+    directional = "\u2066\u202a http://foobar.پاکستان/\u202c\u2069"
+    assert target.preflight(request(tmp_path, (), text=directional)) == ()
+    assert [
+        issue.code
+        for issue in target.preflight(
+            request(tmp_path, (), text="a" * 250 + directional)
+        )
+    ] == ["x_text_too_long"]
     assert target.preflight(request(tmp_path, (), text="\r\n" * 141)) == ()
     issues = target.preflight(
         request(tmp_path, ("image",), text="界" * 141, alt="a" * 1001)
@@ -480,6 +493,7 @@ def test_chunked_video_checkpoint_order_status_params_and_retry_after(
                 json={
                     "data": {
                         "id": "8001",
+                        "expires_after_secs": 120,
                         "processing_info": {"state": "pending", "check_after_secs": 1},
                     }
                 },
@@ -520,7 +534,7 @@ def test_chunked_video_checkpoint_order_status_params_and_retry_after(
     assert clock.sleeps == [1.0, 2.0]
     assert next(
         a for a in prepared.artifacts if a.kind == "x_media_id"
-    ).expires_at == NOW + timedelta(seconds=3540)
+    ).expires_at == NOW + timedelta(seconds=60)
     transitions = [
         event.processing_metadata["state"]
         for kind, event in writer.events
@@ -808,6 +822,10 @@ def test_resume_before_finalize_status_404_performs_finalize_once(
 
 def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None:
     timer = Clock()
+    settings: dict[str, object] = {
+        "chunk_size_bytes": 4,
+        "processing_timeout_seconds": 30,
+    }
     repository = StateRepository(tmp_path / "state.sqlite3", clock=timer)
     repository.register_profile(
         "alpha",
@@ -818,7 +836,7 @@ def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None
                 "12345",
                 "expected_user",
                 "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
-                {},
+                settings,
             ),
         ),
         config_hash="b" * 64,
@@ -830,7 +848,7 @@ def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None
         source_bucket="QUEUE",
         files=(
             BundleFileSnapshot(
-                "cat_1.jpg", "image", 1, "image", "image/jpeg", 24, "c" * 64
+                "cat_1.mp4", "media", 1, "video", "video/mp4", 24, "c" * 64
             ),
         ),
         targets=(
@@ -841,7 +859,7 @@ def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None
                 "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
                 "2",
                 1,
-                {},
+                settings,
             ),
         ),
     )
@@ -856,20 +874,203 @@ def test_real_state_writer_accepts_x_checkpoint_contract(tmp_path: Path) -> None
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/2/users/me":
             return identity_response()
-        if req.url.path == "/2/media/upload":
+        if req.url.path == "/2/media/upload/initialize":
             return httpx.Response(
-                200, json={"data": {"id": "7301", "expires_after_secs": 3600}}
+                202, json={"data": {"id": "7301", "expires_after_secs": 3600}}
+            )
+        if req.url.path == "/2/media/upload/7301/append":
+            return httpx.Response(204)
+        if req.url.path == "/2/media/upload/7301/finalize":
+            return httpx.Response(
+                200, json={"data": {"id": "7301", "expires_after_secs": 120}}
             )
         raise AssertionError(req.url)
 
-    publication = request(tmp_path, ("image",))
-    with adapter(tmp_path, handler, clock=timer) as target:
+    publication = request(tmp_path, ("video",), settings=settings)
+    with adapter(tmp_path, handler, settings=settings, clock=timer) as target:
         prepared = target.prepare(publication, prior=None, checkpoints=writer)
     assert [item.kind for item in prepared.artifacts] == [
         "staged_private",
         "x_media_id",
     ]
+    remote = next(item for item in prepared.artifacts if item.kind == "x_media_id")
+    assert remote.expires_at == NOW + timedelta(seconds=60)
+    assert remote.processing_metadata["state"] == "succeeded"
+    assert (
+        remote.processing_metadata["processing_deadline"]
+        == "2026-09-05T12:00:30.000000Z"
+    )
+    assert repository.list_delivery_artifacts(bundle_key, "x")[-1] == remote
     assert repository.get_delivery(bundle_key, "x").phase == "ready"
+
+
+@pytest.mark.parametrize(
+    ("processing_state", "next_segment_index"),
+    [("pending", 6), ("succeeded", 5)],
+)
+def test_commit_rejects_unfinished_chunked_artifact_from_real_state(
+    tmp_path: Path, processing_state: str, next_segment_index: int
+) -> None:
+    timer = Clock()
+    repository = StateRepository(tmp_path / "pending.sqlite3", clock=timer)
+    repository.register_profile(
+        "alpha",
+        tmp_path / "accounts/alpha",
+        (
+            ProfileTargetSnapshot(
+                "x",
+                "12345",
+                "expected_user",
+                "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
+                {"chunk_size_bytes": 4},
+            ),
+        ),
+        config_hash="b" * 64,
+    )
+    bundle_key = repository.add_bundle(
+        profile_id="alpha",
+        bundle_id="cat",
+        fingerprint=FINGERPRINT,
+        source_bucket="QUEUE",
+        files=(
+            BundleFileSnapshot(
+                "cat_1.mp4", "media", 1, "video", "video/mp4", 24, "c" * 64
+            ),
+        ),
+        targets=(
+            TargetSnapshot(
+                "x",
+                "12345",
+                "expected_user",
+                "POST_PULSAR_X_ALPHA_USER_ACCESS_TOKEN",
+                "2",
+                1,
+                {"chunk_size_bytes": 4},
+            ),
+        ),
+    )
+    claimed = repository.claim_delivery(bundle_key, "x", "claim-x-pending")
+    writer = RepositoryWriter(
+        repository,
+        bundle_key=bundle_key,
+        claim_token="claim-x-pending",
+        attempt_count=claimed.attempt_count,
+    )
+    processing = writer.advance_phase("processing")
+    publication = request(tmp_path, ("video",), settings={"chunk_size_bytes": 4})
+    item = publication.media.items[0]
+    staged = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "staged_private",
+            0,
+            relative_path=item.private.relative_path.as_posix(),
+            sha256=item.private.sha256,
+        )
+    )
+    pending = writer.checkpoint_artifact(
+        ArtifactCheckpoint(
+            "x_media_id",
+            0,
+            external_id="7351",
+            expires_at=NOW + timedelta(hours=1),
+            processing_metadata={
+                "state": processing_state,
+                "next_segment_index": next_segment_index,
+                "source_sha256": item.private.sha256,
+                "media_type": item.private.mime_type,
+            },
+        )
+    )
+    writer.advance_phase("ready")
+    final = writer.advance_phase("final_dispatch_started")
+    prepared = PreparedPublication(
+        publication,
+        processing.attempt_count,
+        tuple(sorted((pending, staged), key=lambda item: (item.kind, item.ordinal))),
+    )
+    calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req.url.path)
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        raise AssertionError("final create must not run for unfinished media")
+
+    with adapter(
+        tmp_path, handler, settings={"chunk_size_bytes": 4}, clock=timer
+    ) as target:
+        with pytest.raises(AdapterContractError, match="not ready"):
+            target.commit(prepared, delivery=final)
+    assert calls == ["/2/users/me"]
+
+
+def test_processing_deadline_is_checkpointed_and_not_reset_on_resume(
+    tmp_path: Path,
+) -> None:
+    timer = Clock()
+    settings: dict[str, object] = {
+        "chunk_size_bytes": 4,
+        "processing_timeout_seconds": 5,
+    }
+    publication = request(tmp_path, ("video",), settings=settings)
+    writer = Writer()
+    status_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload/initialize":
+            return httpx.Response(
+                202, json={"data": {"id": "8361", "expires_after_secs": 3600}}
+            )
+        if req.url.path == "/2/media/upload/8361/append":
+            return httpx.Response(204)
+        if req.url.path == "/2/media/upload/8361/finalize":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8361",
+                        "processing_info": {
+                            "state": "pending",
+                            "check_after_secs": 60,
+                        },
+                    }
+                },
+            )
+        if req.url.path == "/2/media/upload":
+            status_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8361",
+                        "processing_info": {"state": "in_progress"},
+                    }
+                },
+            )
+        raise AssertionError(req.url)
+
+    with adapter(tmp_path, handler, settings=settings, clock=timer) as first:
+        with pytest.raises(AdapterContractError, match="timed out"):
+            first.prepare(publication, prior=None, checkpoints=writer)
+    remote = writer.records[("x_media_id", 0)]
+    assert (
+        remote.processing_metadata["processing_deadline"]
+        == "2026-09-05T12:00:05.000000Z"
+    )
+    prior = PreparedPublication(
+        publication,
+        1,
+        tuple(
+            sorted(writer.records.values(), key=lambda item: (item.kind, item.ordinal))
+        ),
+    )
+    with adapter(tmp_path, handler, settings=settings, clock=timer) as resumed:
+        with pytest.raises(AdapterContractError, match="timed out"):
+            resumed.prepare(publication, prior=prior, checkpoints=Writer())
+    assert status_calls == 0
 
 
 def test_processing_retry_after_cannot_overrun_monotonic_deadline(
