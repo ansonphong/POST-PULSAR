@@ -17,6 +17,7 @@ dependencies = [
     "platformdirs>=4.11.7,<5",
     "pydantic>=2.13.5,<3",
     "twitter-text-parser>=3.0.0,<4",
+    "tzdata>=2025.3",
 ]
 
 [project.scripts]

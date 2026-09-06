@@ -1,24 +1,55 @@
-# POST PULSAR non-secret settings.
-# Copy this file to post-pulsar.toml. Paths are relative to that file.
+# POST PULSAR non-secret settings. Copy to post-pulsar.toml.
+# Paths are relative to this file. Replace numeric example IDs before publishing.
 
 [app]
-posts_directory = "posts"
 state_directory = ".post-pulsar"
-log_file = "post_pulsar.log"
+log_file = ".post-pulsar/logs/post_pulsar.log"
 log_max_bytes = 5242880
 log_backups = 3
+deployment_mode = "simple"
+allow_agent_publish = false
+control_host = "127.0.0.1"
+control_port = 8765
+agent_capability_file = ".post-pulsar/control/agent-capability"
+operator_verifier_file = ".post-pulsar/control/operator-verifier"
+bootstrap_file = ".post-pulsar/control/bootstrap.json"
+endpoint_record_file = ".post-pulsar/control/endpoint.json"
 
-[x]
+[[profiles]]
+profile_id = "ansonphong"
+account_root = "accounts/ansonphong"
+timezone = "America/Vancouver"
+
+[profiles.x]
 enabled = false
-user_id = ""
+expected_remote_user_id = "100000000000000001"
+expected_username = "ansonphong"
+token_env_var = "POST_PULSAR_X_ANSONPHONG_USER_ACCESS_TOKEN"
 request_timeout_seconds = 30
 processing_timeout_seconds = 300
 chunk_size_bytes = 4194304
 
-[instagram]
+[[profiles]]
+profile_id = "360hextile"
+account_root = "accounts/360hextile"
+timezone = "America/Vancouver"
+
+[profiles.x]
 enabled = false
-user_id = ""
-media_directory = "public-media"
-media_base_url = ""
+expected_remote_user_id = "100000000000000002"
+expected_username = "360hextile"
+token_env_var = "POST_PULSAR_X_360HEXTILE_USER_ACCESS_TOKEN"
 request_timeout_seconds = 30
 processing_timeout_seconds = 300
+chunk_size_bytes = 4194304
+
+# Optional Instagram target template for a profile:
+# [profiles.instagram]
+# enabled = false
+# expected_remote_user_id = "200000000000000001"
+# expected_username = "replace_me"
+# token_env_var = "POST_PULSAR_INSTAGRAM_REPLACE_ME_ACCESS_TOKEN"
+# media_directory = "public-media/replace-me"
+# media_base_url = "https://media.example.com/replace-me/"
+# request_timeout_seconds = 30
+# processing_timeout_seconds = 300

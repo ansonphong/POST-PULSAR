@@ -11,13 +11,12 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Final, Literal, Protocol
+from typing import BinaryIO, Final, Literal, Protocol, TypeAlias, cast
 
 IssueSeverity = Literal["error", "warning"]
+SourceBucket: TypeAlias = Literal["QUEUE", "RANDOM", "REELS"]
 
-_BUNDLE_ID_RE: Final = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?\Z"
-)
+_BUNDLE_ID_RE: Final = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?\Z")
 _ORDINAL_RE: Final = re.compile(r"(?P<bundle_id>.+)-(?P<ordinal>[0-9]+)\Z")
 _AMBIGUOUS_ID_RE: Final = re.compile(r"(?:-alt|-[0-9]+)\Z", re.IGNORECASE)
 _IMAGE_EXTENSIONS: Final = frozenset({".jpg", ".jpeg", ".png", ".gif"})
@@ -30,6 +29,11 @@ _WINDOWS_DEVICE_NAMES: Final = frozenset(
 )
 _FINGERPRINT_DOMAIN: Final = b"POST-PULSAR-CONTENT-BUNDLE\x00V1\x00"
 _READ_CHUNK_SIZE: Final = 1024 * 1024
+_PUBLISHABLE_BUCKETS: Final[tuple[SourceBucket, ...]] = (
+    "QUEUE",
+    "RANDOM",
+    "REELS",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,38 @@ class InboxScan:
 
     bundles: tuple[ContentBundle, ...]
     issues: tuple[InboxIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishableBundle:
+    """An exact semantic bundle admitted beneath one editorial bucket."""
+
+    bucket: SourceBucket
+    directory: Path
+    ready_marker: Path
+    content: ContentBundle
+
+    @property
+    def bundle_id(self) -> str:
+        """Return the stable semantic bundle ID."""
+        return self.content.bundle_id
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the fingerprint that deliberately excludes ``.ready``."""
+        return self.content.fingerprint
+
+
+@dataclass(frozen=True, slots=True)
+class AccountScan:
+    """One fail-closed scan of all publishable buckets for an account root."""
+
+    bundles: tuple[PublishableBundle, ...]
+    issues: tuple[InboxIssue, ...]
+
+    def for_bucket(self, bucket: SourceBucket) -> tuple[PublishableBundle, ...]:
+        """Return deterministic candidates for one supported bucket."""
+        return tuple(item for item in self.bundles if item.bucket == bucket)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,15 +226,18 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
     known_keys = set(candidates)
     for path in unsupported:
         potential_id = _potential_bundle_id(path.name)
-        key = potential_id.casefold() if potential_id is not None else None
-        if key is not None and key in known_keys:
-            invalid_bundle_keys.add(key)
+        alias_key = potential_id.casefold() if potential_id is not None else None
+        if alias_key is not None and alias_key in known_keys:
+            invalid_bundle_keys.add(alias_key)
             issues.append(
                 _issue(
                     "error",
                     "unsupported_bundle_alias",
                     path,
-                    min(spellings[key], key=lambda value: (value.casefold(), value)),
+                    min(
+                        spellings[alias_key],
+                        key=lambda value: (value.casefold(), value),
+                    ),
                     "Unsupported file aliases a recognized bundle role.",
                 )
             )
@@ -225,6 +264,327 @@ def scan_inbox(directory: str | os.PathLike[str]) -> InboxScan:
     bundles.sort(key=lambda bundle: (bundle.bundle_id.casefold(), bundle.bundle_id))
     issues.sort(key=_issue_sort_key)
     return InboxScan(bundles=tuple(bundles), issues=tuple(issues))
+
+
+def scan_account_root(directory: str | os.PathLike[str]) -> AccountScan:
+    """Discover ready immediate bundle directories without inspecting DRAFTS."""
+
+    supplied_root = Path(directory).expanduser()
+    if supplied_root.is_symlink():
+        msg = "The account root itself must not be a symbolic link."
+        raise ValueError(msg)
+    root = supplied_root.resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+
+    issues: list[InboxIssue] = []
+    candidates: list[PublishableBundle] = []
+    misplaced_ready = root / ".ready"
+    try:
+        os.lstat(misplaced_ready)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        issues.append(
+            _bucket_issue(
+                "unreadable_bundle_entry",
+                misplaced_ready,
+                None,
+                "Account-root entry metadata could not be read.",
+            )
+        )
+    else:
+        issues.append(
+            _bucket_issue(
+                "misplaced_ready_marker",
+                misplaced_ready,
+                None,
+                "The ready marker is valid only inside a bundle directory.",
+            )
+        )
+    for bucket in _PUBLISHABLE_BUCKETS:
+        bucket_path = root / bucket
+        try:
+            bucket_mode = os.lstat(bucket_path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            issues.append(
+                _bucket_issue(
+                    "unreadable_bucket",
+                    bucket_path,
+                    None,
+                    "Publishable bucket metadata could not be read.",
+                )
+            )
+            continue
+        if stat.S_ISLNK(bucket_mode) or not stat.S_ISDIR(bucket_mode):
+            issues.append(
+                _bucket_issue(
+                    "unsafe_bucket",
+                    bucket_path,
+                    None,
+                    "A publishable bucket must be a real directory.",
+                )
+            )
+            continue
+
+        try:
+            entries = sorted(
+                bucket_path.iterdir(),
+                key=lambda path: (path.name.casefold(), path.name),
+            )
+        except OSError:
+            issues.append(
+                _bucket_issue(
+                    "unreadable_bucket",
+                    bucket_path,
+                    None,
+                    "Publishable bucket contents could not be enumerated.",
+                )
+            )
+            continue
+        collisions = _find_casefold_filename_collisions(entries)
+        for bundle_directory in entries:
+            if bundle_directory.name.casefold() in collisions:
+                issues.append(
+                    _bucket_issue(
+                        "casefold_bundle_directory_collision",
+                        bundle_directory,
+                        bundle_directory.name,
+                        "Bundle directory collides case-insensitively in its bucket.",
+                    )
+                )
+                continue
+            candidate, candidate_issues = _scan_bundle_directory(
+                bucket, bundle_directory
+            )
+            issues.extend(candidate_issues)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    by_id: dict[str, list[PublishableBundle]] = defaultdict(list)
+    for candidate in candidates:
+        by_id[candidate.bundle_id.casefold()].append(candidate)
+    for duplicates in by_id.values():
+        if len(duplicates) <= 1:
+            continue
+        first = min(duplicates, key=lambda item: (item.bucket, item.bundle_id))
+        issues.append(
+            _bucket_issue(
+                "duplicate_bundle_across_buckets",
+                first.directory,
+                first.bundle_id,
+                "A bundle ID may appear in only one publishable bucket.",
+            )
+        )
+
+    issues.sort(key=_issue_sort_key)
+    if any(issue.severity == "error" for issue in issues):
+        return AccountScan(bundles=(), issues=tuple(issues))
+    bucket_order = {name: index for index, name in enumerate(_PUBLISHABLE_BUCKETS)}
+    candidates.sort(
+        key=lambda item: (
+            bucket_order[item.bucket],
+            item.bundle_id.casefold(),
+            item.bundle_id,
+        )
+    )
+    return AccountScan(bundles=tuple(candidates), issues=tuple(issues))
+
+
+def _scan_bundle_directory(
+    bucket: SourceBucket, bundle_directory: Path
+) -> tuple[PublishableBundle | None, tuple[InboxIssue, ...]]:
+    bundle_id = bundle_directory.name
+    issues: list[InboxIssue] = []
+    try:
+        directory_before = os.lstat(bundle_directory)
+    except OSError:
+        return None, (
+            _bucket_issue(
+                "unreadable_bundle_directory",
+                bundle_directory,
+                bundle_id,
+                "Bundle directory metadata could not be read.",
+            ),
+        )
+    if stat.S_ISLNK(directory_before.st_mode):
+        return None, (
+            _bucket_issue(
+                "symlink_bundle_directory",
+                bundle_directory,
+                bundle_id,
+                "Symbolic links cannot be publishable bundle directories.",
+            ),
+        )
+    if not stat.S_ISDIR(directory_before.st_mode):
+        return None, (
+            _bucket_issue(
+                "non_directory_bundle_entry",
+                bundle_directory,
+                bundle_id,
+                "Publishable buckets contain only bundle directories.",
+            ),
+        )
+    if not _valid_bundle_id(bundle_id):
+        return None, (
+            _bucket_issue(
+                "invalid_bundle_directory_id",
+                bundle_directory,
+                bundle_id,
+                "Bundle directory name is not a portable bundle ID.",
+            ),
+        )
+
+    ready_marker = bundle_directory / ".ready"
+    ready_before: os.stat_result | None = None
+    try:
+        entries = tuple(bundle_directory.iterdir())
+    except OSError:
+        return None, (
+            _bucket_issue(
+                "unreadable_bundle_directory",
+                bundle_directory,
+                bundle_id,
+                "Bundle directory contents could not be enumerated.",
+            ),
+        )
+    for entry in entries:
+        try:
+            entry_stat = os.lstat(entry)
+        except OSError:
+            issues.append(
+                _bucket_issue(
+                    "unreadable_bundle_entry",
+                    entry,
+                    bundle_id,
+                    "Bundle entry metadata could not be read.",
+                )
+            )
+            continue
+        if entry.name == ".ready":
+            if stat.S_ISREG(entry_stat.st_mode):
+                ready_before = entry_stat
+            else:
+                issues.append(
+                    _bucket_issue(
+                        "unsafe_ready_marker",
+                        entry,
+                        bundle_id,
+                        "The canonical ready marker must be a regular file.",
+                    )
+                )
+            continue
+        if stat.S_ISDIR(entry_stat.st_mode):
+            issues.append(
+                _bucket_issue(
+                    "nested_bundle_entry",
+                    entry,
+                    bundle_id,
+                    "Bundle directories cannot contain nested directories.",
+                )
+            )
+        elif entry.name.startswith("."):
+            issues.append(
+                _bucket_issue(
+                    "unexpected_operational_entry",
+                    entry,
+                    bundle_id,
+                    "Only the canonical .ready operational entry is accepted.",
+                )
+            )
+    if ready_before is None and not any(
+        issue.code == "unsafe_ready_marker" for issue in issues
+    ):
+        issues.append(
+            _bucket_issue(
+                "missing_ready_marker",
+                ready_marker,
+                bundle_id,
+                "Publishable bundles require a canonical .ready marker.",
+            )
+        )
+    if issues:
+        return None, tuple(issues)
+
+    try:
+        flat_scan = scan_inbox(bundle_directory)
+    except (OSError, ValueError):
+        return None, (
+            _bucket_issue(
+                "bundle_directory_changed",
+                bundle_directory,
+                bundle_id,
+                "Bundle directory changed during discovery.",
+            ),
+        )
+    if flat_scan.issues:
+        return None, flat_scan.issues
+    if len(flat_scan.bundles) != 1:
+        return None, (
+            _bucket_issue(
+                "bundle_count_mismatch",
+                bundle_directory,
+                bundle_id,
+                "A bundle directory must contain exactly one semantic bundle.",
+            ),
+        )
+    content = flat_scan.bundles[0]
+    if content.bundle_id != bundle_id:
+        return None, (
+            _bucket_issue(
+                "bundle_id_mismatch",
+                bundle_directory,
+                bundle_id,
+                "Container and parsed semantic bundle IDs must match exactly.",
+            ),
+        )
+    if bucket == "REELS" and content.video is None:
+        return None, (
+            _bucket_issue(
+                "reels_requires_video",
+                bundle_directory,
+                bundle_id,
+                "REELS accepts exactly one video bundle.",
+            ),
+        )
+
+    try:
+        directory_after = os.lstat(bundle_directory)
+        ready_after = os.lstat(ready_marker)
+    except OSError:
+        return None, (
+            _bucket_issue(
+                "ready_marker_changed",
+                ready_marker,
+                bundle_id,
+                "Ready marker or bundle directory changed during discovery.",
+            ),
+        )
+    if not (
+        stat.S_ISDIR(directory_after.st_mode)
+        and stat.S_ISREG(ready_after.st_mode)
+        and _same_file_identity(directory_before, directory_after)
+        and _same_file_identity(cast(os.stat_result, ready_before), ready_after)
+    ):
+        return None, (
+            _bucket_issue(
+                "ready_marker_changed",
+                ready_marker,
+                bundle_id,
+                "Ready marker or bundle directory changed during discovery.",
+            ),
+        )
+    return (
+        PublishableBundle(
+            bucket=bucket,
+            directory=bundle_directory,
+            ready_marker=ready_marker,
+            content=content,
+        ),
+        (),
+    )
 
 
 def _find_casefold_filename_collisions(paths: list[Path]) -> set[str]:
@@ -391,7 +751,7 @@ def _build_bundle(
                 "Bundle contains more than one unnumbered image.",
             )
         )
-    ordinals = [entry.ordinal for entry in numbered]
+    ordinals = [cast(int, entry.ordinal) for entry in numbered]
     if len(ordinals) != len(set(ordinals)):
         issues.append(
             _bundle_issue(
@@ -516,18 +876,16 @@ def _build_bundle(
     )
 
 
-def _fingerprint(
-    entries: list[_Member], captured_bytes: Mapping[Path, bytes]
-) -> str:
+def _fingerprint(entries: list[_Member], captured_bytes: Mapping[Path, bytes]) -> str:
     digest = hashlib.sha256()
     digest.update(_FINGERPRINT_DOMAIN)
     digest.update(len(entries).to_bytes(8, "big"))
     for entry in entries:
-        role = entry.role
-        if role == "image":
+        role_label: str = entry.role
+        if role_label == "image":
             position = entry.ordinal if entry.ordinal is not None else 0
-            role = f"image:{position}"
-        _hash_field(digest, role.encode("ascii"))
+            role_label = f"image:{position}"
+        _hash_field(digest, role_label.encode("ascii"))
         normalized_name = unicodedata.normalize("NFC", entry.path.name)
         _hash_field(digest, normalized_name.encode("utf-8"))
         captured = captured_bytes.get(entry.path)
@@ -604,8 +962,12 @@ def _issue(
     return InboxIssue(severity, code, message, bundle_id, member)
 
 
-def _bundle_issue(
-    code: str, bundle_id: str, member: Path, message: str
+def _bundle_issue(code: str, bundle_id: str, member: Path, message: str) -> InboxIssue:
+    return _issue("error", code, member, bundle_id, message)
+
+
+def _bucket_issue(
+    code: str, member: Path, bundle_id: str | None, message: str
 ) -> InboxIssue:
     return _issue("error", code, member, bundle_id, message)
 
@@ -622,4 +984,12 @@ def _issue_sort_key(issue: InboxIssue) -> tuple[str, str, int, str, str]:
     )
 
 
-__all__ = ["ContentBundle", "InboxIssue", "InboxScan", "scan_inbox"]
+__all__ = [
+    "AccountScan",
+    "ContentBundle",
+    "InboxIssue",
+    "InboxScan",
+    "PublishableBundle",
+    "scan_account_root",
+    "scan_inbox",
+]
