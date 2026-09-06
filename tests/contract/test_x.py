@@ -26,7 +26,7 @@ from post_pulsar.platforms.base import (
     PublicationSnapshot,
 )
 from post_pulsar.platforms.http import HTTPPolicy, PlatformHTTPClient
-from post_pulsar.platforms.x import XAdapter
+from post_pulsar.platforms.x import XAdapter, XAdapterError
 from post_pulsar.state import (
     ArtifactRecord,
     BundleFileSnapshot,
@@ -567,6 +567,52 @@ def test_chunked_video_checkpoint_order_status_params_and_retry_after(
     ]
 
 
+@pytest.mark.parametrize(
+    ("processing_info", "expected_classification", "message"),
+    [
+        ({"state": "failed"}, "permanent", "processing failed"),
+        ({"state": "unknown"}, "safe_pre_final", "response is invalid"),
+    ],
+)
+def test_x_processing_failures_have_explicit_retry_classification(
+    tmp_path: Path,
+    processing_info: dict[str, object],
+    expected_classification: str,
+    message: str,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/2/users/me":
+            return identity_response()
+        if req.url.path == "/2/media/upload/initialize":
+            return httpx.Response(
+                202, json={"data": {"id": "8051", "expires_after_secs": 3600}}
+            )
+        if req.url.path == "/2/media/upload/8051/append":
+            return httpx.Response(204)
+        if req.url.path == "/2/media/upload/8051/finalize":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "8051",
+                        "processing_info": processing_info,
+                    }
+                },
+            )
+        raise AssertionError(req.url)
+
+    settings: dict[str, object] = {
+        "chunk_size_bytes": 4,
+        "processing_timeout_seconds": 30,
+    }
+    publication = request(tmp_path, ("video",), settings=settings)
+    with adapter(tmp_path, handler, settings=settings) as target:
+        with pytest.raises(XAdapterError, match=message) as caught:
+            target.prepare(publication, prior=None, checkpoints=Writer())
+
+    assert caught.value.retry_classification == expected_classification
+
+
 def test_final_create_ambiguity_is_returned_and_never_repeated(tmp_path: Path) -> None:
     tweet_calls = 0
 
@@ -1066,8 +1112,9 @@ def test_processing_deadline_is_checkpointed_and_not_reset_on_resume(
         raise AssertionError(req.url)
 
     with adapter(tmp_path, handler, settings=settings, clock=timer) as first:
-        with pytest.raises(AdapterContractError, match="timed out"):
+        with pytest.raises(XAdapterError, match="timed out") as first_error:
             first.prepare(publication, prior=None, checkpoints=writer)
+    assert first_error.value.retry_classification == "safe_pre_final"
     remote = writer.records[("x_media_id", 0)]
     assert (
         remote.processing_metadata["processing_deadline"]
@@ -1081,8 +1128,9 @@ def test_processing_deadline_is_checkpointed_and_not_reset_on_resume(
         ),
     )
     with adapter(tmp_path, handler, settings=settings, clock=timer) as resumed:
-        with pytest.raises(AdapterContractError, match="timed out"):
+        with pytest.raises(XAdapterError, match="timed out") as resumed_error:
             resumed.prepare(publication, prior=prior, checkpoints=Writer())
+    assert resumed_error.value.retry_classification == "safe_pre_final"
     assert status_calls == 0
 
 
@@ -1133,7 +1181,8 @@ def test_processing_retry_after_cannot_overrun_monotonic_deadline(
     }
     publication = request(tmp_path, ("video",), settings=settings)
     with adapter(tmp_path, handler, settings=settings, clock=timer) as target:
-        with pytest.raises(AdapterContractError, match="timed out"):
+        with pytest.raises(XAdapterError, match="timed out") as caught:
             target.prepare(publication, prior=None, checkpoints=Writer())
+    assert caught.value.retry_classification == "safe_pre_final"
     assert timer.elapsed == 5
     assert status_calls == 1

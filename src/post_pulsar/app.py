@@ -25,6 +25,7 @@ from post_pulsar.config import (
 from post_pulsar.content import PublishableBundle, SourceBucket, scan_account_root
 from post_pulsar.media import (
     PreparedMedia,
+    cleanup_checkpointed_staging,
     cleanup_staged_media,
     prepare_bundle_media,
 )
@@ -55,6 +56,7 @@ from post_pulsar.state import (
     DeliveryPhase,
     DeliveryRecord,
     StateRepository,
+    StateValidationError,
     TargetSnapshot,
 )
 
@@ -169,9 +171,21 @@ class OneRunApplication:
                 reclaim_token=claim_token,
             )
             self._inject("after_stale_recovery")
+            try:
+                triggered = repository.get_triggered_bundle(
+                    trigger_type="run_once",
+                    trigger_id=request.trigger_id,
+                    profile_id=request.profile_id,
+                    source_bucket=request.bucket,
+                )
+            except ConflictError:
+                return RunOutcome("invalid", code="trigger_conflict")
+            if triggered is not None and triggered.status == "archived":
+                return _outcome("archived", triggered)
             protected = repository.list_protected_bundles(request.profile_id)
             bundle = protected[0] if protected else None
             selected: PublishableBundle | None = None
+            media: PreparedMedia | None = None
 
             if bundle is not None and bundle.status == "archiving":
                 return self._archive(repository, bundle, profile_lease=profile_lease)
@@ -195,25 +209,96 @@ class OneRunApplication:
                 candidates = scan.for_bucket(request.bucket)
                 if not candidates:
                     return RunOutcome("empty")
+                global_scan = scan_account_root(profile.account_root)
+                candidate_ids = {item.bundle_id.casefold() for item in candidates}
+                collision = next(
+                    (
+                        issue
+                        for issue in global_scan.issues
+                        if issue.code == "duplicate_bundle_across_buckets"
+                        and issue.bundle_id is not None
+                        and issue.bundle_id.casefold() in candidate_ids
+                    ),
+                    None,
+                )
+                if collision is not None:
+                    return RunOutcome("invalid", code=collision.code)
+                global_structure = next(
+                    (
+                        issue
+                        for issue in global_scan.issues
+                        if issue.code
+                        in {"account_root_changed", "misplaced_ready_marker"}
+                    ),
+                    None,
+                )
+                if global_structure is not None:
+                    return RunOutcome("invalid", code=global_structure.code)
                 enabled = profile.enabled_targets
                 if not enabled:
                     return RunOutcome("invalid", code="no_enabled_targets")
                 target_snapshots = tuple(
                     _configured_target_snapshot(profile, target) for target in enabled
                 )
-                admitted = repository.admit_selected_bundle(
+                admission_candidates = tuple(
+                    _admission_candidate(item) for item in candidates
+                )
+                preview = repository.preview_selected_bundle(
                     profile_id=request.profile_id,
                     source_bucket=request.bucket,
-                    candidates=tuple(_admission_candidate(item) for item in candidates),
-                    targets=target_snapshots,
-                    trigger_id=request.trigger_id,
+                    candidates=admission_candidates,
                 )
-                bundle = admitted
                 selected = next(
                     item
                     for item in candidates
-                    if item.bundle_id == admitted.bundle_id
-                    and item.fingerprint == admitted.fingerprint
+                    if item.bundle_id == preview.bundle_id
+                    and item.fingerprint == preview.fingerprint
+                )
+                instagram_settings = _instagram_from_snapshot(target_snapshots)
+                try:
+                    media = self._media_preparer(
+                        selected,
+                        profile_id=request.profile_id,
+                        targets=enabled,
+                        private_staging_directory=private_root,
+                        instagram=instagram_settings,
+                    )
+                except Exception:
+                    return RunOutcome("invalid", code="media_validation_failed")
+                try:
+                    admitted = repository.admit_selected_bundle(
+                        profile_id=request.profile_id,
+                        source_bucket=request.bucket,
+                        candidates=admission_candidates,
+                        targets=target_snapshots,
+                        trigger_id=request.trigger_id,
+                        expected_bundle_id=preview.bundle_id,
+                        expected_fingerprint=preview.fingerprint,
+                    )
+                except (ConflictError, StateValidationError):
+                    _cleanup_media(
+                        media,
+                        private_root,
+                        instagram_settings,
+                        outcome="failed",
+                    )
+                    return RunOutcome("invalid", code="admission_conflict")
+                except Exception:
+                    _cleanup_media(
+                        media,
+                        private_root,
+                        instagram_settings,
+                        outcome="failed",
+                    )
+                    raise
+                bundle = admitted
+                resources.callback(
+                    self._cleanup_owned_media_on_exit,
+                    repository,
+                    bundle.bundle_key,
+                    media,
+                    private_root,
+                    instagram_settings,
                 )
                 self._inject("after_bundle_admission")
 
@@ -221,6 +306,13 @@ class OneRunApplication:
             if any(item.status == "ambiguous" for item in deliveries):
                 return _outcome("blocked", bundle, "ambiguous_delivery")
             if all(item.status == "published" for item in deliveries):
+                self._cleanup_checkpointed_staging(
+                    repository,
+                    bundle,
+                    repository.list_target_snapshots(bundle.bundle_key),
+                    private_root=private_root,
+                    outcome="published",
+                )
                 return self._archive(repository, bundle, profile_lease=profile_lease)
 
             selected = _find_stored_source(profile, bundle)
@@ -271,14 +363,22 @@ class OneRunApplication:
                 self._environ,
             )
             instagram_settings = _instagram_from_snapshot(snapshots)
-            media = self._media_preparer(
-                selected,
-                profile_id=request.profile_id,
-                targets=required_targets,
-                private_staging_directory=private_root,
-                instagram=instagram_settings,
-            )
-            self._inject("after_media_staging")
+            if media is None:
+                media = self._media_preparer(
+                    selected,
+                    profile_id=request.profile_id,
+                    targets=required_targets,
+                    private_staging_directory=private_root,
+                    instagram=instagram_settings,
+                )
+                resources.callback(
+                    self._cleanup_owned_media_on_exit,
+                    repository,
+                    bundle.bundle_key,
+                    media,
+                    private_root,
+                    instagram_settings,
+                )
 
             publications: dict[str, PublicationRequest] = {}
             adapters: dict[str, PlatformAdapter] = {}
@@ -309,35 +409,68 @@ class OneRunApplication:
                 resources.callback(adapter.close)
                 adapters[delivery.platform] = adapter
 
+            claimed: dict[str, DeliveryRecord] = {}
+            for delivery in required:
+                active = (
+                    delivery
+                    if delivery.status == "in_flight"
+                    else repository.claim_delivery(
+                        bundle.bundle_key,
+                        delivery.platform,
+                        claim_token,
+                    )
+                )
+                claimed[delivery.platform] = active
+                _checkpoint_staging(
+                    _StateCheckpointWriter(
+                        repository,
+                        bundle.bundle_key,
+                        active.platform,
+                        claim_token,
+                        active.attempt_count,
+                    ),
+                    media,
+                    active.platform,
+                )
+            _record_media_warnings(repository, bundle.bundle_key, media)
+            self._inject("after_media_staging")
+
             preflight_failure = self._preflight_all(
                 repository,
                 bundle,
-                {item.platform: item for item in required},
+                claimed,
                 publications,
                 adapters,
                 claim_token,
             )
             if preflight_failure is not None:
-                _cleanup_media(
-                    media,
-                    private_root,
-                    instagram_settings,
-                    outcome="failed",
+                outcome, failed_platform = preflight_failure
+                remote_evidence = any(
+                    _has_remote_artifacts(repository, item)
+                    for item in claimed.values()
                 )
-                return preflight_failure
+                if not remote_evidence:
+                    _cleanup_media(
+                        media,
+                        private_root,
+                        instagram_settings,
+                        outcome="failed",
+                    )
+                for original in required:
+                    if (
+                        original.platform != failed_platform
+                        and original.status != "in_flight"
+                    ):
+                        repository.release_unmutated_delivery_claim(
+                            claimed[original.platform],
+                            original,
+                            claim_token=claim_token,
+                        )
+                return outcome
             self._inject("after_preflight_barrier")
 
             for platform in sorted(adapters):
-                original = next(item for item in required if item.platform == platform)
-                delivery = (
-                    original
-                    if original.status == "in_flight"
-                    else repository.claim_delivery(
-                        bundle.bundle_key,
-                        original.platform,
-                        claim_token,
-                    )
-                )
+                delivery = claimed[platform]
                 publication = publications[platform]
                 writer = _StateCheckpointWriter(
                     repository,
@@ -446,7 +579,7 @@ class OneRunApplication:
         publications: Mapping[str, PublicationRequest],
         adapters: Mapping[str, PlatformAdapter],
         claim_token: str,
-    ) -> RunOutcome | None:
+    ) -> tuple[RunOutcome, str] | None:
         results: dict[str, tuple[ValidationIssue, ...] | Exception] = {}
         for platform in sorted(adapters):
             try:
@@ -470,11 +603,7 @@ class OneRunApplication:
                 if not errors:
                     continue
                 issue = errors[0]
-                delivery = self._claim_for_preflight_failure(
-                    repository,
-                    deliveries[platform],
-                    claim_token,
-                )
+                delivery = deliveries[platform]
                 self._fail_claim(
                     repository,
                     delivery,
@@ -483,15 +612,11 @@ class OneRunApplication:
                     permanent=True,
                     claim_token=claim_token,
                 )
-                return _outcome("blocked", bundle, issue.code)
+                return _outcome("blocked", bundle, issue.code), platform
             if isinstance(result, Exception):
                 stored_error = result
                 classification = _retry_classification(stored_error)
-                delivery = self._claim_for_preflight_failure(
-                    repository,
-                    deliveries[platform],
-                    claim_token,
-                )
+                delivery = deliveries[platform]
                 if classification == "ambiguous":
                     repository.mark_delivery_ambiguous(
                         bundle.bundle_key,
@@ -515,22 +640,8 @@ class OneRunApplication:
                     if classification == "safe_pre_final" and failed.safe_to_retry
                     else "blocked"
                 )
-                return _outcome(status, bundle, "preflight_failed")
+                return _outcome(status, bundle, "preflight_failed"), platform
         return None
-
-    def _claim_for_preflight_failure(
-        self,
-        repository: StateRepository,
-        delivery: DeliveryRecord,
-        claim_token: str,
-    ) -> DeliveryRecord:
-        if delivery.status == "in_flight":
-            return delivery
-        return repository.claim_delivery(
-            delivery.bundle_key,
-            delivery.platform,
-            claim_token,
-        )
 
     def _record_pre_final_exception(
         self,
@@ -566,7 +677,10 @@ class OneRunApplication:
             permanent=classification == "permanent",
             claim_token=claim_token,
         )
-        _cleanup_media(media, private_root, instagram_settings, outcome="failed")
+        if classification == "permanent" or not _has_remote_artifacts(
+            repository, delivery
+        ):
+            _cleanup_media(media, private_root, instagram_settings, outcome="failed")
         return _outcome(
             "failed"
             if classification == "safe_pre_final" and failed.safe_to_retry
@@ -585,6 +699,16 @@ class OneRunApplication:
         permanent: bool,
         claim_token: str,
     ) -> DeliveryRecord:
+        if not permanent and _has_remote_artifacts(repository, delivery):
+            return repository.defer_resumable_delivery(
+                delivery.bundle_key,
+                delivery.platform,
+                error_code=code,
+                error_message=message,
+                retry_at=self._clock() + self._retry_delay,
+                claim_token=claim_token,
+                attempt_count=delivery.attempt_count,
+            )
         return repository.fail_delivery(
             delivery.bundle_key,
             delivery.platform,
@@ -647,6 +771,75 @@ class OneRunApplication:
             profile_lease=profile_lease,
         )
         return _outcome("archived", archived)
+
+    def _cleanup_checkpointed_staging(
+        self,
+        repository: StateRepository,
+        bundle: BundleRecord,
+        snapshots: tuple[TargetSnapshot, ...],
+        *,
+        private_root: Path,
+        outcome: Literal["published", "failed"],
+    ) -> None:
+        """Clean exact durable staging descriptors without credentials or adapters."""
+
+        instagram = _instagram_from_snapshot(snapshots)
+        seen: set[tuple[str, str, str]] = set()
+        for delivery in repository.list_bundle_deliveries(bundle.bundle_key):
+            for artifact in repository.list_delivery_artifacts(
+                bundle.bundle_key, delivery.platform
+            ):
+                if artifact.kind not in {"staged_private", "staged_public"}:
+                    continue
+                key = (
+                    artifact.kind,
+                    cast("str", artifact.relative_path),
+                    cast("str", artifact.sha256),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                root = private_root
+                if artifact.kind == "staged_public":
+                    if instagram is None:
+                        raise AdapterContractError(
+                            "public staging cleanup settings are unavailable"
+                        )
+                    root = instagram.media_directory
+                cleanup_checkpointed_staging(
+                    cast("str", artifact.relative_path),
+                    cast("str", artifact.sha256),
+                    root,
+                    outcome=outcome,
+                )
+
+    def _cleanup_owned_media_on_exit(
+        self,
+        repository: StateRepository,
+        bundle_key: int,
+        media: PreparedMedia,
+        private_root: Path,
+        instagram: InstagramSettings | None,
+    ) -> None:
+        """Release staging unless durable state requires ambiguity-safe retention."""
+
+        deliveries = repository.list_bundle_deliveries(bundle_key)
+        for delivery in deliveries:
+            if delivery.status == "ambiguous" or (
+                delivery.status == "in_flight"
+                and delivery.phase == "final_dispatch_started"
+            ):
+                return
+            if delivery.status in {"in_flight", "failed"} and _has_remote_artifacts(
+                repository, delivery
+            ):
+                return
+        outcome: Literal["published", "failed"] = (
+            "published"
+            if deliveries and all(item.status == "published" for item in deliveries)
+            else "failed"
+        )
+        _cleanup_media(media, private_root, instagram, outcome=outcome)
 
     def _inject(self, boundary: str) -> None:
         if self._fault is not None:
@@ -834,9 +1027,45 @@ def _checkpoint_staging(
                     ordinal,
                     relative_path=item.public.relative_path.as_posix(),
                     sha256=item.public.sha256,
-                    processing_metadata={"source_sha256": item.public.source_sha256},
                 ),
             )
+
+
+def _record_media_warnings(
+    repository: StateRepository,
+    bundle_key: int,
+    media: PreparedMedia,
+) -> None:
+    for warning in media.warnings:
+        platform: TargetName | None = (
+            "instagram"
+            if warning.code.startswith("instagram_")
+            or warning.code == "public_url_verification_limited"
+            else None
+        )
+        repository.record_warning(
+            bundle_key,
+            platform,
+            warning.code,
+            {
+                "source_name": warning.source_name or "",
+                "message": warning.message,
+            },
+        )
+
+
+def _has_remote_artifacts(
+    repository: StateRepository,
+    delivery: DeliveryRecord,
+) -> bool:
+    return any(
+        item.kind not in {"staged_private", "staged_public"}
+        for item in repository.list_delivery_artifacts(
+            delivery.bundle_key,
+            delivery.platform,
+            attempt_count=delivery.attempt_count,
+        )
+    )
 
 
 def _instagram_from_snapshot(

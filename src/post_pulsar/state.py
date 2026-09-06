@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -703,25 +704,57 @@ class StateRepository:
         clock: Callable[[], datetime] | None = None,
         secret_values: Iterable[str] = (),
         busy_timeout_ms: int = 5000,
+        _existing_only: bool = False,
     ) -> None:
         if busy_timeout_ms < 1000:
             raise StateValidationError(
                 "busy timeout must be at least 1000 milliseconds"
             )
         self.path = Path(database_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not _existing_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._secrets = tuple(value for value in secret_values if value)
-        self._connection = sqlite3.connect(
-            self.path,
-            isolation_level=None,
-            timeout=busy_timeout_ms / 1000,
-        )
+        expected_identity: os.stat_result | None = None
+        connect_target: str | Path = self.path
+        connect_as_uri = False
+        if _existing_only:
+            try:
+                expected_identity = self.path.lstat()
+            except FileNotFoundError:
+                raise MigrationRequiredError(
+                    "migration required: state database does not exist"
+                ) from None
+            if stat.S_ISLNK(expected_identity.st_mode) or not stat.S_ISREG(
+                expected_identity.st_mode
+            ):
+                raise MigrationRequiredError(
+                    "migration required: state database path is unsafe"
+                )
+            connect_target = f"{self.path.absolute().as_uri()}?mode=rw"
+            connect_as_uri = True
+        try:
+            self._connection = sqlite3.connect(
+                connect_target,
+                isolation_level=None,
+                timeout=busy_timeout_ms / 1000,
+                uri=connect_as_uri,
+            )
+        except sqlite3.Error:
+            if _existing_only:
+                raise MigrationRequiredError(
+                    "migration required: state database could not be opened safely"
+                ) from None
+            raise
         self._connection.row_factory = sqlite3.Row
         try:
+            if expected_identity is not None:
+                self._verify_open_database_identity(expected_identity)
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             self._initialize_schema()
+            if expected_identity is not None:
+                self._verify_open_database_identity(expected_identity)
             try:
                 self._connection.execute("PRAGMA journal_mode = WAL").fetchone()
             except sqlite3.OperationalError:
@@ -741,23 +774,31 @@ class StateRepository:
     ) -> StateRepository:
         """Open only an existing regular current-schema database."""
 
-        path = Path(database_path)
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            raise MigrationRequiredError(
-                "migration required: state database does not exist"
-            ) from None
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise MigrationRequiredError(
-                "migration required: state database path is unsafe"
-            )
         return cls(
-            path,
+            database_path,
             clock=clock,
             secret_values=secret_values,
             busy_timeout_ms=busy_timeout_ms,
+            _existing_only=True,
         )
+
+    def _verify_open_database_identity(self, expected: os.stat_result) -> None:
+        """Fail closed if the pathname changed around the no-create open."""
+
+        try:
+            current = self.path.lstat()
+        except OSError:
+            raise MigrationRequiredError(
+                "migration required: state database identity changed"
+            ) from None
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or not os.path.samestat(expected, current)
+        ):
+            raise MigrationRequiredError(
+                "migration required: state database identity changed"
+            )
 
     def __enter__(self) -> StateRepository:
         return self
@@ -1082,6 +1123,8 @@ class StateRepository:
         candidates: Sequence[BundleAdmissionCandidate],
         targets: Sequence[TargetSnapshot],
         trigger_id: str,
+        expected_bundle_id: str | None = None,
+        expected_fingerprint: str | None = None,
     ) -> BundleRecord:
         """Select and admit one candidate with its counter and trigger atomically."""
 
@@ -1117,26 +1160,54 @@ class StateRepository:
             replay_rows = tuple(
                 self._connection.execute(
                     "SELECT * FROM bundles WHERE claimed_by_type = 'run_once' "
-                    "AND claimed_by_id = ?",
-                    (trigger_id,),
+                    "AND claimed_by_id = ? AND profile_id = ?",
+                    (trigger_id, profile_id),
                 )
             )
             if replay_rows:
                 if len(replay_rows) != 1:
                     raise ConflictError("run trigger identity is not unique")
                 replay = replay_rows[0]
-                offered = {
-                    (item.bundle_id.casefold(), item.fingerprint)
-                    for item, _files in normalized
-                }
-                if (
-                    str(replay["profile_id"]) != profile_id
-                    or str(replay["source_bucket"]) != bucket
-                    or (str(replay["bundle_id"]).casefold(), str(replay["fingerprint"]))
-                    not in offered
-                ):
+                if str(replay["source_bucket"]) != bucket:
                     raise ConflictError(
                         "run trigger identity conflicts with prior admission"
+                    )
+                matched = next(
+                    (
+                        (item, files)
+                        for item, files in normalized
+                        if item.bundle_id.casefold()
+                        == str(replay["bundle_id"]).casefold()
+                        and item.fingerprint == str(replay["fingerprint"])
+                    ),
+                    None,
+                )
+                if matched is None:
+                    raise ConflictError(
+                        "run trigger identity conflicts with prior admission"
+                    )
+                stored_files = tuple(
+                    tuple(row)
+                    for row in self._connection.execute(
+                        "SELECT relative_name, role, ordinal, media_kind, mime_type, "
+                        "size_bytes, sha256 FROM bundle_files WHERE bundle_key = ? "
+                        "ORDER BY relative_name COLLATE NOCASE, relative_name",
+                        (int(replay["bundle_key"]),),
+                    )
+                )
+                stored_targets = tuple(
+                    tuple(row)
+                    for row in self._connection.execute(
+                        "SELECT platform, expected_remote_user_id, expected_username, "
+                        "token_env_var, api_version, adapter_version, "
+                        "request_settings_json, request_settings_sha256, snapshot_sha256 "
+                        "FROM target_snapshots WHERE bundle_key = ? ORDER BY platform",
+                        (int(replay["bundle_key"]),),
+                    )
+                )
+                if stored_files != matched[1] or stored_targets != normalized_targets:
+                    raise ConflictError(
+                        "run trigger immutable snapshot conflicts with prior admission"
                     )
                 return self._bundle_from_row(replay)
             counter = self._selection_counter_locked(profile_id)
@@ -1158,6 +1229,18 @@ class StateRepository:
                         item[0].bundle_id,
                     ),
                 )
+            if expected_bundle_id is not None:
+                _validate_bundle_id(expected_bundle_id)
+                if expected_fingerprint is None:
+                    raise StateValidationError(
+                        "expected admission fingerprint is required"
+                    )
+                _validate_sha256(expected_fingerprint, "expected bundle fingerprint")
+                if (
+                    selected.bundle_id != expected_bundle_id
+                    or selected.fingerprint != expected_fingerprint
+                ):
+                    raise ConflictError("admission selection changed before commit")
             bundle_key = self._insert_bundle_locked(
                 profile_id=profile_id,
                 bundle_id=selected.bundle_id,
@@ -1169,6 +1252,77 @@ class StateRepository:
                 claimed_by_id=trigger_id,
             )
         return self.get_bundle(bundle_key)
+
+    def preview_selected_bundle(
+        self,
+        *,
+        profile_id: str,
+        source_bucket: SourceBucket,
+        candidates: Sequence[BundleAdmissionCandidate],
+    ) -> BundleAdmissionCandidate:
+        """Select without mutation using the exact transactional ordering contract."""
+
+        _validate_profile_id(profile_id)
+        bucket = _validate_bucket(source_bucket)
+        if not candidates:
+            raise StateValidationError("at least one admission candidate is required")
+        identities: set[str] = set()
+        for candidate in candidates:
+            _validate_bundle_id(candidate.bundle_id)
+            _validate_sha256(candidate.fingerprint, "bundle fingerprint")
+            if not candidate.files:
+                raise StateValidationError(
+                    "admission candidate requires exact bundle files"
+                )
+            identity = candidate.bundle_id.casefold()
+            if identity in identities:
+                raise StateValidationError("admission candidate IDs collide")
+            identities.add(identity)
+        with self._transaction():
+            self._require_profile(profile_id)
+            counter = self._selection_counter_locked(profile_id)
+            if bucket == "RANDOM":
+                return min(
+                    candidates,
+                    key=lambda item: (
+                        _random_selection_score(profile_id, counter, item),
+                        item.bundle_id.casefold(),
+                        item.bundle_id,
+                    ),
+                )
+            return min(
+                candidates,
+                key=lambda item: (item.bundle_id.casefold(), item.bundle_id),
+            )
+
+    def get_triggered_bundle(
+        self,
+        *,
+        trigger_type: str,
+        trigger_id: str,
+        profile_id: str,
+        source_bucket: SourceBucket,
+    ) -> BundleRecord | None:
+        """Resolve one durable, namespace/profile/bucket-bound trigger outcome."""
+
+        _validate_identifier(trigger_type, "trigger type")
+        _validate_identifier(trigger_id, "trigger ID")
+        _validate_profile_id(profile_id)
+        bucket = _validate_bucket(source_bucket)
+        rows = tuple(
+            self._connection.execute(
+                "SELECT * FROM bundles WHERE claimed_by_type = ? AND claimed_by_id = ? "
+                "AND profile_id = ?",
+                (trigger_type, trigger_id, profile_id),
+            )
+        )
+        if len(rows) > 1:
+            raise ConflictError("trigger identity is not unique within its scope")
+        if not rows:
+            return None
+        if str(rows[0]["source_bucket"]) != bucket:
+            raise ConflictError("trigger identity conflicts with another source bucket")
+        return self._bundle_from_row(rows[0])
 
     def _insert_bundle_locked(
         self,
@@ -1622,7 +1776,6 @@ class StateRepository:
             now = self._now_text()
             self._connection.execute(
                 "UPDATE bundles SET status = 'archived', archive_path = ?, "
-                "claimed_by_type = NULL, claimed_by_id = NULL, "
                 "revision = revision + 1, updated_at = ? WHERE bundle_key = ?",
                 (archive_path, now, bundle_key),
             )
@@ -1653,20 +1806,173 @@ class StateRepository:
                 raise TransitionError(
                     "delivery cannot be claimed while bundle is not active"
                 )
+            resume_attempt = False
             if status != "pending":
                 if status == "failed" and bool(delivery["safe_to_retry"]):
                     due = _optional_datetime(delivery["next_attempt_at"])
                     if due is not None and due > self._now():
                         raise TransitionError("failed delivery retry is not due")
+                    remote = self._connection.execute(
+                        "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? "
+                        "AND platform = ? AND attempt_count = ? "
+                        "AND kind NOT IN ('staged_private', 'staged_public')",
+                        (bundle_key, platform, int(delivery["attempt_count"])),
+                    ).fetchone()
+                    resume_attempt = remote is not None and str(delivery["phase"]) in {
+                        "preparing",
+                        "processing",
+                        "ready",
+                    }
                 else:
                     raise TransitionError("delivery is not claimable")
+            phase = str(delivery["phase"]) if resume_attempt else "preparing"
+            attempt_increment = 0 if resume_attempt else 1
             self._connection.execute(
-                "UPDATE deliveries SET status = 'in_flight', phase = 'preparing', "
-                "attempt_count = attempt_count + 1, claim_token = ?, "
+                "UPDATE deliveries SET status = 'in_flight', phase = ?, "
+                "attempt_count = attempt_count + ?, claim_token = ?, "
                 "next_attempt_at = NULL, error_code = NULL, error_message = NULL, "
                 "revision = revision + 1, updated_at = ? "
                 "WHERE bundle_key = ? AND platform = ?",
-                (claim_token, now, bundle_key, platform),
+                (phase, attempt_increment, claim_token, now, bundle_key, platform),
+            )
+        return self.get_delivery(bundle_key, platform)
+
+    def release_unmutated_delivery_claim(
+        self,
+        current: DeliveryRecord,
+        previous: DeliveryRecord,
+        *,
+        claim_token: str,
+    ) -> DeliveryRecord:
+        """Undo a new local-only claim after a peer fails the preflight barrier."""
+
+        fresh_claim = current.attempt_count == previous.attempt_count + 1
+        resumed_claim = (
+            current.attempt_count == previous.attempt_count
+            and previous.status == "failed"
+            and previous.safe_to_retry
+            and previous.phase in {"preparing", "processing", "ready"}
+        )
+        if (
+            current.bundle_key != previous.bundle_key
+            or current.platform != previous.platform
+            or previous.status not in {"pending", "failed"}
+            or not (fresh_claim or resumed_claim)
+        ):
+            raise StateValidationError("delivery claim release snapshot is invalid")
+        with self._transaction():
+            row = self._delivery_row(current.bundle_key, current.platform)
+            self._require_delivery_claim(row, claim_token, current.attempt_count)
+            expected_phase = previous.phase if resumed_claim else "preparing"
+            if str(row["phase"]) != expected_phase:
+                raise TransitionError("mutated delivery claim cannot be released")
+            if fresh_claim:
+                remote = self._connection.execute(
+                    "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? "
+                    "AND platform = ? AND attempt_count = ? "
+                    "AND kind NOT IN ('staged_private', 'staged_public')",
+                    (current.bundle_key, current.platform, current.attempt_count),
+                ).fetchone()
+                if remote is not None:
+                    raise TransitionError(
+                        "delivery with remote artifacts cannot be released"
+                    )
+                self._connection.execute(
+                    "DELETE FROM delivery_artifacts WHERE bundle_key = ? "
+                    "AND platform = ? AND attempt_count = ?",
+                    (current.bundle_key, current.platform, current.attempt_count),
+                )
+            self._connection.execute(
+                "UPDATE deliveries SET status = ?, phase = ?, attempt_count = ?, "
+                "consecutive_failures = ?, safe_to_retry = ?, next_attempt_at = ?, "
+                "claim_token = NULL, remote_id = ?, error_code = ?, error_message = ?, "
+                "revision = revision + 1, updated_at = ? WHERE bundle_key = ? AND platform = ?",
+                (
+                    previous.status,
+                    previous.phase,
+                    previous.attempt_count,
+                    previous.consecutive_failures,
+                    int(previous.safe_to_retry),
+                    _timestamp(previous.next_attempt_at)
+                    if previous.next_attempt_at is not None
+                    else None,
+                    previous.remote_id,
+                    previous.error_code,
+                    previous.error_message,
+                    self._now_text(),
+                    current.bundle_key,
+                    current.platform,
+                ),
+            )
+        return self.get_delivery(current.bundle_key, current.platform)
+
+    def defer_resumable_delivery(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        error_code: str,
+        error_message: str,
+        retry_at: datetime,
+        claim_token: str,
+        attempt_count: int,
+    ) -> DeliveryRecord:
+        """Defer a pre-final remote artifact without starting a new attempt."""
+
+        platform = _validate_platform(platform)
+        error_code = self._safe_text(error_code, "delivery error code", maximum=64)
+        error_message = self._safe_text(error_message, "delivery error message")
+        retry_timestamp = _timestamp(retry_at)
+        with self._transaction():
+            row = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(row, claim_token, attempt_count)
+            if str(row["phase"]) not in {"preparing", "processing", "ready"}:
+                raise TransitionError(
+                    "only a pre-final delivery can retain remote preparation state"
+                )
+            remote = self._connection.execute(
+                "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? "
+                "AND platform = ? AND attempt_count = ? "
+                "AND kind NOT IN ('staged_private', 'staged_public')",
+                (bundle_key, platform, attempt_count),
+            ).fetchone()
+            if remote is None:
+                raise TransitionError(
+                    "resumable delivery requires a durable remote artifact"
+                )
+            failures = int(row["consecutive_failures"]) + 1
+            retryable = failures < 5
+            now = self._now_text()
+            updated = self._connection.execute(
+                "UPDATE deliveries SET status = 'failed', "
+                "consecutive_failures = ?, safe_to_retry = ?, next_attempt_at = ?, "
+                "claim_token = NULL, error_code = ?, error_message = ?, "
+                "revision = revision + 1, updated_at = ? "
+                "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                "AND claim_token = ? AND attempt_count = ?",
+                (
+                    failures,
+                    int(retryable),
+                    retry_timestamp if retryable else None,
+                    error_code,
+                    error_message,
+                    now,
+                    bundle_key,
+                    platform,
+                    claim_token,
+                    attempt_count,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("delivery claim became stale")
+            if not retryable:
+                self._block_bundle_locked(bundle_key, error_code)
+            self._insert_event_locked(
+                bundle_key,
+                platform,
+                "delivery_failed",
+                f"delivery_failed:{attempt_count}:{failures}",
+                {"error_code": error_code, "retryable": retryable},
             )
         return self.get_delivery(bundle_key, platform)
 

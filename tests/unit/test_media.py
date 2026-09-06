@@ -25,6 +25,7 @@ from post_pulsar.content import PublishableBundle, scan_account_root
 from post_pulsar.media import (
     MediaSafetyError,
     StagedMedia,
+    cleanup_checkpointed_staging,
     cleanup_staged_media,
     open_verified_private_media,
     prepare_bundle_media,
@@ -1039,6 +1040,43 @@ def test_cleanup_is_hash_guarded_and_retains_ambiguous_evidence(tmp_path: Path) 
     path.write_bytes(body)
     assert cleanup_staged_media(descriptor, tmp_path / "public", outcome="published")
     assert not path.exists()
+
+
+def test_checkpointed_cleanup_is_path_and_hash_bound_without_metadata(
+    tmp_path: Path,
+) -> None:
+    body = _image_bytes("JPEG")
+    descriptor = _public_descriptor(tmp_path, body)
+    path = descriptor.absolute_path(tmp_path / "public")
+
+    assert not cleanup_checkpointed_staging(
+        descriptor.relative_path,
+        descriptor.sha256,
+        tmp_path / "public",
+        outcome="ambiguous",
+    )
+    path.write_bytes(b"changed")
+    with pytest.raises(MediaSafetyError, match="hash"):
+        cleanup_checkpointed_staging(
+            descriptor.relative_path,
+            descriptor.sha256,
+            tmp_path / "public",
+            outcome="failed",
+        )
+    with pytest.raises(MediaSafetyError, match="relative"):
+        cleanup_checkpointed_staging(
+            "../outside.jpg",
+            descriptor.sha256,
+            tmp_path / "public",
+            outcome="failed",
+        )
+    path.write_bytes(body)
+    assert cleanup_checkpointed_staging(
+        descriptor.relative_path,
+        descriptor.sha256,
+        tmp_path / "public",
+        outcome="published",
+    )
 
 
 def test_cleanup_rejects_a_symlink_swap_without_touching_its_target(

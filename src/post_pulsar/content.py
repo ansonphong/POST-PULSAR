@@ -983,11 +983,15 @@ def _fingerprint(
         else:
             member_digest = hashlib.sha256()
             with _open_regular(entry.path) as source:
-                size = os.fstat(source.fileno()).st_size
+                before = os.fstat(source.fileno())
+                size = before.st_size
                 digest.update(size.to_bytes(8, "big"))
+                observed_size = 0
                 while chunk := source.read(_READ_CHUNK_SIZE):
                     digest.update(chunk)
                     member_digest.update(chunk)
+                    observed_size += len(chunk)
+                _verify_stable_read(entry.path, source, before, observed_size)
             member_sha = member_digest.hexdigest()
         media_kind = entry.role if entry.role in {"image", "video"} else None
         snapshots.append(
@@ -1024,7 +1028,32 @@ def _hash_field(digest: _Hasher, value: bytes) -> None:
 
 def _read_regular_bytes(path: Path) -> bytes:
     with _open_regular(path) as source:
-        return source.read()
+        before = os.fstat(source.fileno())
+        value = source.read()
+        _verify_stable_read(path, source, before, len(value))
+        return value
+
+
+def _verify_stable_read(
+    path: Path,
+    source: BinaryIO,
+    before: os.stat_result,
+    observed_size: int,
+) -> None:
+    """Bind byte count and post-read identity to the same held stream."""
+
+    opened_after = os.fstat(source.fileno())
+    path_after = os.lstat(path)
+    if not (
+        stat.S_ISREG(opened_after.st_mode)
+        and stat.S_ISREG(path_after.st_mode)
+        and _same_file_identity(before, opened_after)
+        and _same_file_identity(opened_after, path_after)
+        and observed_size == before.st_size == opened_after.st_size == path_after.st_size
+        and before.st_mtime_ns == opened_after.st_mtime_ns == path_after.st_mtime_ns
+        and before.st_ctime_ns == opened_after.st_ctime_ns == path_after.st_ctime_ns
+    ):
+        raise OSError("bundle member changed while being captured")
 
 
 def _open_regular(path: Path) -> BinaryIO:

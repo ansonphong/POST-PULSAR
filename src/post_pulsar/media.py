@@ -591,11 +591,51 @@ def cleanup_staged_media(
     outcome: TerminalOutcome,
 ) -> bool:
     """Remove only a hash-matched artifact after a known terminal result."""
+    return _cleanup_staged_artifact(
+        staged.relative_path,
+        staged.sha256,
+        staging_root,
+        outcome=outcome,
+        expected_size=staged.size_bytes,
+    )
+
+
+def cleanup_checkpointed_staging(
+    relative_path: str | os.PathLike[str],
+    sha256: str,
+    staging_root: str | os.PathLike[str],
+    *,
+    outcome: TerminalOutcome,
+) -> bool:
+    """Remove a durable path/hash checkpoint without reconstructing media metadata."""
+
+    relative = Path(relative_path)
+    _validate_relative_path(relative)
+    if not _SHA256_RE.fullmatch(sha256):
+        raise MediaSafetyError("staged media cleanup hash is invalid")
+    return _cleanup_staged_artifact(
+        relative,
+        sha256,
+        staging_root,
+        outcome=outcome,
+        expected_size=None,
+    )
+
+
+def _cleanup_staged_artifact(
+    relative: Path,
+    expected_sha256: str,
+    staging_root: str | os.PathLike[str],
+    *,
+    outcome: TerminalOutcome,
+    expected_size: int | None,
+) -> bool:
+    """Quarantine and unlink one no-follow, hash-bound staging artifact."""
+
     if outcome == "ambiguous":
         return False
     if outcome not in {"published", "failed"}:
         raise MediaSafetyError("unknown staging cleanup outcome")
-    relative = staged.relative_path
     quarantine = f".delete-{secrets.token_hex(16)}"
     try:
         with _open_descriptor_parent(Path(staging_root), relative) as parent_fd:
@@ -627,7 +667,9 @@ def cleanup_staged_media(
                             "staged media identity changed during cleanup"
                         )
                     digest, size = _hash_open_file(source)
-                    if digest != staged.sha256 or size != staged.size_bytes:
+                    if digest != expected_sha256 or (
+                        expected_size is not None and size != expected_size
+                    ):
                         _restore_quarantine(
                             cleanup_fd,
                             parent_fd,

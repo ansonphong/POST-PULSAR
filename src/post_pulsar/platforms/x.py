@@ -22,6 +22,7 @@ from post_pulsar.platforms.base import (
     PublicationSnapshot,
     PublishResult,
     RemoteIdentity,
+    RetryClassification,
     ValidationIssue,
 )
 from post_pulsar.platforms.http import (
@@ -77,6 +78,16 @@ class _DurableXCheckpointWriter(Protocol):
         self, current: ArtifactRecord, checkpoint: ArtifactCheckpoint
     ) -> ArtifactRecord: ...
 
+
+class XAdapterError(AdapterContractError):
+    """A sanitized X preparation failure with explicit retry semantics."""
+
+    def __init__(
+        self, code: str, message: str, retry_classification: RetryClassification
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retry_classification = retry_classification
 
 class XAdapter(BasePlatformAdapter):
     """Single-profile official X adapter with a one-shot final create."""
@@ -489,7 +500,7 @@ class XAdapter(BasePlatformAdapter):
                 (processing_deadline - _aware_utc(self._clock())).total_seconds(),
             )
             if remaining <= 0:
-                raise AdapterContractError("X media processing timed out")
+                raise _processing_timeout()
             deadline = self._monotonic() + remaining
             try:
                 response = self._client.read_only_request(
@@ -506,10 +517,13 @@ class XAdapter(BasePlatformAdapter):
                     return self._finalize_and_wait(record, item, checkpoints)
                 raise
             if self._monotonic() >= deadline:
-                raise AdapterContractError("X media processing timed out")
-            data = _response_data(response, "X media status response is invalid")
+                raise _processing_timeout()
+            try:
+                data = _response_data(response, "X media status response is invalid")
+            except AdapterContractError:
+                raise _processing_response_invalid() from None
             if data.get("id") != media_id:
-                raise AdapterContractError("X media status response is invalid")
+                raise _processing_response_invalid()
             info = data.get("processing_info")
             if info is None:
                 return self._transition_media(
@@ -535,9 +549,20 @@ class XAdapter(BasePlatformAdapter):
         response = self._client.pre_final_request(
             "POST", f"/2/media/upload/{media_id}/finalize"
         )
-        data = _response_data(response, "X media finalize response is invalid")
+        try:
+            data = _response_data(response, "X media finalize response is invalid")
+        except AdapterContractError:
+            raise XAdapterError(
+                "x_media_finalize_response_invalid",
+                "X media finalize response is invalid",
+                "safe_pre_final",
+            ) from None
         if data.get("id") != media_id:
-            raise AdapterContractError("X media finalize response is invalid")
+            raise XAdapterError(
+                "x_media_finalize_response_invalid",
+                "X media finalize response is invalid",
+                "safe_pre_final",
+            )
         now = _aware_utc(self._clock())
         expiry = record.expires_at
         if "expires_after_secs" in data:
@@ -595,7 +620,7 @@ class XAdapter(BasePlatformAdapter):
         )
         deadline = self._monotonic() + remaining
         if remaining <= 0:
-            raise AdapterContractError("X media processing timed out")
+            raise _processing_timeout()
         for _poll in range(_MAX_PROCESSING_POLLS):
             if info is None:
                 resumed_state = record.processing_metadata.get("state")
@@ -611,10 +636,10 @@ class XAdapter(BasePlatformAdapter):
                 else:
                     return record
             if not isinstance(info, Mapping):
-                raise AdapterContractError("X media processing response is invalid")
+                raise _processing_response_invalid()
             state = info.get("state")
             if state not in {"pending", "in_progress", "succeeded", "failed"}:
-                raise AdapterContractError("X media processing response is invalid")
+                raise _processing_response_invalid()
             record = self._transition_media(
                 checkpoints,
                 record,
@@ -626,7 +651,11 @@ class XAdapter(BasePlatformAdapter):
             if state == "succeeded":
                 return record
             if state == "failed":
-                raise AdapterContractError("X media processing failed")
+                raise XAdapterError(
+                    "x_media_processing_failed",
+                    "X media processing failed",
+                    "permanent",
+                )
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 break
@@ -636,7 +665,11 @@ class XAdapter(BasePlatformAdapter):
                 or not isinstance(delay, (int, float))
                 or not math.isfinite(float(delay))
             ):
-                raise AdapterContractError("X media processing delay is invalid")
+                raise XAdapterError(
+                    "x_media_processing_delay_invalid",
+                    "X media processing delay is invalid",
+                    "safe_pre_final",
+                )
             bounded = min(max(float(delay), 0.0), 60.0, remaining)
             self._sleeper(bounded)
             if self._monotonic() >= deadline:
@@ -650,15 +683,18 @@ class XAdapter(BasePlatformAdapter):
                 )
             except PlatformHTTPError as error:
                 if error.code == "retry_budget_exhausted":
-                    raise AdapterContractError("X media processing timed out") from None
+                    raise _processing_timeout() from None
                 raise
             if self._monotonic() >= deadline:
-                raise AdapterContractError("X media processing timed out")
-            data = _response_data(response, "X media status response is invalid")
+                raise _processing_timeout()
+            try:
+                data = _response_data(response, "X media status response is invalid")
+            except AdapterContractError:
+                raise _processing_response_invalid() from None
             if data.get("id") != media_id:
-                raise AdapterContractError("X media status response is invalid")
+                raise _processing_response_invalid()
             info = data.get("processing_info")
-        raise AdapterContractError("X media processing timed out")
+        raise _processing_timeout()
 
     def _transition_media(
         self,
@@ -782,6 +818,22 @@ def _response_data(response: SafeHTTPResponse, message: str) -> dict[str, object
     if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), Mapping):
         raise AdapterContractError(message)
     return dict(cast(Mapping[str, object], payload["data"]))
+
+
+def _processing_timeout() -> XAdapterError:
+    return XAdapterError(
+        "x_media_processing_timeout",
+        "X media processing timed out",
+        "safe_pre_final",
+    )
+
+
+def _processing_response_invalid() -> XAdapterError:
+    return XAdapterError(
+        "x_media_processing_response_invalid",
+        "X media processing response is invalid",
+        "safe_pre_final",
+    )
 
 
 def _media_identity(response: SafeHTTPResponse, now: datetime) -> tuple[str, datetime]:

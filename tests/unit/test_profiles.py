@@ -381,3 +381,47 @@ def test_account_scan_rejects_root_or_bucket_generation_replacement(
     assert replaced
     assert scan.bundles == ()
     assert code in _codes(scan)
+
+
+def test_member_capture_rejects_append_during_same_stream_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "account"
+    directory = _ready_bundle(root, "QUEUE", "post", "post.jpg")
+    media_path = directory / "post.jpg"
+    media_path.write_bytes(b"a")
+    original_open = content_module._open_regular
+
+    class AppendDuringRead:
+        def __init__(self, source: object) -> None:
+            self.source = source
+            self.appended = False
+
+        def __enter__(self) -> AppendDuringRead:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.source.close()  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return self.source.fileno()  # type: ignore[attr-defined,no-any-return]
+
+        def read(self, size: int = -1) -> bytes:
+            value = self.source.read(size)  # type: ignore[attr-defined]
+            if not self.appended:
+                self.appended = True
+                with media_path.open("ab") as destination:
+                    destination.write(b"b")
+            return value  # type: ignore[no-any-return]
+
+    def open_with_append(path: Path) -> object:
+        source = original_open(path)
+        return AppendDuringRead(source) if path == media_path else source
+
+    monkeypatch.setattr(content_module, "_open_regular", open_with_append)
+    monkeypatch.setattr(content_module, "_READ_CHUNK_SIZE", 1)
+
+    scan = scan_account_root(root)
+
+    assert scan.bundles == ()
+    assert "unreadable_member" in _codes(scan)

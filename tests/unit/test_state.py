@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -151,6 +152,23 @@ def test_open_existing_never_initializes_missing_state(tmp_path: Path) -> None:
     with pytest.raises(MigrationRequiredError, match="does not exist"):
         StateRepository.open_existing(path)
 
+    assert not path.exists()
+
+
+def test_open_existing_delete_race_never_recreates_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    StateRepository(path).close()
+    real_connect = sqlite3.connect
+
+    def delete_then_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        path.unlink()
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("post_pulsar.state.sqlite3.connect", delete_then_connect)
+    with pytest.raises(MigrationRequiredError, match="could not be opened safely"):
+        StateRepository.open_existing(path)
     assert not path.exists()
 
 
@@ -471,6 +489,105 @@ def test_delivery_checkpoints_attempt_and_failure_counters_block_on_fifth(
         else:
             assert not failed.safe_to_retry
             assert repository.get_bundle(bundle_key).status == "blocked"
+
+
+def test_remote_preparation_failure_resumes_same_attempt_and_can_be_released(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    first = repository.claim_delivery(bundle_key, "x", "first")
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "processing",
+        claim_token="first",
+        attempt_count=first.attempt_count,
+    )
+    artifact = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="90001",
+        expires_at=clock() + timedelta(hours=1),
+        processing_metadata={"state": "pending"},
+        claim_token="first",
+        attempt_count=first.attempt_count,
+    )
+    deferred = repository.defer_resumable_delivery(
+        bundle_key,
+        "x",
+        error_code="processing_timeout",
+        error_message="Remote processing is not finished.",
+        retry_at=clock(),
+        claim_token="first",
+        attempt_count=first.attempt_count,
+    )
+
+    resumed = repository.claim_delivery(bundle_key, "x", "second")
+
+    assert resumed.attempt_count == first.attempt_count == 1
+    assert resumed.phase == "processing"
+    assert repository.list_delivery_artifacts(
+        bundle_key, "x", attempt_count=resumed.attempt_count
+    ) == (artifact,)
+    released = repository.release_unmutated_delivery_claim(
+        resumed, deferred, claim_token="second"
+    )
+    assert replace(released, revision=deferred.revision) == deferred
+    assert repository.list_delivery_artifacts(
+        bundle_key, "x", attempt_count=resumed.attempt_count
+    ) == (artifact,)
+
+
+def test_fifth_resumable_failure_blocks_without_discarding_remote_evidence(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository)
+    delivery = repository.claim_delivery(bundle_key, "x", "claim-1")
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "processing",
+        claim_token="claim-1",
+        attempt_count=delivery.attempt_count,
+    )
+    artifact = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="90002",
+        expires_at=clock() + timedelta(hours=1),
+        processing_metadata={"state": "pending"},
+        claim_token="claim-1",
+        attempt_count=delivery.attempt_count,
+    )
+
+    for failure in range(1, 6):
+        failed = repository.defer_resumable_delivery(
+            bundle_key,
+            "x",
+            error_code="processing_timeout",
+            error_message="Remote processing is not finished.",
+            retry_at=clock(),
+            claim_token=f"claim-{failure}",
+            attempt_count=delivery.attempt_count,
+        )
+        assert failed.attempt_count == 1
+        assert failed.consecutive_failures == failure
+        if failure < 5:
+            delivery = repository.claim_delivery(
+                bundle_key, "x", f"claim-{failure + 1}"
+            )
+
+    assert not failed.safe_to_retry
+    assert repository.get_bundle(bundle_key).status == "blocked"
+    assert repository.list_delivery_artifacts(bundle_key, "x") == (artifact,)
 
 
 def test_artifact_checkpoint_is_idempotent_but_not_mutable(tmp_path: Path) -> None:
@@ -1069,6 +1186,88 @@ def test_transactional_random_admission_selects_fixed_sha256_score_and_links_tri
     )
     assert replay == admitted
     assert repository.selection_counter("ansonphong") == 1
+
+
+def test_admission_preview_is_read_only_and_commit_requires_same_selection(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    candidates = (
+        BundleAdmissionCandidate("Zulu", "b" * 64, (_file("Zulu.jpg"),)),
+        BundleAdmissionCandidate("alpha", "c" * 64, (_file("alpha.jpg"),)),
+    )
+    preview = repository.preview_selected_bundle(
+        profile_id="ansonphong", source_bucket="RANDOM", candidates=candidates
+    )
+    assert repository.selection_counter("ansonphong") == 0
+    with pytest.raises(ConflictError, match="selection changed"):
+        repository.admit_selected_bundle(
+            profile_id="ansonphong",
+            source_bucket="RANDOM",
+            candidates=candidates,
+            targets=(_target(),),
+            trigger_id="preview-1",
+            expected_bundle_id="wrong",
+            expected_fingerprint=preview.fingerprint,
+        )
+    assert repository.selection_counter("ansonphong") == 0
+    assert repository.list_active_bundles("ansonphong") == ()
+
+
+def test_run_trigger_survives_archive_and_is_profile_bound(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    candidate = BundleAdmissionCandidate("post", "b" * 64, (_file("post.jpg"),))
+    admitted = repository.admit_selected_bundle(
+        profile_id="ansonphong",
+        source_bucket="QUEUE",
+        candidates=(candidate,),
+        targets=(_target(),),
+        trigger_id="manual-durable",
+    )
+    claim = repository.claim_delivery(admitted.bundle_key, "x", "publish")
+    repository.advance_delivery_phase(
+        admitted.bundle_key,
+        "x",
+        "final_dispatch_started",
+        claim_token="publish",
+        attempt_count=claim.attempt_count,
+    )
+    repository.publish_delivery(
+        admitted.bundle_key,
+        "x",
+        remote_id="remote-durable",
+        claim_token="publish",
+        attempt_count=claim.attempt_count,
+    )
+    archiving = repository.begin_archiving(
+        admitted.bundle_key, expected_revision=repository.get_bundle(admitted.bundle_key).revision
+    )
+    repository.checkpoint_archive_member(
+        admitted.bundle_key, "post.jpg", sha256="a" * 64
+    )
+    repository.checkpoint_archive_member(
+        admitted.bundle_key, ".ready", sha256=hashlib.sha256(b"").hexdigest()
+    )
+    repository.mark_archived(
+        admitted.bundle_key, "QUEUE/post", expected_revision=archiving.revision
+    )
+
+    replay = repository.get_triggered_bundle(
+        trigger_type="run_once",
+        trigger_id="manual-durable",
+        profile_id="ansonphong",
+        source_bucket="QUEUE",
+    )
+    assert replay is not None and replay.status == "archived"
+    with pytest.raises(ConflictError, match="another source bucket"):
+        repository.get_triggered_bundle(
+            trigger_type="run_once",
+            trigger_id="manual-durable",
+            profile_id="ansonphong",
+            source_bucket="REELS",
+        )
 
 
 def test_transactional_admission_rolls_back_selection_counter_on_snapshot_conflict(
