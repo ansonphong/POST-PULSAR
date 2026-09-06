@@ -213,6 +213,7 @@ def test_paused_scheduler_does_not_admit_or_recover_work() -> None:
         wall_clock=lambda: datetime(2026, 9, 7, 9, 5, tzinfo=UTC),
     )
     assert scheduler.tick() == ()
+    assert repository.runs == {}
 
 
 def test_occurrence_gate_stops_later_admission_and_failure_isolates_profiles() -> None:
@@ -246,4 +247,3 @@ def test_occurrence_gate_stops_later_admission_and_failure_isolates_profiles() -
     )
     assert failures == ["zulu"]
     assert len(repository.runs) == 2
-    assert repository.runs == {}
