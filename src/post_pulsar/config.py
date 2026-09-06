@@ -11,6 +11,7 @@ import ipaddress
 import math
 import os
 import tomllib
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
@@ -355,7 +356,12 @@ def _positive_number(
     value = values.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigurationError(f"{section}.{key} must be a finite positive number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ConfigurationError(
+            f"{section}.{key} must be a finite positive number"
+        ) from None
     if not math.isfinite(number) or number <= 0:
         raise ConfigurationError(f"{section}.{key} must be a finite positive number")
     return number
@@ -407,7 +413,7 @@ def _validated_media_base_url(value: str) -> str:
     label = "instagram.media_base_url"
     if any(character.isspace() or ord(character) < 32 for character in value):
         raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
-    if "\\" in value:
+    if "\\" in value or "?" in value or "#" in value:
         raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
     try:
         parsed = urlsplit(value)
@@ -424,11 +430,19 @@ def _validated_media_base_url(value: str) -> str:
         or not parsed.path.endswith("/")
     ):
         raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
+    hostname = parsed.hostname
+    if hostname is None:  # Guard the Optional property after URL parsing.
+        raise ConfigurationError(f"{label} must be a safe public HTTPS base URL")
+    hostname = hostname.rstrip(".")
+    if "%" in hostname or _looks_like_noncanonical_ipv4(hostname):
+        raise ConfigurationError(f"{label} must not contain an IP literal")
     try:
-        ipaddress.ip_address(parsed.hostname)
+        ipaddress.ip_address(hostname)
     except ValueError:
-        hostname = parsed.hostname.casefold().rstrip(".")
-        if hostname == "localhost" or hostname.endswith(".localhost"):
+        normalized_hostname = hostname.casefold()
+        if normalized_hostname == "localhost" or normalized_hostname.endswith(
+            ".localhost"
+        ):
             raise ConfigurationError(f"{label} must use a public hostname")
     else:
         raise ConfigurationError(f"{label} must not contain an IP literal")
@@ -444,6 +458,24 @@ def _validated_media_base_url(value: str) -> str:
     ):
         raise ConfigurationError(f"{label} must not contain traversal")
     return value
+
+
+def _looks_like_noncanonical_ipv4(hostname: str) -> bool:
+    """Recognize inet_aton-style numeric hosts without resolving them."""
+    components = hostname.split(".")
+    if not components or any(not component for component in components):
+        return False
+    return all(_looks_like_ipv4_number(component) for component in components)
+
+
+def _looks_like_ipv4_number(component: str) -> bool:
+    lowered = component.lower()
+    if lowered.startswith("0x"):
+        digits = lowered[2:]
+        return bool(digits) and all(
+            character in "0123456789abcdef" for character in digits
+        )
+    return component.isascii() and component.isdigit()
 
 
 def _validate_path_separation(
@@ -462,14 +494,16 @@ def _validate_path_separation(
                     f"runtime directories must not overlap: {left_name}, {right_name}"
                 )
     for directory_name, directory in items:
-        if app.log_file == directory or directory.is_relative_to(app.log_file):
+        if _paths_equal(app.log_file, directory) or _path_is_relative_to(
+            directory, app.log_file
+        ):
             raise ConfigurationError(
                 f"app.log_file must not equal or contain {directory_name}"
             )
 
     for directory_name in ("app.posts_directory", "instagram.media_directory"):
         directory = directories[directory_name]
-        if app.log_file.is_relative_to(directory):
+        if _path_is_relative_to(app.log_file, directory):
             raise ConfigurationError(
                 f"app.log_file must not overlap {directory_name}"
             )
@@ -477,10 +511,28 @@ def _validate_path_separation(
 
 def _paths_overlap(left: Path, right: Path) -> bool:
     return (
-        left == right
-        or left.is_relative_to(right)
-        or right.is_relative_to(left)
+        _paths_equal(left, right)
+        or _path_is_relative_to(left, right)
+        or _path_is_relative_to(right, left)
     )
+
+
+def _paths_equal(left: Path, right: Path) -> bool:
+    return _portable_path_parts(left) == _portable_path_parts(right)
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    path_parts = _portable_path_parts(path)
+    parent_parts = _portable_path_parts(parent)
+    return (
+        len(path_parts) >= len(parent_parts)
+        and path_parts[: len(parent_parts)] == parent_parts
+    )
+
+
+def _portable_path_parts(path: Path) -> tuple[str, ...]:
+    """Normalize components for supported case-insensitive filesystems."""
+    return tuple(unicodedata.normalize("NFD", part).lower() for part in path.parts)
 
 
 def _require_account_id(target: TargetName, user_id: str) -> None:

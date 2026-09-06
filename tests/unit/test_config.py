@@ -170,9 +170,16 @@ def test_enabled_targets_require_numeric_expected_account_ids(
         "http://media.example.com/post-pulsar/",
         "https://user@media.example.com/post-pulsar/",
         "https://media.example.com/post-pulsar/?key=value",
+        "https://media.example.com/post-pulsar/?",
         "https://media.example.com/post-pulsar/#fragment",
+        "https://media.example.com/post-pulsar/#",
         "https://127.0.0.1/post-pulsar/",
         "https://[::1]/post-pulsar/",
+        "https://2130706433/post-pulsar/",
+        "https://0x7f000001/post-pulsar/",
+        "https://127.1/post-pulsar/",
+        "https://%31%32%37.0.0.1/post-pulsar/",
+        "https://127%2e0%2e0%2e1/post-pulsar/",
         "https://media.example.com/../private/",
         "https://media.example.com/%2e%2e/private/",
         "https://media.example.com/post-pulsar",
@@ -334,6 +341,52 @@ def test_log_file_may_be_inside_state_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("state_directory", "media_directory"),
+    [
+        ("POSTS/state", "public-media"),
+        (".post-pulsar", "Posts/media"),
+        ("Runtime/State", "runtime"),
+    ],
+)
+def test_runtime_directories_reject_portable_case_collisions(
+    tmp_path: Path, state_directory: str, media_directory: str
+) -> None:
+    path = _write_config(tmp_path, media_directory=media_directory)
+    text = path.read_text(encoding="utf-8").replace(
+        'state_directory = ".post-pulsar"',
+        f'state_directory = "{state_directory}"',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="overlap"):
+        load_local_settings(path)
+
+
+def test_portable_path_comparison_is_component_aware(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        'state_directory = ".post-pulsar"',
+        'state_directory = "POSTS-archive"',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    settings = load_local_settings(path)
+
+    assert settings.app.state_directory == (tmp_path / "POSTS-archive").resolve()
+
+
+def test_log_file_rejects_portable_case_collision(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        'log_file = "post_pulsar.log"', 'log_file = "POSTS/post_pulsar.log"'
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="app.log_file"):
+        load_local_settings(path)
+
+
+@pytest.mark.parametrize(
     ("section", "key", "original", "invalid"),
     [
         ("x", "request_timeout_seconds", "30", "nan"),
@@ -355,3 +408,23 @@ def test_timeout_settings_must_be_finite(
 
     with pytest.raises(ConfigurationError, match=rf"{section}\.{key}"):
         load_local_settings(path)
+
+
+def test_oversized_integer_timeout_raises_sanitized_configuration_error(
+    tmp_path: Path,
+) -> None:
+    path = _write_config(tmp_path)
+    oversized = "1" + ("0" * 400)
+    text = path.read_text(encoding="utf-8").replace(
+        "request_timeout_seconds = 30",
+        f"request_timeout_seconds = {oversized}",
+        1,
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as caught:
+        load_local_settings(path)
+
+    message = str(caught.value)
+    assert message == "x.request_timeout_seconds must be a finite positive number"
+    assert oversized not in message
