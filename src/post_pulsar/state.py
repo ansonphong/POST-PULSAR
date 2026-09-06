@@ -66,7 +66,15 @@ _ARTIFACT_KINDS: Final = frozenset(
     }
 )
 _PROCESSING_METADATA_KEYS: Final = frozenset(
-    {"state", "progress_percent", "check_after_seconds", "error_code"}
+    {
+        "state",
+        "progress_percent",
+        "check_after_seconds",
+        "error_code",
+        "next_segment_index",
+        "source_sha256",
+        "media_type",
+    }
 )
 _WARNING_CODES: Final = frozenset(
     {
@@ -1642,6 +1650,174 @@ class StateRepository:
                 )
                 if updated.rowcount != 1:
                     raise ConflictError("delivery claim became stale")
+        row = self._connection.execute(
+            "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ? "
+            "AND attempt_count = ? AND kind = ? AND ordinal = ?",
+            (bundle_key, platform, attempt_count, kind, ordinal),
+        ).fetchone()
+        return self._artifact_from_row(cast(sqlite3.Row, row))
+
+    def transition_artifact_processing(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        kind: str,
+        ordinal: int,
+        external_id: str,
+        expected_processing_metadata: Mapping[str, object],
+        processing_metadata: Mapping[str, object],
+        claim_token: str,
+        attempt_count: int,
+    ) -> ArtifactRecord:
+        """CAS-update processing state without weakening artifact identity."""
+
+        platform = _validate_platform(platform)
+        if kind not in {
+            "x_media_id",
+            "instagram_child_container",
+            "instagram_parent_container",
+        }:
+            raise StateValidationError(
+                "only remote artifacts have processing transitions"
+            )
+        if ordinal < 0:
+            raise StateValidationError("artifact ordinal must be non-negative")
+        _validate_identifier(external_id, "remote artifact ID")
+        expected_json = self._processing_metadata_json(expected_processing_metadata)
+        metadata_json = self._processing_metadata_json(processing_metadata)
+        with self._transaction():
+            delivery = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(delivery, claim_token, attempt_count)
+            if str(delivery["phase"]) == "final_dispatch_started":
+                raise TransitionError(
+                    "artifact processing cannot change after final dispatch"
+                )
+            artifact = self._connection.execute(
+                "SELECT * FROM delivery_artifacts WHERE bundle_key = ? "
+                "AND platform = ? AND attempt_count = ? AND kind = ? AND ordinal = ?",
+                (bundle_key, platform, attempt_count, kind, ordinal),
+            ).fetchone()
+            if artifact is None:
+                raise ConflictError("artifact processing checkpoint is missing")
+            if str(artifact["external_id"]) != external_id:
+                raise ConflictError("artifact processing identity changed")
+            if str(artifact["processing_metadata_json"]) != expected_json:
+                raise ConflictError("artifact processing metadata changed")
+            if metadata_json != expected_json:
+                now = self._now_text()
+                updated = self._connection.execute(
+                    "UPDATE delivery_artifacts SET processing_metadata_json = ?, "
+                    "updated_at = ? WHERE bundle_key = ? AND platform = ? "
+                    "AND attempt_count = ? AND kind = ? AND ordinal = ? "
+                    "AND external_id = ? AND processing_metadata_json = ?",
+                    (
+                        metadata_json,
+                        now,
+                        bundle_key,
+                        platform,
+                        attempt_count,
+                        kind,
+                        ordinal,
+                        external_id,
+                        expected_json,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ConflictError("artifact processing checkpoint became stale")
+                self._connection.execute(
+                    "UPDATE deliveries SET revision = revision + 1, updated_at = ? "
+                    "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                    "AND claim_token = ? AND attempt_count = ?",
+                    (now, bundle_key, platform, claim_token, attempt_count),
+                )
+        row = self._connection.execute(
+            "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ? "
+            "AND attempt_count = ? AND kind = ? AND ordinal = ?",
+            (bundle_key, platform, attempt_count, kind, ordinal),
+        ).fetchone()
+        return self._artifact_from_row(cast(sqlite3.Row, row))
+
+    def replace_expired_artifact(
+        self,
+        bundle_key: int,
+        platform: Platform,
+        *,
+        kind: str,
+        ordinal: int,
+        expected_external_id: str,
+        external_id: str,
+        expires_at: datetime,
+        processing_metadata: Mapping[str, object],
+        claim_token: str,
+        attempt_count: int,
+    ) -> ArtifactRecord:
+        """Atomically replace one expired remote artifact before final dispatch."""
+
+        platform = _validate_platform(platform)
+        if kind not in {
+            "x_media_id",
+            "instagram_child_container",
+            "instagram_parent_container",
+        }:
+            raise StateValidationError("only remote artifacts can be replaced")
+        if ordinal < 0:
+            raise StateValidationError("artifact ordinal must be non-negative")
+        _validate_identifier(expected_external_id, "expected remote artifact ID")
+        _validate_identifier(external_id, "remote artifact ID")
+        expiry = _timestamp(expires_at)
+        if expires_at.astimezone(UTC) <= self._now():
+            raise StateValidationError("replacement artifact expiry must be in the future")
+        metadata_json = self._processing_metadata_json(processing_metadata)
+        with self._transaction():
+            delivery = self._delivery_row(bundle_key, platform)
+            self._require_delivery_claim(delivery, claim_token, attempt_count)
+            if str(delivery["phase"]) == "final_dispatch_started":
+                raise TransitionError(
+                    "expired artifact cannot be replaced after final dispatch"
+                )
+            artifact = self._connection.execute(
+                "SELECT * FROM delivery_artifacts WHERE bundle_key = ? "
+                "AND platform = ? AND attempt_count = ? AND kind = ? AND ordinal = ?",
+                (bundle_key, platform, attempt_count, kind, ordinal),
+            ).fetchone()
+            if artifact is None or str(artifact["external_id"]) != expected_external_id:
+                raise ConflictError("expired artifact identity changed")
+            current_expiry = _optional_datetime(artifact["expires_at"])
+            if current_expiry is None or current_expiry > self._now():
+                raise TransitionError("remote artifact is not expired")
+            now = self._now_text()
+            try:
+                updated = self._connection.execute(
+                    "UPDATE delivery_artifacts SET external_id = ?, expires_at = ?, "
+                    "processing_metadata_json = ?, updated_at = ? "
+                    "WHERE bundle_key = ? AND platform = ? AND attempt_count = ? "
+                    "AND kind = ? AND ordinal = ? AND external_id = ?",
+                    (
+                        external_id,
+                        expiry,
+                        metadata_json,
+                        now,
+                        bundle_key,
+                        platform,
+                        attempt_count,
+                        kind,
+                        ordinal,
+                        expected_external_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError(
+                    "replacement artifact identity conflicts with durable state"
+                ) from None
+            if updated.rowcount != 1:
+                raise ConflictError("expired artifact replacement became stale")
+            self._connection.execute(
+                "UPDATE deliveries SET revision = revision + 1, updated_at = ? "
+                "WHERE bundle_key = ? AND platform = ? AND status = 'in_flight' "
+                "AND claim_token = ? AND attempt_count = ?",
+                (now, bundle_key, platform, claim_token, attempt_count),
+            )
         row = self._connection.execute(
             "SELECT * FROM delivery_artifacts WHERE bundle_key = ? AND platform = ? "
             "AND attempt_count = ? AND kind = ? AND ordinal = ?",

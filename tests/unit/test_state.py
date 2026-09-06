@@ -482,6 +482,109 @@ def test_artifact_checkpoint_is_idempotent_but_not_mutable(tmp_path: Path) -> No
         )
 
 
+def test_remote_artifact_processing_transitions_and_expired_replacement_are_guarded(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    bundle_key = _bundle(repository, "x-resume")
+    claim = _claim(repository, bundle_key, "x", "x-resume-claim")
+    source_hash = "c" * 64
+    initialized = repository.checkpoint_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="media-old",
+        expires_at=clock() + timedelta(minutes=5),
+        processing_metadata={
+            "state": "initialized",
+            "next_segment_index": 0,
+            "source_sha256": source_hash,
+            "media_type": "video/mp4",
+        },
+        **claim,  # type: ignore[arg-type]
+    )
+    appending = repository.transition_artifact_processing(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        external_id="media-old",
+        expected_processing_metadata=initialized.processing_metadata,
+        processing_metadata={
+            "state": "appending",
+            "next_segment_index": 1,
+            "source_sha256": source_hash,
+            "media_type": "video/mp4",
+        },
+        **claim,  # type: ignore[arg-type]
+    )
+    assert appending.processing_metadata["next_segment_index"] == 1
+    with pytest.raises(ConflictError, match="processing metadata"):
+        repository.transition_artifact_processing(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            external_id="media-old",
+            expected_processing_metadata=initialized.processing_metadata,
+            processing_metadata={"state": "succeeded"},
+            **claim,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TransitionError, match="not expired"):
+        repository.replace_expired_artifact(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            expected_external_id="media-old",
+            external_id="media-new",
+            expires_at=clock() + timedelta(hours=1),
+            processing_metadata={"state": "succeeded"},
+            **claim,  # type: ignore[arg-type]
+        )
+    clock.advance(minutes=6)
+    replacement = repository.replace_expired_artifact(
+        bundle_key,
+        "x",
+        kind="x_media_id",
+        ordinal=0,
+        expected_external_id="media-old",
+        external_id="media-new",
+        expires_at=clock() + timedelta(hours=1),
+        processing_metadata={
+            "state": "succeeded",
+            "source_sha256": source_hash,
+            "media_type": "video/mp4",
+        },
+        **claim,  # type: ignore[arg-type]
+    )
+    assert replacement.external_id == "media-new"
+    assert repository.list_delivery_artifacts(bundle_key, "x") == (replacement,)
+
+    repository.advance_delivery_phase(
+        bundle_key,
+        "x",
+        "final_dispatch_started",
+        **claim,  # type: ignore[arg-type]
+    )
+    clock.advance(hours=2)
+    with pytest.raises(TransitionError, match="final dispatch"):
+        repository.replace_expired_artifact(
+            bundle_key,
+            "x",
+            kind="x_media_id",
+            ordinal=0,
+            expected_external_id="media-new",
+            external_id="media-never",
+            expires_at=clock() + timedelta(hours=1),
+            processing_metadata={"state": "succeeded"},
+            **claim,  # type: ignore[arg-type]
+        )
+
+
 def test_instagram_container_and_public_staging_checkpoints_are_durable(
     tmp_path: Path,
 ) -> None:
