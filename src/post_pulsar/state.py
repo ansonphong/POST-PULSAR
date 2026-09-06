@@ -19,7 +19,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 Platform: TypeAlias = Literal["x", "instagram"]
 SourceBucket: TypeAlias = Literal["QUEUE", "RANDOM", "REELS"]
-BundleStatus: TypeAlias = Literal["active", "blocked", "archiving", "archived"]
+BundleStatus: TypeAlias = Literal[
+    "active", "blocked", "archiving", "archived", "cancelled", "deleted"
+]
 DeliveryStatus: TypeAlias = Literal[
     "pending", "in_flight", "published", "failed", "ambiguous"
 ]
@@ -41,7 +43,9 @@ SCHEMA_VERSION: Final = 1
 _APPLICATION_ID: Final = 0x50505352
 _PLATFORMS: Final = frozenset({"x", "instagram"})
 _BUCKETS: Final = frozenset({"QUEUE", "RANDOM", "REELS"})
-_BUNDLE_STATES: Final = frozenset({"active", "blocked", "archiving", "archived"})
+_BUNDLE_STATES: Final = frozenset(
+    {"active", "blocked", "archiving", "archived", "cancelled", "deleted"}
+)
 _PHASE_ORDER: Final = {
     "preparing": 0,
     "processing": 1,
@@ -98,6 +102,8 @@ _EVENT_TYPES: Final = frozenset(
         "bundle_blocked",
         "bundle_archiving",
         "bundle_archived",
+        "bundle_cancelled",
+        "bundle_deleted",
         "warning",
     }
 )
@@ -408,7 +414,7 @@ CREATE TABLE IF NOT EXISTS bundles (
     profile_root_snapshot TEXT NOT NULL,
     ready_marker_name TEXT NOT NULL DEFAULT '.ready',
     ready_marker_archived INTEGER NOT NULL DEFAULT 0 CHECK (ready_marker_archived IN (0, 1)),
-    status TEXT NOT NULL CHECK (status IN ('active', 'blocked', 'archiving', 'archived')),
+    status TEXT NOT NULL CHECK (status IN ('active', 'blocked', 'archiving', 'archived', 'cancelled', 'deleted')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     archive_path TEXT,
     block_reason TEXT,
@@ -1748,6 +1754,69 @@ class StateRepository:
             )
         return self.get_bundle(bundle_key)
 
+    def terminalize_pending_bundle(
+        self,
+        *,
+        profile_id: str,
+        bundle_key: int,
+        expected_revision: int,
+        fingerprint: str,
+        action: str,
+    ) -> BundleRecord:
+        """Record a cancel/delete tombstone without removing snapshotted media."""
+
+        _validate_profile_id(profile_id)
+        _validate_sha256(fingerprint, "bundle fingerprint")
+        if action not in {"cancel", "delete"}:
+            raise StateValidationError("pending terminal action is invalid")
+        terminal_status = "cancelled" if action == "cancel" else "deleted"
+        with self._transaction():
+            bundle = self._bundle_row(bundle_key)
+            if str(bundle["profile_id"]) != profile_id:
+                raise ConflictError("pending bundle belongs to another profile")
+            self._require_revision(bundle, expected_revision, "pending bundle")
+            if str(bundle["fingerprint"]) != fingerprint:
+                raise ConflictError("pending bundle fingerprint drift")
+            if str(bundle["status"]) != "active":
+                raise TransitionError("only pristine pending work can be terminalized")
+            nonpristine = self._connection.execute(
+                "SELECT 1 FROM deliveries WHERE bundle_key = ? AND "
+                "(status != 'pending' OR phase IS NOT NULL OR attempt_count != 0 "
+                "OR consecutive_failures != 0 OR safe_to_retry != 1 "
+                "OR next_attempt_at IS NOT NULL OR claim_token IS NOT NULL "
+                "OR remote_id IS NOT NULL OR error_code IS NOT NULL "
+                "OR error_message IS NOT NULL) LIMIT 1",
+                (bundle_key,),
+            ).fetchone()
+            artifact = self._connection.execute(
+                "SELECT 1 FROM delivery_artifacts WHERE bundle_key = ? LIMIT 1",
+                (bundle_key,),
+            ).fetchone()
+            dispatching = self._connection.execute(
+                "SELECT 1 FROM schedule_runs WHERE bundle_key = ? "
+                "AND state = 'dispatching' LIMIT 1",
+                (bundle_key,),
+            ).fetchone()
+            if nonpristine is not None or artifact is not None or dispatching is not None:
+                raise TransitionError("only pristine non-in-flight work can be terminalized")
+            now = self._now_text()
+            updated = self._connection.execute(
+                "UPDATE bundles SET status = ?, block_reason = NULL, "
+                "revision = revision + 1, updated_at = ? "
+                "WHERE bundle_key = ? AND revision = ? AND status = 'active'",
+                (terminal_status, now, bundle_key, expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("pending bundle changed during terminalization")
+            self._insert_event_locked(
+                bundle_key,
+                None,
+                f"bundle_{terminal_status}",
+                f"operator_{action}",
+                {"terminal_status": terminal_status},
+            )
+        return self.get_bundle(bundle_key)
+
     def begin_archiving(
         self, bundle_key: int, *, expected_revision: int
     ) -> BundleRecord:
@@ -2899,36 +2968,15 @@ class StateRepository:
         enabled: bool,
         expected_revision: int | None = None,
     ) -> ScheduleRecord:
-        if not _SCHEDULE_RE.fullmatch(schedule_id):
-            raise StateValidationError("schedule ID is invalid")
-        bucket = _validate_bucket(bucket)
-        if isinstance(weekdays, (str, bytes)) or any(
-            isinstance(day, bool) or not isinstance(day, int) for day in weekdays
-        ):
-            raise StateValidationError(
-                "schedule weekdays must be integers from 0 through 6"
-            )
-        weekdays_tuple = tuple(sorted(set(weekdays)))
-        if not weekdays_tuple or any(day < 0 or day > 6 for day in weekdays_tuple):
-            raise StateValidationError(
-                "schedule weekdays must be integers from 0 through 6"
-            )
-        _validate_timezone(timezone)
-        _validate_local_time(local_time)
-        if (
-            isinstance(misfire_grace_seconds, bool)
-            or not isinstance(misfire_grace_seconds, int)
-            or not 0 <= misfire_grace_seconds <= 86400
-        ):
-            raise StateValidationError("schedule misfire grace is out of range")
-        settings = {
-            "bucket": bucket,
-            "timezone": timezone,
-            "weekdays": weekdays_tuple,
-            "local_time": local_time,
-            "misfire_grace_seconds": misfire_grace_seconds,
-            "enabled": enabled,
-        }
+        bucket, weekdays_tuple, settings = _normalize_schedule_settings(
+            schedule_id=schedule_id,
+            bucket=bucket,
+            timezone=timezone,
+            weekdays=weekdays,
+            local_time=local_time,
+            misfire_grace_seconds=misfire_grace_seconds,
+            enabled=enabled,
+        )
         config_hash = _sha256_text(self._safe_json(settings))
         weekdays_json = self._safe_json(weekdays_tuple)
         now = self._now_text()
@@ -2980,6 +3028,66 @@ class StateRepository:
                         schedule_key,
                     ),
                 )
+        return self.get_schedule(schedule_key)
+
+    def update_schedule(
+        self,
+        schedule_key: int,
+        *,
+        profile_id: str,
+        schedule_id: str,
+        bucket: SourceBucket,
+        timezone: str,
+        weekdays: Sequence[int],
+        local_time: str,
+        misfire_grace_seconds: int,
+        enabled: bool,
+        expected_revision: int,
+    ) -> ScheduleRecord:
+        """Update one exact schedule key without identity-based upsert ambiguity."""
+
+        _validate_profile_id(profile_id)
+        bucket, weekdays_tuple, settings = _normalize_schedule_settings(
+            schedule_id=schedule_id,
+            bucket=bucket,
+            timezone=timezone,
+            weekdays=weekdays,
+            local_time=local_time,
+            misfire_grace_seconds=misfire_grace_seconds,
+            enabled=enabled,
+        )
+        weekdays_json = self._safe_json(weekdays_tuple)
+        config_hash = _sha256_text(self._safe_json(settings))
+        with self._transaction():
+            row = self._schedule_row(schedule_key)
+            if (
+                str(row["profile_id"]) != profile_id
+                or str(row["schedule_id"]) != schedule_id
+            ):
+                raise ConflictError("schedule exact identity has changed")
+            self._require_revision(row, expected_revision, "schedule")
+            if str(row["config_hash"]) == config_hash:
+                return self._schedule_from_row(row)
+            updated = self._connection.execute(
+                "UPDATE schedules SET bucket = ?, timezone = ?, weekdays_json = ?, "
+                "local_time = ?, misfire_grace_seconds = ?, enabled = ?, "
+                "config_hash = ?, revision = revision + 1, updated_at = ? "
+                "WHERE schedule_key = ? AND revision = ?",
+                (
+                    bucket,
+                    timezone,
+                    weekdays_json,
+                    local_time,
+                    misfire_grace_seconds,
+                    int(enabled),
+                    config_hash,
+                    self._now_text(),
+                    schedule_key,
+                    expected_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("schedule changed during update")
         return self.get_schedule(schedule_key)
 
     def get_schedule(self, schedule_key: int) -> ScheduleRecord:
@@ -4319,11 +4427,47 @@ class StateRepository:
         else:
             raise StateValidationError("run request action is not allow-listed")
 
+        if action in {"cancel", "delete", "retry", "reconcile"}:
+            required = {"bundle_id", "fingerprint"}
+            if action in {"retry", "reconcile"}:
+                required.add("platform")
+            if action == "reconcile":
+                required.add("published_remote_id")
+            if set(arguments) != required:
+                raise StateValidationError(
+                    f"{action} request arguments do not match the exact contract"
+                )
+            bundle_id = arguments.get("bundle_id")
+            fingerprint = arguments.get("fingerprint")
+            if not isinstance(bundle_id, str):
+                raise StateValidationError(f"{action} bundle ID is invalid")
+            _validate_bundle_id(bundle_id)
+            if not isinstance(fingerprint, str):
+                raise StateValidationError(f"{action} fingerprint is invalid")
+            _validate_sha256(fingerprint, f"{action} fingerprint")
+            if action in {"retry", "reconcile"}:
+                platform = arguments.get("platform")
+                if not isinstance(platform, str):
+                    raise StateValidationError(f"{action} platform is invalid")
+                _validate_platform(platform)
+            remote_id = arguments.get("published_remote_id")
+            if action == "reconcile" and remote_id is not None:
+                if not isinstance(remote_id, str):
+                    raise StateValidationError("reconcile remote post ID is invalid")
+                _validate_identifier(remote_id, "remote post ID")
+
         if (
             bundle_key is not None
             and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id
         ):
             raise ConflictError("run request bundle belongs to another profile")
+        if action in {"cancel", "delete", "retry", "reconcile"}:
+            exact_bundle = self._bundle_row(cast(int, bundle_key))
+            if (
+                str(exact_bundle["bundle_id"]) != arguments["bundle_id"]
+                or str(exact_bundle["fingerprint"]) != arguments["fingerprint"]
+            ):
+                raise ConflictError("run request exact bundle identity drift")
         if (
             schedule_key is not None
             and str(self._schedule_row(schedule_key)["profile_id"]) != profile_id
@@ -4826,6 +4970,49 @@ def _validate_local_time(value: str) -> None:
         raise StateValidationError("schedule local time must be HH:MM") from None
     if parsed.strftime("%H:%M") != value:
         raise StateValidationError("schedule local time must be HH:MM")
+
+
+def _normalize_schedule_settings(
+    *,
+    schedule_id: str,
+    bucket: str,
+    timezone: str,
+    weekdays: Sequence[int],
+    local_time: str,
+    misfire_grace_seconds: int,
+    enabled: bool,
+) -> tuple[SourceBucket, tuple[int, ...], Mapping[str, object]]:
+    if not _SCHEDULE_RE.fullmatch(schedule_id):
+        raise StateValidationError("schedule ID is invalid")
+    normalized_bucket = _validate_bucket(bucket)
+    if isinstance(weekdays, (str, bytes)) or any(
+        isinstance(day, bool) or not isinstance(day, int) for day in weekdays
+    ):
+        raise StateValidationError("schedule weekdays must be integers from 0 through 6")
+    normalized_weekdays = tuple(sorted(set(weekdays)))
+    if not normalized_weekdays or any(
+        day < 0 or day > 6 for day in normalized_weekdays
+    ):
+        raise StateValidationError("schedule weekdays must be integers from 0 through 6")
+    _validate_timezone(timezone)
+    _validate_local_time(local_time)
+    if (
+        isinstance(misfire_grace_seconds, bool)
+        or not isinstance(misfire_grace_seconds, int)
+        or not 0 <= misfire_grace_seconds <= 86400
+    ):
+        raise StateValidationError("schedule misfire grace is out of range")
+    if not isinstance(enabled, bool):
+        raise StateValidationError("schedule enabled flag is invalid")
+    settings: Mapping[str, object] = {
+        "bucket": normalized_bucket,
+        "timezone": timezone,
+        "weekdays": normalized_weekdays,
+        "local_time": local_time,
+        "misfire_grace_seconds": misfire_grace_seconds,
+        "enabled": enabled,
+    }
+    return normalized_bucket, normalized_weekdays, settings
 
 
 def _timestamp(value: datetime | None) -> str:

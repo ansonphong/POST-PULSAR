@@ -4,26 +4,29 @@ from __future__ import annotations
 
 import json
 import runpy
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from PIL import Image
 
-from post_pulsar import main as package_main
 import post_pulsar
+from post_pulsar import main as package_main
 from post_pulsar.cli import (
     CONTROL_SCHEMA,
     EXIT_CONTENTION,
     EXIT_OK,
     EXIT_USAGE,
+    _execute_daemon_request,
     main,
 )
-from post_pulsar.config import SecretValue
+from post_pulsar.config import SecretValue, load_local_settings
+from post_pulsar.daemon import ForegroundDaemon
 from post_pulsar.locking import LockManager
 from post_pulsar.platforms.base import (
-    AdapterContractError,
     CheckpointWriter,
     PreparedPublication,
     PublicationRequest,
@@ -47,7 +50,7 @@ class CLIAdapter:
         self.closed = False
 
     def verify_identity(self) -> None:
-        pass
+        return None
 
     def preflight(self, publication: PublicationRequest) -> tuple[ValidationIssue, ...]:
         assert publication.snapshot == self.snapshot
@@ -201,6 +204,38 @@ def _seed_bundle(database: Path, *, state: str) -> int:
         return bundle_key
 
 
+def _approved_delivery_intent(
+    database: Path,
+    *,
+    action: str,
+    bundle_key: int,
+    published_remote_id: str | None = None,
+) -> tuple[str, int]:
+    with StateRepository.open_existing(database) as repository:
+        bundle = repository.get_bundle(bundle_key)
+        arguments: dict[str, object] = {
+            "bundle_id": bundle.bundle_id,
+            "fingerprint": bundle.fingerprint,
+            "platform": "x",
+        }
+        if action == "reconcile":
+            arguments["published_remote_id"] = published_remote_id
+        intent = repository.create_confirmation_intent(
+            action=action,
+            arguments=arguments,
+            profile_id="operator",
+            resource_revision=bundle.revision,
+            fingerprint=bundle.fingerprint,
+            consequence=f"Authorize exact {action}.",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            bundle_key=bundle_key,
+        )
+        repository.approve_confirmation_intent(
+            intent.intent_id, expected_revision=intent.revision
+        )
+        return intent.intent_id, bundle.revision
+
+
 def _invoke(
     arguments: list[str],
     *,
@@ -288,11 +323,14 @@ def test_status_is_credentialless_read_only_and_renders_warnings(
     assert not (tmp_path / "state/post_pulsar.log").exists()
 
 
-def test_retry_requires_confirmation_then_revalidates_identity_under_lock(
+def test_retry_requires_approved_intent_and_enqueues_without_network(
     tmp_path: Path,
 ) -> None:
     config, database = _setup(tmp_path, enabled=False)
     bundle_key = _seed_bundle(database, state="failed")
+    intent_id, revision = _approved_delivery_intent(
+        database, action="retry", bundle_key=bundle_key
+    )
     common = [
         "retry",
         "--config",
@@ -301,37 +339,38 @@ def test_retry_requires_confirmation_then_revalidates_identity_under_lock(
         "operator",
         "--bundle-key",
         str(bundle_key),
+        "--bundle-id",
+        "post-failed",
+        "--fingerprint",
+        "b" * 64,
         "--platform",
         "x",
+        "--expected-revision",
+        str(revision),
+        "--idempotency-key",
+        "retry-request",
     ]
     before = database.read_bytes()
     code, _output, _error = _invoke(common)
     assert code == EXIT_USAGE
     assert database.read_bytes() == before
-    verified: list[str] = []
-
-    def verify(
-        snapshot: PublicationSnapshot, token: SecretValue, private: Path
-    ) -> None:
-        verified.append(snapshot.target.expected_username)
-        assert token.reveal() == "token-x"
-        assert private.name == "private"
-
     code, output, error = _invoke(
-        common + ["--confirm", "RETRY", "--json"],
-        environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
-        identity_verifier=verify,
+        [*common, "--intent-id", intent_id, "--json"],
+        identity_verifier=lambda *_args: pytest.fail("retry executed during enqueue"),
     )
 
-    assert code == EXIT_OK and error == "" and verified == ["operator"]
-    assert json.loads(output)["result"]["delivery"]["safe_to_retry"] is True
+    assert code == EXIT_OK and error == ""
+    assert json.loads(output)["result"]["request"]["status"] == "queued"
     with StateRepository.open_existing(database) as repository:
-        assert repository.get_bundle(bundle_key).status == "active"
+        assert repository.get_bundle(bundle_key).status == "blocked"
 
 
 def test_retry_lock_contention_is_nonmutating(tmp_path: Path) -> None:
     config, database = _setup(tmp_path)
     bundle_key = _seed_bundle(database, state="failed")
+    intent_id, revision = _approved_delivery_intent(
+        database, action="retry", bundle_key=bundle_key
+    )
     manager = LockManager(tmp_path / "state")
     with manager.acquire_instance():
         before = database.read_bytes()
@@ -344,10 +383,18 @@ def test_retry_lock_contention_is_nonmutating(tmp_path: Path) -> None:
                 "operator",
                 "--bundle-key",
                 str(bundle_key),
+                "--bundle-id",
+                "post-failed",
+                "--fingerprint",
+                "b" * 64,
                 "--platform",
                 "x",
-                "--confirm",
-                "RETRY",
+                "--expected-revision",
+                str(revision),
+                "--idempotency-key",
+                "retry-contended",
+                "--intent-id",
+                intent_id,
             ],
             environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
             identity_verifier=lambda *_args: pytest.fail("contended retry verified"),
@@ -360,6 +407,9 @@ def test_retry_lock_contention_is_nonmutating(tmp_path: Path) -> None:
 def test_reconcile_lock_contention_is_nonmutating(tmp_path: Path) -> None:
     config, database = _setup(tmp_path)
     bundle_key = _seed_bundle(database, state="ambiguous")
+    intent_id, revision = _approved_delivery_intent(
+        database, action="reconcile", bundle_key=bundle_key
+    )
     manager = LockManager(tmp_path / "state")
     with manager.acquire_instance():
         before = database.read_bytes()
@@ -372,11 +422,19 @@ def test_reconcile_lock_contention_is_nonmutating(tmp_path: Path) -> None:
                 "operator",
                 "--bundle-key",
                 str(bundle_key),
+                "--bundle-id",
+                "post-ambiguous",
+                "--fingerprint",
+                "b" * 64,
                 "--platform",
                 "x",
                 "--not-published",
-                "--confirm",
-                "RECONCILE",
+                "--expected-revision",
+                str(revision),
+                "--idempotency-key",
+                "reconcile-contended",
+                "--intent-id",
+                intent_id,
             ],
             identity_verifier=lambda *_args: pytest.fail("reconcile used the network"),
         )
@@ -385,11 +443,18 @@ def test_reconcile_lock_contention_is_nonmutating(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("published", [True, False])
-def test_reconcile_is_offline_and_requires_exact_operator_evidence(
+def test_reconcile_is_offline_and_enqueues_exact_operator_evidence(
     tmp_path: Path, published: bool
 ) -> None:
     config, database = _setup(tmp_path, enabled=False)
     bundle_key = _seed_bundle(database, state="ambiguous")
+    remote_id = "96001" if published else None
+    intent_id, revision = _approved_delivery_intent(
+        database,
+        action="reconcile",
+        bundle_key=bundle_key,
+        published_remote_id=remote_id,
+    )
     resolution = ["--published", "96001"] if published else ["--not-published"]
 
     code, output, error = _invoke(
@@ -401,33 +466,39 @@ def test_reconcile_is_offline_and_requires_exact_operator_evidence(
             "operator",
             "--bundle-key",
             str(bundle_key),
+            "--bundle-id",
+            "post-ambiguous",
+            "--fingerprint",
+            "b" * 64,
             "--platform",
             "x",
             *resolution,
-            "--confirm",
-            "RECONCILE",
+            "--expected-revision",
+            str(revision),
+            "--idempotency-key",
+            f"reconcile-{published}",
+            "--intent-id",
+            intent_id,
             "--json",
         ],
         identity_verifier=lambda *_args: pytest.fail("reconcile used the network"),
     )
 
-    delivery = json.loads(output)["result"]["delivery"]
+    request = json.loads(output)["result"]["request"]
     assert code == EXIT_OK and error == ""
-    assert delivery["status"] == ("published" if published else "failed")
-    assert delivery["remote_id"] == ("96001" if published else None)
+    assert request["status"] == "queued"
+    assert request["arguments"]["published_remote_id"] == remote_id
 
 
-def test_errors_redact_configured_secret_and_package_exports_same_main(
+def test_durable_retry_does_not_render_credentials_and_package_exports_main(
     tmp_path: Path,
 ) -> None:
     config, database = _setup(tmp_path)
     bundle_key = _seed_bundle(database, state="failed")
+    intent_id, revision = _approved_delivery_intent(
+        database, action="retry", bundle_key=bundle_key
+    )
     secret = "never-render-this-token"
-
-    def unsafe_failure(
-        _snapshot: PublicationSnapshot, token: SecretValue, _private: Path
-    ) -> None:
-        raise AdapterContractError(f"remote rejected {token.reveal()}")
 
     code, output, error = _invoke(
         [
@@ -438,23 +509,184 @@ def test_errors_redact_configured_secret_and_package_exports_same_main(
             "operator",
             "--bundle-key",
             str(bundle_key),
+            "--bundle-id",
+            "post-failed",
+            "--fingerprint",
+            "b" * 64,
             "--platform",
             "x",
-            "--confirm",
-            "RETRY",
+            "--expected-revision",
+            str(revision),
+            "--idempotency-key",
+            "retry-secret-safe",
+            "--intent-id",
+            intent_id,
             "--json",
         ],
         environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": secret},
-        identity_verifier=unsafe_failure,
+        identity_verifier=lambda *_args: pytest.fail("retry executed during enqueue"),
     )
 
-    assert code != EXIT_OK and output == ""
-    assert secret not in error
-    assert "<redacted>" in error
+    assert code == EXIT_OK and error == ""
+    assert secret not in output
     log = (tmp_path / "state/post_pulsar.log").read_text(encoding="utf-8")
     assert secret not in log
     assert (tmp_path / "state/post_pulsar.log").stat().st_mode & 0o077 == 0
     assert package_main is main
+
+
+def test_daemon_retry_executor_revalidates_remote_identity(tmp_path: Path) -> None:
+    config, database = _setup(tmp_path)
+    bundle_key = _seed_bundle(database, state="failed")
+    intent_id, revision = _approved_delivery_intent(
+        database, action="retry", bundle_key=bundle_key
+    )
+    with StateRepository.open_existing(database) as repository:
+        bundle = repository.get_bundle(bundle_key)
+        request = repository.consume_intent_with_request(
+            intent_id=intent_id,
+            action="retry",
+            arguments={
+                "bundle_id": bundle.bundle_id,
+                "fingerprint": bundle.fingerprint,
+                "platform": "x",
+            },
+            profile_id="operator",
+            resource_revision=revision,
+            fingerprint=bundle.fingerprint,
+            idempotency_key="retry-executor",
+            bundle_key=bundle_key,
+        )
+    verified: list[str] = []
+
+    def verify(
+        snapshot: PublicationSnapshot, token: SecretValue, private: Path
+    ) -> None:
+        verified.append(snapshot.target.expected_remote_user_id)
+        assert token.reveal() == "token-x"
+        assert private.name == "private"
+
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as lease:
+        daemon = cast(
+            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
+        )
+        result = _execute_daemon_request(
+            load_local_settings(config),
+            request,
+            daemon=daemon,
+            environ={"POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "token-x"},
+            adapter_factory=None,
+            identity_verifier=verify,
+            clock=lambda: datetime.now(UTC),
+        )
+
+    assert verified == ["10001"]
+    assert result["safe_to_retry"] is True
+    with StateRepository.open_existing(database) as repository:
+        assert repository.get_bundle(bundle_key).status == "active"
+
+
+def test_daemon_reconcile_executor_is_offline(tmp_path: Path) -> None:
+    config, database = _setup(tmp_path)
+    bundle_key = _seed_bundle(database, state="ambiguous")
+    intent_id, revision = _approved_delivery_intent(
+        database,
+        action="reconcile",
+        bundle_key=bundle_key,
+        published_remote_id="96001",
+    )
+    with StateRepository.open_existing(database) as repository:
+        bundle = repository.get_bundle(bundle_key)
+        request = repository.consume_intent_with_request(
+            intent_id=intent_id,
+            action="reconcile",
+            arguments={
+                "bundle_id": bundle.bundle_id,
+                "fingerprint": bundle.fingerprint,
+                "platform": "x",
+                "published_remote_id": "96001",
+            },
+            profile_id="operator",
+            resource_revision=revision,
+            fingerprint=bundle.fingerprint,
+            idempotency_key="reconcile-executor",
+            bundle_key=bundle_key,
+        )
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as lease:
+        daemon = cast(
+            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
+        )
+        result = _execute_daemon_request(
+            load_local_settings(config),
+            request,
+            daemon=daemon,
+            environ={},
+            adapter_factory=None,
+            identity_verifier=lambda *_args: pytest.fail("reconcile used the network"),
+            clock=lambda: datetime.now(UTC),
+        )
+
+    assert result["status"] == "published"
+    assert result["remote_id"] == "96001"
+
+
+@pytest.mark.parametrize("action", ["cancel", "delete"])
+def test_daemon_pending_terminal_executor_preserves_source_media(
+    tmp_path: Path, action: str
+) -> None:
+    config, database = _setup(tmp_path)
+    bundle_key = _seed_bundle(database, state="pending")
+    source = tmp_path / "accounts/operator/QUEUE/post-pending/post-pending.jpg"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source-media")
+    with StateRepository.open_existing(database) as repository:
+        bundle = repository.get_bundle(bundle_key)
+        arguments = {
+            "bundle_id": bundle.bundle_id,
+            "fingerprint": bundle.fingerprint,
+        }
+        intent = repository.create_confirmation_intent(
+            action=action,
+            arguments=arguments,
+            profile_id="operator",
+            resource_revision=bundle.revision,
+            fingerprint=bundle.fingerprint,
+            consequence=f"Authorize exact {action} tombstone.",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            bundle_key=bundle_key,
+        )
+        repository.approve_confirmation_intent(
+            intent.intent_id, expected_revision=intent.revision
+        )
+        request = repository.consume_intent_with_request(
+            intent_id=intent.intent_id,
+            action=action,
+            arguments=arguments,
+            profile_id="operator",
+            resource_revision=bundle.revision,
+            fingerprint=bundle.fingerprint,
+            idempotency_key=f"{action}-executor",
+            bundle_key=bundle_key,
+        )
+    locks = LockManager(tmp_path / "state")
+    with locks.acquire_instance() as lease:
+        daemon = cast(
+            ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease)
+        )
+        result = _execute_daemon_request(
+            load_local_settings(config),
+            request,
+            daemon=daemon,
+            environ={},
+            adapter_factory=None,
+            identity_verifier=lambda *_args: pytest.fail("terminal action used network"),
+            clock=lambda: datetime.now(UTC),
+        )
+
+    assert result["status"] == ("cancelled" if action == "cancel" else "deleted")
+    assert source.read_bytes() == b"source-media"
 
 
 def test_module_entrypoint_returns_the_package_main_exit_code(

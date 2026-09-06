@@ -1672,9 +1672,14 @@ def test_expired_or_drifted_intent_cannot_create_request(tmp_path: Path) -> None
     clock = FakeClock()
     repository = _repository(tmp_path, clock)
     bundle_key = _bundle(repository)
+    arguments = {
+        "bundle_id": "post",
+        "fingerprint": "b" * 64,
+        "platform": "x",
+    }
     intent = repository.create_confirmation_intent(
         action="retry",
-        arguments={"bundle_key": bundle_key},
+        arguments=arguments,
         profile_id="ansonphong",
         resource_revision=1,
         fingerprint="b" * 64,
@@ -1688,7 +1693,7 @@ def test_expired_or_drifted_intent_cannot_create_request(tmp_path: Path) -> None
         repository.consume_intent_with_request(
             intent_id=intent.intent_id,
             action="retry",
-            arguments={"bundle_key": bundle_key},
+            arguments=arguments,
             profile_id="ansonphong",
             resource_revision=1,
             fingerprint="b" * 64,
@@ -1917,6 +1922,87 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
         schedule_key=schedule.schedule_key,
     )
     assert schedule_request.schedule_key == schedule.schedule_key
+
+
+@pytest.mark.parametrize("action", ["cancel", "delete"])
+def test_pristine_pending_bundle_becomes_revisioned_terminal_tombstone(
+    tmp_path: Path, action: str
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository, f"pending-{action}")
+    before_files = repository.list_bundle_files(bundle_key)
+
+    tombstone = repository.terminalize_pending_bundle(
+        profile_id="ansonphong",
+        bundle_key=bundle_key,
+        expected_revision=1,
+        fingerprint="b" * 64,
+        action=action,
+    )
+
+    expected_status = "cancelled" if action == "cancel" else "deleted"
+    assert tombstone.status == expected_status
+    assert tombstone.revision == 2
+    assert repository.list_bundle_files(bundle_key) == before_files
+    assert repository.list_bundle_deliveries(bundle_key)[0].status == "pending"
+    assert repository.list_events(bundle_key)[-1]["event_type"] == f"bundle_{tombstone.status}"
+
+
+def test_pending_tombstone_rejects_nonpristine_or_drifted_bundle(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    bundle_key = _bundle(repository, "claimed")
+    repository.claim_delivery(bundle_key, "x", "active-claim")
+
+    with pytest.raises(TransitionError, match="pristine"):
+        repository.terminalize_pending_bundle(
+            profile_id="ansonphong",
+            bundle_key=bundle_key,
+            expected_revision=1,
+            fingerprint="b" * 64,
+            action="cancel",
+        )
+    with pytest.raises(ConflictError, match="fingerprint"):
+        repository.terminalize_pending_bundle(
+            profile_id="ansonphong",
+            bundle_key=bundle_key,
+            expected_revision=1,
+            fingerprint="c" * 64,
+            action="delete",
+        )
+
+
+def test_schedule_update_mutates_the_exact_key_in_place(tmp_path: Path) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    schedule = repository.create_schedule(
+        profile_id="ansonphong",
+        schedule_id="morning",
+        bucket="QUEUE",
+        timezone="UTC",
+        weekdays=(0,),
+        local_time="09:30",
+        misfire_grace_seconds=60,
+        enabled=False,
+    )
+
+    updated = repository.update_schedule(
+        schedule.schedule_key,
+        profile_id="ansonphong",
+        schedule_id="morning",
+        bucket="RANDOM",
+        timezone="UTC",
+        weekdays=(0, 2),
+        local_time="09:45",
+        misfire_grace_seconds=120,
+        enabled=False,
+        expected_revision=schedule.revision,
+    )
+
+    assert updated.schedule_key == schedule.schedule_key
+    assert updated.bucket == "RANDOM"
+    assert updated.weekdays == (0, 2)
+    assert updated.revision == schedule.revision + 1
 
 
 def test_unfinished_snapshot_prevents_target_removal_or_reassignment(

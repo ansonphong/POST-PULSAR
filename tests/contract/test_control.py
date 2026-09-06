@@ -110,6 +110,59 @@ def test_writes_need_revision_idempotency_and_publish_permission(
     assert blocked.status == 403
 
 
+def test_keyed_schedule_routes_execute_and_reject_path_body_drift(
+    tmp_path: Path,
+) -> None:
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text(encoding="ascii").strip()
+    with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+        schedule = repository.create_schedule(
+            profile_id="profile",
+            schedule_id="morning",
+            bucket="QUEUE",
+            timezone="UTC",
+            weekdays=(0,),
+            local_time="09:30",
+            misfire_grace_seconds=60,
+            enabled=False,
+        )
+    headers = {"Idempotency-Key": "schedule-patch", "If-Match": '"1"'}
+    body = {
+        "profile_id": "profile",
+        "schedule_key": schedule.schedule_key,
+        "arguments": {
+            "schedule_id": "morning",
+            "bucket": "QUEUE",
+            "timezone": "UTC",
+            "weekdays": [0, 2],
+            "local_time": "09:45",
+            "misfire_grace_seconds": 60,
+            "enabled": False,
+        },
+    }
+
+    accepted = _call(
+        app,
+        "PATCH",
+        f"/control/v1/schedules/{schedule.schedule_key}",
+        token=token,
+        body=body,
+        headers=headers,
+    )
+    drifted = _call(
+        app,
+        "POST",
+        f"/control/v1/schedules/{schedule.schedule_key}/disable",
+        token=token,
+        body={"profile_id": "profile", "schedule_key": schedule.schedule_key + 1},
+        headers={"Idempotency-Key": "schedule-disable", "If-Match": '"1"'},
+    )
+
+    assert accepted.status == 202
+    assert json.loads(accepted.body)["data"]["action"] == "schedule_update"
+    assert drifted.status == 422
+
+
 def test_openapi_is_authoritative_and_has_every_operation() -> None:
     path = Path(__file__).parents[2] / "api/control-v1.openapi.json"
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -139,6 +192,7 @@ def test_openapi_is_authoritative_and_has_every_operation() -> None:
         "resume",
         "runNow",
         "cancelPending",
+        "deletePending",
         "retry",
         "reconcile",
         "createConfirmation",

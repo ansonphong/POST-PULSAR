@@ -46,8 +46,6 @@ _PUBLISH_ACTIONS: Final = frozenset(
         "schedule_create",
         "schedule_update",
         "schedule_enable",
-        "cancel",
-        "delete",
         "retry",
         "reconcile",
     }
@@ -84,6 +82,7 @@ _OPERATIONS: Final = (
     "resume",
     "runNow",
     "cancelPending",
+    "deletePending",
     "retry",
     "reconcile",
     "createConfirmation",
@@ -368,7 +367,10 @@ class ControlApplication:
                 "preview": len(route) == 7 and route[6] == "preview",
             }, 200
         if method == "GET" and route == ("schedules",):
+            profile_id = _required_profile_query(query)
             values = repository.list_schedules(
+                profile_id=profile_id,
+                after_schedule_key=_query_cursor(query),
                 limit=_page_limit(query, self._max_results)
             )
             return _page(
@@ -376,7 +378,10 @@ class ControlApplication:
                 values[-1].schedule_key if values else None,
             ), 200
         if method == "GET" and route == ("requests",):
+            profile_id = _required_profile_query(query)
             values = repository.list_run_requests(
+                profile_id=profile_id,
+                after_request_id=_query_cursor(query),
                 limit=_page_limit(query, self._max_results)
             )
             return _page(
@@ -440,8 +445,6 @@ class ControlApplication:
         ):
             key, revision = _write_headers(headers)
             action = _text(body, "action")
-            if action in _PUBLISH_ACTIONS and not self._allow_agent_publish:
-                return {"code": "agent_publish_disabled"}, 403
             result = repository.consume_intent_with_request(
                 intent_id=route[1],
                 action=action,
@@ -470,8 +473,14 @@ class ControlApplication:
                     if not isinstance(text_value, str) or len(text_value) > 10000:
                         raise StateValidationError("text is invalid")
                     arguments["text"] = text_value
+            schedule_key = _optional_integer(body, "schedule_key")
+            route_schedule_key = _route_schedule_key(route)
+            if route_schedule_key is not None:
+                if schedule_key != route_schedule_key:
+                    raise StateValidationError("schedule path and body keys disagree")
+                schedule_key = route_schedule_key
             enabling = _publication_enabling(
-                repository, action, arguments, _optional_integer(body, "schedule_key")
+                repository, action, arguments, schedule_key
             )
             if enabling:
                 if not self._allow_agent_publish:
@@ -484,7 +493,7 @@ class ControlApplication:
                 idempotency_key=key,
                 expected_revision=revision,
                 bundle_key=_optional_integer(body, "bundle_key"),
-                schedule_key=_optional_integer(body, "schedule_key"),
+                schedule_key=schedule_key,
             )
             return _request(result), 202
         raise StateValidationError("unknown control route")
@@ -558,6 +567,17 @@ def _action_for_route(
         and route[6] == "ready"
     ):
         return "admit_draft"
+    if method == "PATCH" and len(route) == 2 and route[0] == "schedules":
+        _positive(route[1])
+        return "schedule_update"
+    if (
+        method == "POST"
+        and len(route) == 3
+        and route[0] == "schedules"
+        and route[2] == "disable"
+    ):
+        _positive(route[1])
+        return "schedule_disable"
     if method != "POST":
         return None
     fixed = {
@@ -566,6 +586,7 @@ def _action_for_route(
         ("run-now",): "run_now",
         ("enqueue",): "enqueue",
         ("cancel-pending",): "cancel",
+        ("delete-pending",): "delete",
         ("retry",): "retry",
         ("reconcile",): "reconcile",
     }
@@ -573,8 +594,12 @@ def _action_for_route(
         return fixed[route]
     if route == ("schedules",):
         return "schedule_create"
-    if route == ("schedules", "disable"):
-        return "schedule_disable"
+    return None
+
+
+def _route_schedule_key(route: tuple[str, ...]) -> int | None:
+    if len(route) >= 2 and route[0] == "schedules" and route[1] != "disable":
+        return _positive(route[1])
     return None
 
 
@@ -733,6 +758,21 @@ def _page_limit(query: Mapping[str, list[str]], maximum: int) -> int:
     value = maximum if raw is None else int(raw)
     if not 1 <= value <= maximum:
         raise StateValidationError("page limit is invalid")
+    return value
+
+
+def _query_cursor(query: Mapping[str, list[str]]) -> int:
+    raw = _one(query, "cursor")
+    value = 0 if raw is None else int(raw)
+    if value < 0:
+        raise StateValidationError("page cursor is invalid")
+    return value
+
+
+def _required_profile_query(query: Mapping[str, list[str]]) -> str:
+    value = _one(query, "profile_id")
+    if value is None:
+        raise StateValidationError("explicit profile query is required")
     return value
 
 

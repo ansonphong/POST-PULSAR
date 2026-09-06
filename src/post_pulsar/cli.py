@@ -92,6 +92,7 @@ _COMMANDS: Final = frozenset(
         "requests",
         "run-now",
         "cancel-pending",
+        "delete-pending",
         "pause",
         "resume",
         "shutdown",
@@ -150,18 +151,16 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--profile", required=True)
     status.add_argument("--bundle-key", type=_positive_integer)
 
-    retry = commands.add_parser("retry", help="enable one blocked failed delivery")
-    _add_delivery_target(retry)
-    retry.add_argument("--confirm", required=True, choices=("RETRY",))
+    retry = commands.add_parser("retry", help="enqueue one exact approved retry")
+    _add_confirmed_delivery_target(retry)
 
     reconcile = commands.add_parser(
         "reconcile", help="resolve one ambiguous delivery from operator evidence"
     )
-    _add_delivery_target(reconcile)
+    _add_confirmed_delivery_target(reconcile)
     resolution = reconcile.add_mutually_exclusive_group(required=True)
     resolution.add_argument("--published", metavar="REMOTE_ID")
     resolution.add_argument("--not-published", action="store_true")
-    reconcile.add_argument("--confirm", required=True, choices=("RECONCILE",))
 
     profiles = commands.add_parser("profiles", help="list configured profile IDs")
     profile_commands = profiles.add_subparsers(dest="profiles_command", required=True)
@@ -214,14 +213,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_now.add_argument("--fingerprint", required=True, type=_sha256)
     run_now.add_argument("--intent-id", required=True, type=_intent_id)
 
-    cancel_pending = commands.add_parser(
-        "cancel-pending", help="enqueue cancellation of one exact pending bundle"
-    )
-    _add_write_identity(cancel_pending)
-    cancel_pending.add_argument("--bundle-key", required=True, type=_positive_integer)
-    cancel_pending.add_argument("--bundle-id", required=True, type=_bundle_id)
-    cancel_pending.add_argument("--fingerprint", required=True, type=_sha256)
-    cancel_pending.add_argument("--intent-id", required=True, type=_intent_id)
+    for command_name, action_label in (
+        ("cancel-pending", "cancellation"),
+        ("delete-pending", "deletion"),
+    ):
+        terminal = commands.add_parser(
+            command_name,
+            help=f"enqueue {action_label} of one exact pristine pending bundle",
+        )
+        _add_write_identity(terminal)
+        terminal.add_argument("--bundle-key", required=True, type=_positive_integer)
+        terminal.add_argument("--bundle-id", required=True, type=_bundle_id)
+        terminal.add_argument("--fingerprint", required=True, type=_sha256)
+        terminal.add_argument("--intent-id", required=True, type=_intent_id)
 
     pause = commands.add_parser("pause", help="durably pause new publication")
     _add_write_identity(pause)
@@ -432,24 +436,13 @@ def _dispatch(
         )
         return _run_result(outcome), _run_exit_code(outcome)
     if command == "retry":
-        delivery = _retry(
-            settings,
-            arguments.profile,
-            arguments.bundle_key,
-            arguments.platform,
-            environ=environ,
-            identity_verifier=identity_verifier,
-        )
-        return {"delivery": _delivery_document(delivery)}, EXIT_OK
+        return _delivery_mutation(
+            settings, arguments, transport=control_transport
+        ), EXIT_OK
     if command == "reconcile":
-        delivery = _reconcile(
-            settings,
-            arguments.profile,
-            arguments.bundle_key,
-            arguments.platform,
-            published_remote_id=arguments.published,
-        )
-        return {"delivery": _delivery_document(delivery)}, EXIT_OK
+        return _delivery_mutation(
+            settings, arguments, transport=control_transport
+        ), EXIT_OK
     if command == "profiles":
         remote = _control_call(
             settings,
@@ -465,7 +458,8 @@ def _dispatch(
             remote = _control_call(
                 settings,
                 "GET",
-                f"/control/v1/schedules?limit={arguments.limit}",
+                f"/control/v1/schedules?profile_id={arguments.profile}"
+                f"&cursor={arguments.cursor}&limit={arguments.limit}",
                 transport=control_transport,
             )
             if remote is not None:
@@ -490,7 +484,8 @@ def _dispatch(
             remote = _control_call(
                 settings,
                 "GET",
-                f"/control/v1/requests?limit={arguments.limit}",
+                f"/control/v1/requests?profile_id={arguments.profile}"
+                f"&cursor={arguments.cursor}&limit={arguments.limit}",
                 transport=control_transport,
             )
             if remote is not None:
@@ -517,7 +512,7 @@ def _dispatch(
         return _pause_resume(settings, arguments, transport=control_transport), EXIT_OK
     if command == "run-now":
         return _run_now(settings, arguments, transport=control_transport), EXIT_OK
-    if command == "cancel-pending":
+    if command in {"cancel-pending", "delete-pending"}:
         return _cancel_pending(
             settings, arguments, transport=control_transport
         ), EXIT_OK
@@ -528,6 +523,7 @@ def _dispatch(
             settings,
             environ=environ,
             adapter_factory=adapter_factory,
+            identity_verifier=identity_verifier,
             clock=clock,
             daemon_factory=daemon_factory,
         ), EXIT_OK
@@ -940,6 +936,7 @@ def _cancel_pending(
     *,
     transport: ControlTransport | None,
 ) -> Mapping[str, object]:
+    action = "cancel" if arguments.command == "cancel-pending" else "delete"
     profile_id = cast(str, arguments.profile)
     settings.profile(profile_id)
     database = settings.app.state_directory / "post_pulsar.sqlite3"
@@ -951,14 +948,27 @@ def _cancel_pending(
             or bundle.fingerprint != arguments.fingerprint
         ):
             raise ConflictError("pending bundle exact identity has changed")
-        if bundle.status not in {"active", "blocked"}:
-            raise TransitionError("bundle is not pending")
+        deliveries = repository.list_bundle_deliveries(arguments.bundle_key)
+        if bundle.status != "active" or any(
+            delivery.status != "pending"
+            or delivery.phase is not None
+            or delivery.attempt_count != 0
+            for delivery in deliveries
+        ):
+            raise TransitionError("bundle is not pristine pending work")
+        if any(
+            repository.list_delivery_artifacts(
+                arguments.bundle_key, delivery.platform
+            )
+            for delivery in deliveries
+        ):
+            raise TransitionError("bundle has durable delivery artifacts")
     request_arguments = {
         "bundle_id": arguments.bundle_id,
         "fingerprint": arguments.fingerprint,
     }
     body = {
-        "action": "cancel",
+        "action": action,
         "profile_id": profile_id,
         "bundle_key": arguments.bundle_key,
         "resource_revision": arguments.expected_revision,
@@ -980,7 +990,69 @@ def _cancel_pending(
     request = _local_durable_request(
         settings,
         profile_id=profile_id,
-        action="cancel",
+        action=action,
+        request_arguments=request_arguments,
+        idempotency_key=arguments.idempotency_key,
+        expected_revision=arguments.expected_revision,
+        bundle_key=arguments.bundle_key,
+        intent_id=arguments.intent_id,
+    )
+    return {"request": _request_document(request)}
+
+
+def _delivery_mutation(
+    settings: LocalSettings,
+    arguments: argparse.Namespace,
+    *,
+    transport: ControlTransport | None,
+) -> Mapping[str, object]:
+    action = cast(str, arguments.command)
+    profile_id = cast(str, arguments.profile)
+    settings.profile(profile_id)
+    database = settings.app.state_directory / "post_pulsar.sqlite3"
+    with StateRepository.open_read_only(database) as repository:
+        bundle = repository.get_bundle(arguments.bundle_key)
+        if (
+            bundle.profile_id != profile_id
+            or bundle.bundle_id != arguments.bundle_id
+            or bundle.fingerprint != arguments.fingerprint
+        ):
+            raise ConflictError(f"{action} exact bundle identity has changed")
+        delivery = repository.get_delivery(arguments.bundle_key, arguments.platform)
+        expected_status = "failed" if action == "retry" else "ambiguous"
+        if bundle.status != "blocked" or delivery.status != expected_status:
+            raise TransitionError(f"{action} target is not an exact blocked delivery")
+    request_arguments: dict[str, object] = {
+        "bundle_id": arguments.bundle_id,
+        "fingerprint": arguments.fingerprint,
+        "platform": arguments.platform,
+    }
+    if action == "reconcile":
+        request_arguments["published_remote_id"] = arguments.published
+    body = {
+        "action": action,
+        "profile_id": profile_id,
+        "bundle_key": arguments.bundle_key,
+        "resource_revision": arguments.expected_revision,
+        "fingerprint": arguments.fingerprint,
+        "arguments": request_arguments,
+    }
+    remote = _control_call(
+        settings,
+        "POST",
+        f"/control/v1/confirmations/{arguments.intent_id}/consume",
+        body=body,
+        headers=_control_headers(
+            arguments.idempotency_key, arguments.expected_revision
+        ),
+        transport=transport,
+    )
+    if remote is not None:
+        return {"request": remote}
+    request = _local_durable_request(
+        settings,
+        profile_id=profile_id,
+        action=action,
         request_arguments=request_arguments,
         idempotency_key=arguments.idempotency_key,
         expected_revision=arguments.expected_revision,
@@ -1086,6 +1158,7 @@ def _daemon_foreground(
     *,
     environ: Mapping[str, str] | None,
     adapter_factory: AdapterFactory | None,
+    identity_verifier: IdentityVerifier,
     clock: Callable[[], datetime],
     daemon_factory: DaemonFactory | None,
 ) -> Mapping[str, object]:
@@ -1112,6 +1185,7 @@ def _daemon_foreground(
             daemon=holder["daemon"],
             environ=environ,
             adapter_factory=adapter_factory,
+            identity_verifier=identity_verifier,
             clock=clock,
         )
 
@@ -1137,6 +1211,7 @@ def _execute_daemon_request(
     daemon: ForegroundDaemon,
     environ: Mapping[str, str] | None,
     adapter_factory: AdapterFactory | None,
+    identity_verifier: IdentityVerifier,
     clock: Callable[[], datetime],
 ) -> Mapping[str, object]:
     database = settings.app.state_directory / "post_pulsar.sqlite3"
@@ -1146,7 +1221,7 @@ def _execute_daemon_request(
             raise StateError("daemon instance lease is unavailable")
         outcome = OneRunApplication(
             settings.config_path,
-            locks=LockManager(settings.app.state_directory),
+            locks=daemon._locks,
             instance_lease=lease,
             environ=environ,
             clock=clock,
@@ -1162,7 +1237,13 @@ def _execute_daemon_request(
             )
         )
         return _run_result(outcome)
-    with StateRepository.open_existing(database, clock=clock) as repository:
+    lease = daemon._lease
+    if lease is None:
+        raise StateError("daemon instance lease is unavailable")
+    with (
+        daemon._locks.acquire_profiles(lease, (request.profile_id,)),
+        StateRepository.open_existing(database, clock=clock) as repository,
+    ):
         if request.action in {"pause", "resume"}:
             pause_record = repository.set_paused(
                 request.action == "pause", expected_revision=request.expected_revision
@@ -1189,12 +1270,10 @@ def _execute_daemon_request(
         if request.action == "schedule_update":
             if request.schedule_key is None:
                 raise StateError("schedule update lost its exact resource")
-            current = repository.get_schedule(request.schedule_key)
-            if current.profile_id != request.profile_id:
-                raise ConflictError("schedule belongs to another profile")
-            schedule_record = repository.create_schedule(
+            schedule_record = repository.update_schedule(
+                request.schedule_key,
                 profile_id=request.profile_id,
-                schedule_id=current.schedule_id,
+                schedule_id=cast(str, request.arguments["schedule_id"]),
                 bucket=cast(
                     "Literal['QUEUE', 'RANDOM', 'REELS']",
                     request.arguments["bucket"],
@@ -1218,7 +1297,90 @@ def _execute_daemon_request(
                 expected_revision=request.expected_revision,
             )
             return _schedule_document(schedule_record)
+        if request.action in {"cancel", "delete"}:
+            if request.bundle_key is None:
+                raise StateError("pending terminal request lost its exact resource")
+            bundle = repository.get_bundle(request.bundle_key)
+            if bundle.bundle_id != request.arguments.get("bundle_id"):
+                raise ConflictError("pending bundle identity changed before execution")
+            tombstone = repository.terminalize_pending_bundle(
+                profile_id=request.profile_id,
+                bundle_key=request.bundle_key,
+                expected_revision=request.expected_revision,
+                fingerprint=cast(str, request.arguments["fingerprint"]),
+                action=request.action,
+            )
+            return _bundle_document(repository, tombstone)
+        if request.action == "retry":
+            if request.bundle_key is None:
+                raise StateError("retry request lost its exact resource")
+            bundle = _assert_request_bundle_identity(repository, request)
+            platform = _request_platform(request)
+            profile = settings.profile(request.profile_id)
+            snapshot = _target_snapshot(repository, request.bundle_key, platform)
+            current = _configured_target_snapshot(profile, platform)
+            if current != snapshot:
+                raise ConflictError("current target configuration differs from snapshot")
+            credentials = validate_publishing_credentials(
+                settings, request.profile_id, (platform,), environ
+            )
+            identity_verifier(
+                PublicationSnapshot(
+                    request.profile_id,
+                    bundle.bundle_key,
+                    bundle.bundle_id,
+                    bundle.fingerprint,
+                    bundle.source_bucket,
+                    snapshot,
+                ),
+                credentials.for_target(platform),
+                settings.app.state_directory / "staging" / "private",
+            )
+            delivery = repository.operator_retry(
+                request.bundle_key,
+                platform,
+                expected_bundle_revision=request.expected_revision,
+                validated_snapshot=snapshot,
+            )
+            return _delivery_document(delivery)
+        if request.action == "reconcile":
+            if request.bundle_key is None:
+                raise StateError("reconcile request lost its exact resource")
+            _assert_request_bundle_identity(repository, request)
+            platform = _request_platform(request)
+            remote_id = request.arguments.get("published_remote_id")
+            if remote_id is not None and not isinstance(remote_id, str):
+                raise StateError("reconcile request has invalid operator evidence")
+            delivery = repository.operator_reconcile(
+                request.bundle_key,
+                platform,
+                published_remote_id=remote_id,
+                expected_bundle_revision=request.expected_revision,
+            )
+            return _delivery_document(delivery)
     raise StateError("daemon request action is unsupported")
+
+
+def _assert_request_bundle_identity(
+    repository: StateRepository, request: RunRequestRecord
+) -> BundleRecord:
+    if request.bundle_key is None:
+        raise StateError("durable request lost its exact bundle resource")
+    bundle = repository.get_bundle(request.bundle_key)
+    if (
+        bundle.profile_id != request.profile_id
+        or bundle.bundle_id != request.arguments.get("bundle_id")
+        or bundle.fingerprint != request.arguments.get("fingerprint")
+    ):
+        raise ConflictError("durable request bundle identity changed")
+    return bundle
+
+
+def _request_platform(request: RunRequestRecord) -> Platform:
+    value = request.arguments.get("platform")
+    if value not in {"x", "instagram"}:
+        raise StateError("durable request platform is invalid")
+    return cast(Platform, value)
 
 
 def _migrate(
@@ -1446,82 +1608,6 @@ def _status(
             bundles = (bundle,)
         documents = tuple(_bundle_document(repository, item) for item in bundles)
     return {"profile_id": profile_id, "bundles": documents}
-
-
-def _retry(
-    settings: LocalSettings,
-    profile_id: str,
-    bundle_key: int,
-    platform: Platform,
-    *,
-    environ: Mapping[str, str] | None,
-    identity_verifier: IdentityVerifier,
-) -> DeliveryRecord:
-    profile = settings.profile(profile_id)
-    locks = LockManager(settings.app.state_directory)
-    database = settings.app.state_directory / "post_pulsar.sqlite3"
-    with (
-        locks.acquire_instance() as instance,
-        locks.acquire_profiles(instance, (profile_id,)),
-        StateRepository.open_existing(database) as repository,
-    ):
-        bundle = repository.get_bundle(bundle_key)
-        if bundle.profile_id != profile_id:
-            raise StateError("bundle does not belong to the requested profile")
-        snapshot = _target_snapshot(repository, bundle_key, platform)
-        current = _configured_target_snapshot(profile, platform)
-        if current != snapshot:
-            raise StateError("current target configuration differs from snapshot")
-        credentials = validate_publishing_credentials(
-            settings, profile_id, (platform,), environ
-        )
-        publication = PublicationSnapshot(
-            profile_id,
-            bundle.bundle_key,
-            bundle.bundle_id,
-            bundle.fingerprint,
-            bundle.source_bucket,
-            snapshot,
-        )
-        identity_verifier(
-            publication,
-            credentials.for_target(platform),
-            settings.app.state_directory / "staging" / "private",
-        )
-        return repository.operator_retry(
-            bundle_key,
-            platform,
-            expected_bundle_revision=bundle.revision,
-            validated_snapshot=snapshot,
-        )
-
-
-def _reconcile(
-    settings: LocalSettings,
-    profile_id: str,
-    bundle_key: int,
-    platform: Platform,
-    *,
-    published_remote_id: str | None,
-) -> DeliveryRecord:
-    settings.profile(profile_id)
-    locks = LockManager(settings.app.state_directory)
-    database = settings.app.state_directory / "post_pulsar.sqlite3"
-    with (
-        locks.acquire_instance() as instance,
-        locks.acquire_profiles(instance, (profile_id,)),
-        StateRepository.open_existing(database) as repository,
-    ):
-        bundle = repository.get_bundle(bundle_key)
-        if bundle.profile_id != profile_id:
-            raise StateError("bundle does not belong to the requested profile")
-        _target_snapshot(repository, bundle_key, platform)
-        return repository.operator_reconcile(
-            bundle_key,
-            platform,
-            published_remote_id=published_remote_id,
-            expected_bundle_revision=bundle.revision,
-        )
 
 
 def _verify_identity(
@@ -1756,10 +1842,13 @@ def _normalize_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(global_arguments + command_arguments)
 
 
-def _add_delivery_target(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--profile", required=True)
+def _add_confirmed_delivery_target(parser: argparse.ArgumentParser) -> None:
+    _add_write_identity(parser)
     parser.add_argument("--bundle-key", required=True, type=_positive_integer)
+    parser.add_argument("--bundle-id", required=True, type=_bundle_id)
+    parser.add_argument("--fingerprint", required=True, type=_sha256)
     parser.add_argument("--platform", required=True, choices=("x", "instagram"))
+    parser.add_argument("--intent-id", required=True, type=_intent_id)
 
 
 def _add_write_identity(parser: argparse.ArgumentParser) -> None:
