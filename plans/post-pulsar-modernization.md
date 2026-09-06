@@ -1,7 +1,7 @@
 ---
-stage: 2
+stage: 3
 repo: POST-PULSAR
-stage_state: done
+stage_state: active
 ---
 
 # POST PULSAR modernization
@@ -14,7 +14,8 @@ Instagram, suitable for manual use or an external OS scheduler.
 
 - Stage 1 — Brainstorm: complete; direction converged.
 - Stage 2 — Design: complete; quality gate B+ (8.55/10).
-- Stage 3 — Plan: pending.
+- Stage 3 — Plan: complete; 15-task execution graph validated with zero
+  mechanical warnings and no execution blockers.
 - Stage 4 — Harden: pending.
 - Stage 5 — Execute: pending.
 - Stage 6 — Review: pending.
