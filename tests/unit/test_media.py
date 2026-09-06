@@ -721,6 +721,51 @@ def test_public_video_copy_uses_held_verified_private_stream(
     assert tuple(public_root.iterdir()) == ()
 
 
+def test_public_video_context_entry_failures_do_not_leak_file_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    descriptor_root = Path("/proc/self/fd")
+    if not descriptor_root.is_dir():
+        pytest.skip("file descriptor accounting requires procfs")
+    body = b"\x00\x00\x00\x18ftypmp42" + b"0" * 12
+    bundle = _bundle(tmp_path, {"post.mp4": body}, bucket="REELS")
+
+    class EntryFailure:
+        def __enter__(self) -> None:
+            raise MediaSafetyError("forced verified-open entry failure")
+
+        def __exit__(
+            self,
+            exception_type: object,
+            exception: object,
+            traceback: object,
+        ) -> None:
+            return None
+
+    def fail_verified_open(*_args: object, **_kwargs: object) -> EntryFailure:
+        return EntryFailure()
+
+    monkeypatch.setattr(
+        media_module, "open_verified_private_media", fail_verified_open
+    )
+    baseline = len(tuple(descriptor_root.iterdir()))
+
+    for _attempt in range(32):
+        with pytest.raises(MediaSafetyError, match="forced verified-open"):
+            prepare_bundle_media(
+                bundle,
+                profile_id="ansonphong",
+                targets=("instagram",),
+                private_staging_directory=tmp_path / "private",
+                instagram=_instagram(tmp_path),
+                process_runner=_runner_for(_video_probe()),
+                ffprobe_timeout_seconds=7.0,
+            )
+
+    assert len(tuple(descriptor_root.iterdir())) == baseline
+    assert tuple((tmp_path / "public").iterdir()) == ()
+
+
 @pytest.mark.parametrize(
     ("failure", "match"),
     [

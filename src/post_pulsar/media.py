@@ -934,13 +934,19 @@ def _stage_public_video(
             dir_fd=directory_fd,
         )
         try:
-            with open_verified_private_media(
-                private,
-                private_root,
-                expected_profile_id=profile_id,
-                expected_bucket=bucket,
-            ) as verified:
-                with os.fdopen(descriptor, "wb") as destination:
+            destination = os.fdopen(descriptor, "wb")
+        except Exception:
+            os.close(descriptor)
+            _safe_unlink_at(directory_fd, temporary)
+            raise
+        try:
+            with destination:
+                with open_verified_private_media(
+                    private,
+                    private_root,
+                    expected_profile_id=profile_id,
+                    expected_bucket=bucket,
+                ) as verified:
                     size = _copy_stream(verified.stream, destination, digest)
                     destination.flush()
                     os.fsync(destination.fileno())
