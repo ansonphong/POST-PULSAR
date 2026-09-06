@@ -340,8 +340,8 @@ def test_success_archives_exact_bundle_and_releases_owned_resources(
     with pytest.raises(LockContentionError):
         competing.acquire_instance()
     instance.release()
-    with competing.acquire_instance():
-        pass
+    with competing.acquire_instance() as competing_instance:
+        assert competing_instance.active
 
 
 def test_post_create_pre_result_crash_recovers_ambiguous_without_repeat(
