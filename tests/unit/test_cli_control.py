@@ -126,6 +126,71 @@ class _TTY(StringIO):
         return True
 
 
+def test_daemon_reconcile_drives_exact_bundle_after_unlock(tmp_path: Path, monkeypatch) -> None:
+    from post_pulsar import cli
+    from post_pulsar.config import load_local_settings
+    from post_pulsar.daemon import ForegroundDaemon
+    from post_pulsar.state import BundleFileSnapshot, RunRequestRecord
+
+    config, database = _setup(tmp_path)
+    settings = load_local_settings(config)
+    with StateRepository.open_existing(database) as repository:
+        key = repository.add_bundle(profile_id="operator", bundle_id="post", fingerprint="b" * 64,
+            source_bucket="QUEUE", files=(BundleFileSnapshot("post.jpg", "image", None, "image", "image/jpeg", 1, "a" * 64),),
+            targets=(cli._configured_target_snapshot(settings.profile("operator"), "x"),))
+        delivery = repository.claim_delivery(key, "x", "unknown")
+        repository.advance_delivery_phase(key, "x", "final_dispatch_started", claim_token="unknown", attempt_count=delivery.attempt_count)
+        repository.mark_delivery_ambiguous(key, "x", error_code="unknown", error_message="Unknown.", claim_token="unknown", attempt_count=delivery.attempt_count)
+        revision = repository.get_bundle(key).revision
+    request = RunRequestRecord(1, "operator", "reconcile", {"bundle_id": "post", "fingerprint": "b" * 64,
+        "platform": "x", "published_remote_id": "remote"}, "reconcile", revision, key, None, None, "claimed", None, 1)
+    daemon = ForegroundDaemon(settings.app.state_directory, settings.app.endpoint_record_file, "127.0.0.1", 0)
+    calls = []
+
+    class Application:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def run_once(self, exact):
+            with daemon._locks.acquire_profiles(daemon._lease, ("operator",)):
+                calls.append(exact)
+            return cli.RunOutcome("archived", bundle_key=key, bundle_id="post", fingerprint="b" * 64)
+
+    monkeypatch.setattr(cli, "OneRunApplication", Application)
+    with daemon._locks.acquire_instance() as lease:
+        daemon._lease = lease
+        cli._execute_daemon_request(settings, request, daemon=daemon, environ={}, adapter_factory=None,
+            identity_verifier=lambda *a: None, clock=lambda: datetime.now(UTC))
+    assert len(calls) == 1
+    assert calls[0].expected_bundle_key == key and calls[0].expected_fingerprint == "b" * 64
+
+
+def test_draft_edit_failure_keeps_original_bytes(tmp_path: Path, monkeypatch) -> None:
+    from PIL import Image
+    from post_pulsar import cli
+    from post_pulsar.config import load_local_settings
+    from post_pulsar.content import scan_inbox
+    from post_pulsar.state import RunRequestRecord
+
+    config, _ = _setup(tmp_path)
+    drafts = tmp_path / "accounts/operator/DRAFTS"
+    drafts.mkdir()
+    Image.new("RGB", (8, 8)).save(drafts / "post.jpg")
+    caption = drafts / "post.txt"
+    caption.write_text("original")
+    fingerprint = scan_inbox(drafts).bundles[0].fingerprint
+    request = RunRequestRecord(1, "operator", "edit_caption", {"bundle_id": "post", "bucket": "DRAFTS",
+        "fingerprint": fingerprint, "text": "replacement"}, "edit", 1, None, None, None, "claimed", None, 1)
+
+    def fail_replace(*args):
+        raise OSError("injected atomic install failure")
+
+    monkeypatch.setattr(cli.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="atomic install"):
+        cli._edit_draft_text(load_local_settings(config), request)
+    assert caption.read_text() == "original"
+
+
 def test_agent_capability_initialize_rotate_revoke_is_redacted_and_bootstraps(
     tmp_path: Path,
 ) -> None:

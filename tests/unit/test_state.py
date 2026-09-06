@@ -36,6 +36,49 @@ class FakeClock:
         self.value += timedelta(**kwargs)
 
 
+@pytest.mark.parametrize("published", [True, False])
+def test_operator_decision_recovers_linked_ambiguous_occurrence(tmp_path: Path, published: bool) -> None:
+    clock = FakeClock()
+    repository = _repository(tmp_path, clock)
+    key = _bundle(repository)
+    schedule = repository.create_schedule(
+        profile_id="ansonphong", schedule_id="recovery", bucket="QUEUE",
+        timezone="UTC", weekdays=(5,), local_time="12:00",
+        misfire_grace_seconds=60, enabled=True,
+    )
+    run = repository.claim_schedule_occurrence(
+        schedule.schedule_key, bundle_key=key, local_date="2026-09-05",
+        scheduled_at=clock(), utc_offset_minutes=0, schedule_hash=schedule.config_hash,
+    )
+    claim = _claim(repository, key, "x", "unknown")
+    repository.advance_delivery_phase(key, "x", "final_dispatch_started", **claim)
+    repository.mark_delivery_ambiguous(key, "x", error_code="unknown", error_message="Unknown.", **claim)
+    repository.synchronize_schedule_run(run.run_id)
+    assert repository.get_schedule_run(run.run_id).state == "ambiguous"
+    repository.operator_reconcile(key, "x", published_remote_id="remote" if published else None,
+                                  expected_bundle_revision=repository.get_bundle(key).revision)
+    assert repository.get_schedule_run(run.run_id).state == ("dispatching" if published else "failed")
+    if not published:
+        assert repository.list_recoverable_schedule_runs(clock()) == ()
+        repository.operator_retry(key, "x", expected_bundle_revision=repository.get_bundle(key).revision,
+                                  validated_snapshot=_target())
+    assert [item.run_id for item in repository.list_recoverable_schedule_runs(clock())] == [run.run_id]
+
+
+def test_interrupted_draft_edit_is_never_requeued(tmp_path: Path) -> None:
+    repository = _repository(tmp_path, FakeClock())
+    request = repository.create_run_request(
+        profile_id="ansonphong", action="edit_caption", arguments={"bucket": "DRAFTS",
+        "bundle_id": "post", "fingerprint": "b" * 64, "text": "new text"},
+        idempotency_key="edit", expected_revision=1,
+    )
+    repository.claim_next_run_request("old")
+    repository.recover_claimed_run_requests("new")
+    recovered = repository.get_run_request(request.request_id)
+    assert recovered.status == "failed"
+    assert recovered.result == {"code": "daemon_restart_unknown", "outcome": "blocked"}
+
+
 def _profile_target(
     remote_id: str = "10001",
     env_var: str = "POST_PULSAR_X_ANSONPHONG_USER_ACCESS_TOKEN",

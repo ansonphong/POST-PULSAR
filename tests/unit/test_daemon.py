@@ -146,3 +146,49 @@ def test_daemon_stops_worker_admission_before_http_shutdown(tmp_path: Path) -> N
     assert order[:2] == ["recover", "schedule"]
     assert daemon._stop.is_set()
     assert order.index("http") >= 2
+
+
+def test_callback_failure_is_durable_and_worker_continues(tmp_path: Path) -> None:
+    from post_pulsar.state import StateRepository
+
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    with StateRepository(database) as repository:
+        assert repository.schema_version == 1
+    continued = threading.Event()
+    calls = 0
+
+    def schedule() -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise ValueError("secret-value must never reach durable diagnostics")
+        continued.set()
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
+        recovery=lambda: (_ for _ in ()).throw(ValueError("secret-value")),
+        schedule_admission=schedule, poll_seconds=0.01,
+        server_factory=lambda *args: _Server(*args),
+    )
+    try:
+        daemon.start()
+        assert continued.wait(1)
+        assert daemon._worker_thread.is_alive()
+        with StateRepository.open_existing(database) as repository:
+            events = repository.control_events(limit=100)
+            assert "callback_failed" in json.dumps(events)
+            assert "secret-value" not in json.dumps(events)
+    finally:
+        daemon.stop()
+
+
+def test_each_schedule_boundary_respects_shutdown(tmp_path: Path) -> None:
+    daemon = ForegroundDaemon(
+        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0
+    )
+    dispatched: list[int] = []
+    assert daemon.dispatch_if_running(lambda: dispatched.append(1))
+    with daemon._claim_gate:
+        daemon._stop.set()
+    assert not daemon.dispatch_if_running(lambda: dispatched.append(2))
+    assert dispatched == [1]

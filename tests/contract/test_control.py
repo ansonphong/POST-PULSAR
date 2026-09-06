@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
+import pytest
 from openapi_spec_validator import validate
 
 from post_pulsar.control import (
@@ -16,6 +17,23 @@ from post_pulsar.control import (
     rotate_agent_capability,
 )
 from post_pulsar.state import ProfileTargetSnapshot, StateRepository
+
+
+@pytest.mark.parametrize("path,arguments", [
+    ("pause", {"unexpected": True}),
+    ("schedules", {}),
+    ("schedules", {"schedule_id": "bad", "bucket": "QUEUE", "timezone": "UTC",
+                   "weekdays": [True], "local_time": "12:00", "misfire_grace_seconds": 60, "enabled": False}),
+])
+def test_malformed_action_rejected_before_durable_admission(tmp_path: Path, path: str, arguments: dict) -> None:
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text().strip()
+    response = _call(app, "POST", "/control/v1/" + path, token=token,
+                     body={"profile_id": "profile", "arguments": arguments},
+                     headers={"Idempotency-Key": "malformed", "If-Match": "1"})
+    assert response.status == 400
+    with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+        assert repository.claim_next_run_request("worker") is None
 
 
 def _application(tmp_path: Path, *, allow_publish: bool = False) -> ControlApplication:

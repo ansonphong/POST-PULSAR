@@ -2,6 +2,24 @@
 
 from __future__ import annotations
 
+
+def test_darwin_atomic_exclusive_rename(monkeypatch, tmp_path):
+    import post_pulsar.admission as admission
+    calls = []
+
+    class Rename:
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    class Libc:
+        renamex_np = Rename()
+
+    monkeypatch.setattr(admission.sys, "platform", "darwin")
+    monkeypatch.setattr(admission.ctypes, "CDLL", lambda *a, **k: Libc())
+    admission._rename_no_replace(tmp_path / "source", tmp_path / "target")
+    assert calls == [(bytes(tmp_path / "source"), bytes(tmp_path / "target"), 4)]
+
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
