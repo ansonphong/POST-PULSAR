@@ -67,3 +67,6 @@
 {"event":"commit","sha":"2e64c01","message":"fix(app): close one-run recovery gaps","time":"2026-09-06T07:53:57Z"}
 {"event":"commit","sha":"d693a19","message":"chore(plan): mark T4.1 DONE","time":"2026-09-06T07:54:13Z"}
 {"event":"commit","sha":"7588bc5","message":"feat(cli): expose safe local control commands","time":"2026-09-06T08:08:06Z"}
+{"event":"commit","sha":"3fcc425","message":"chore(plan): mark T4.2 DONE","time":"2026-09-06T08:08:16Z"}
+{"event":"commit","sha":"ac3c831","message":"style: format source and tests","time":"2026-09-06T08:11:34Z"}
+{"event":"commit","sha":"ed3c18d","message":"ci: lock dependencies and enforce security gates","time":"2026-09-06T08:16:55Z"}
