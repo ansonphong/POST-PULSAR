@@ -8,11 +8,12 @@ import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from filelock import FileLock
 
+import post_pulsar.archive as archive_module
 from post_pulsar.archive import (
     ArchiveFaultInjector,
     ArchiveManager,
@@ -20,6 +21,7 @@ from post_pulsar.archive import (
 )
 from post_pulsar.content import scan_account_root
 from post_pulsar.locking import (
+    LockLease,
     LockContentionError,
     LockManager,
     LockOrderError,
@@ -213,6 +215,31 @@ def test_ordered_leases_are_passed_already_held_and_released_lifo(
         instance.__enter__()
 
 
+def test_forged_and_mutated_leases_are_rejected(tmp_path: Path) -> None:
+    locks = LockManager(tmp_path / "state")
+    forged_instance = LockLease(locks, "instance", ("instance",), ())
+    forged_profiles = LockLease(locks, "profiles", ("operator",), ())
+
+    with pytest.raises(LockOrderError, match="already-held"):
+        locks.require_instance(forged_instance)
+    with pytest.raises(LockOrderError, match="already-held"):
+        locks.require_profile(forged_profiles, "operator")
+
+    with locks.acquire_instance() as instance:
+        with locks.acquire_profiles(instance, ["operator"]) as profiles:
+            object.__setattr__(profiles, "resources", ("operator", "other"))
+            with pytest.raises(LockOrderError, match="mutated"):
+                locks.require_profile(profiles, "operator")
+            object.__setattr__(profiles, "resources", ("operator",))
+            object.__setattr__(profiles, "active", False)
+            with pytest.raises(LockOrderError, match="mutated"):
+                profiles.release()
+            object.__setattr__(profiles, "active", True)
+
+    with pytest.raises(LockOrderError, match="already-held"):
+        locks.require_instance(instance)
+
+
 def test_lock_contention_fails_cleanly_before_archive_work(tmp_path: Path) -> None:
     repository, bundle_key, source = _make_repository(tmp_path)
     lock_path = tmp_path / "state" / "locks" / "instance.lock"
@@ -239,6 +266,7 @@ def test_lock_contention_fails_cleanly_before_archive_work(tmp_path: Path) -> No
         "after_member_checkpoint:post.jpg",
         "after_member_move:.ready",
         "after_member_checkpoint:.ready",
+        "after_directory_quarantine:post",
         "before_final_rename",
         "after_final_rename",
         "after_mark_archived",
@@ -294,7 +322,7 @@ def test_recovers_staged_only_container(tmp_path: Path) -> None:
     assert _final(tmp_path).exists()
 
 
-def test_crash_after_no_overwrite_reservation_converges_to_blocked(
+def test_crash_after_source_quarantine_recovers_without_data_loss(
     tmp_path: Path,
 ) -> None:
     repository, bundle_key, source = _make_repository(tmp_path)
@@ -310,11 +338,9 @@ def test_crash_after_no_overwrite_reservation_converges_to_blocked(
             tmp_path,
             fault=crash,
         )
-    with pytest.raises(ArchiveSafetyError):
-        _archive(repository, bundle_key, tmp_path)
-
-    assert repository.get_bundle(bundle_key).status == "blocked"
-    assert (source / "post.txt").exists()
+    assert _archive(repository, bundle_key, tmp_path).status == "archived"
+    assert repository.get_bundle(bundle_key).status == "archived"
+    assert (_final(tmp_path) / "post.txt").exists()
 
 
 @pytest.mark.parametrize("retain_source", [False, True])
@@ -357,6 +383,35 @@ def test_conflicting_destination_blocks_without_deleting_source(
 
     assert source.exists()
     assert final.exists()
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
+def test_raced_empty_final_destination_is_never_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, bundle_key, source = _make_repository(tmp_path)
+    real_install = archive_module._atomic_noreplace
+
+    def race_install(
+        source_parent: Any,
+        source_name: str,
+        destination_parent: Any,
+        destination_name: str,
+    ) -> None:
+        if destination_name == "post":
+            _final(tmp_path).mkdir()
+        real_install(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(archive_module, "_atomic_noreplace", race_install)
+
+    with pytest.raises(ArchiveSafetyError):
+        _archive(repository, bundle_key, tmp_path)
+
+    assert _final(tmp_path).is_dir()
+    assert tuple(_final(tmp_path).iterdir()) == ()
+    assert source.exists() or any(
+        path.name.endswith(".archiving") for path in _final(tmp_path).parent.iterdir()
+    )
     assert repository.get_bundle(bundle_key).status == "blocked"
 
 
@@ -447,6 +502,31 @@ def test_exdev_verification_failure_retains_source(
     assert repository.get_bundle(bundle_key).status == "blocked"
 
 
+def test_exdev_source_swap_after_copy_is_preserved_and_blocks(
+    tmp_path: Path,
+) -> None:
+    repository, bundle_key, source = _make_repository(tmp_path)
+
+    def cross_device(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def swap(boundary: str) -> None:
+        if boundary != "after_exdev_staged_verify:post.txt":
+            return
+        candidates = tuple(source.glob(".archive-source-*.quarantine"))
+        assert len(candidates) == 1
+        candidates[0].unlink()
+        candidates[0].write_bytes(b"unrelated replacement")
+
+    with pytest.raises(ArchiveSafetyError):
+        _archive(repository, bundle_key, tmp_path, fault=swap, replace=cross_device)
+
+    candidates = tuple(source.glob(".archive-source-*.quarantine"))
+    assert len(candidates) == 1
+    assert candidates[0].read_bytes() == b"unrelated replacement"
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
 def test_symlink_member_blocks_and_never_moves_target(tmp_path: Path) -> None:
     repository, bundle_key, source = _make_repository(tmp_path)
     outside = tmp_path / "outside.txt"
@@ -459,6 +539,37 @@ def test_symlink_member_blocks_and_never_moves_target(tmp_path: Path) -> None:
 
     assert outside.read_text(encoding="utf-8") == "outside"
     assert (source / "post.txt").is_symlink()
+    assert repository.get_bundle(bundle_key).status == "blocked"
+
+
+def test_source_member_swap_is_quarantined_and_never_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, bundle_key, source = _make_repository(tmp_path)
+    real_move = archive_module._atomic_noreplace
+    swapped = False
+
+    def swap_before_quarantine(
+        source_parent: Any,
+        source_name: str,
+        destination_parent: Any,
+        destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if source_name == "post.txt" and not swapped:
+            (source_parent.path / source_name).unlink()
+            (source_parent.path / source_name).write_bytes(b"unrelated replacement")
+            swapped = True
+        real_move(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(archive_module, "_atomic_noreplace", swap_before_quarantine)
+
+    with pytest.raises(ArchiveSafetyError):
+        _archive(repository, bundle_key, tmp_path)
+
+    quarantined = tuple(source.glob(".archive-source-*.quarantine"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"unrelated replacement"
     assert repository.get_bundle(bundle_key).status == "blocked"
 
 
@@ -476,6 +587,37 @@ def test_symlinked_posted_parent_is_rejected_before_external_mutation(
 
     assert tuple(outside.iterdir()) == ()
     assert source.exists()
+
+
+@pytest.mark.parametrize("swap_level", ["root", "bucket"])
+def test_directory_replacement_after_guard_snapshot_blocks_without_escape(
+    tmp_path: Path,
+    swap_level: str,
+) -> None:
+    repository, bundle_key, source = _make_repository(tmp_path)
+    account = source.parents[1]
+    bucket = source.parent
+    outside = tmp_path / f"outside-{swap_level}"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep", encoding="utf-8")
+
+    def swap(boundary: str) -> None:
+        if boundary != "after_archive_guards":
+            return
+        if swap_level == "root":
+            moved = tmp_path / "moved-account"
+            account.rename(moved)
+            account.symlink_to(outside, target_is_directory=True)
+        else:
+            moved = account / "moved-queue"
+            bucket.rename(moved)
+            bucket.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ArchiveSafetyError):
+        _archive(repository, bundle_key, tmp_path, fault=swap)
+
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert repository.get_bundle(bundle_key).status == "blocked"
 
 
 def test_conflicting_partial_staging_never_deletes_source(tmp_path: Path) -> None:
@@ -496,6 +638,47 @@ def test_conflicting_partial_staging_never_deletes_source(tmp_path: Path) -> Non
 
     assert (source / "post.txt").exists()
     assert (staging / "post.txt").exists()
+
+
+def test_redundant_source_swap_is_preserved_in_delete_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, bundle_key, source = _make_repository(tmp_path)
+    bundle = repository.get_bundle(bundle_key)
+    repository.begin_archiving(bundle_key, expected_revision=bundle.revision)
+    final = _final(tmp_path)
+    final.parent.mkdir(parents=True)
+    shutil.copytree(source, final)
+    real_move = archive_module._atomic_noreplace
+    swapped = False
+
+    def swap_before_delete(
+        source_parent: Any,
+        source_name: str,
+        destination_parent: Any,
+        destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if (
+            source_parent.path == source
+            and source_name == "post.txt"
+            and destination_name.startswith(".archive-delete-")
+            and not swapped
+        ):
+            (source_parent.path / source_name).unlink()
+            (source_parent.path / source_name).write_bytes(b"unrelated replacement")
+            swapped = True
+        real_move(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(archive_module, "_atomic_noreplace", swap_before_delete)
+
+    with pytest.raises(ArchiveSafetyError):
+        _archive(repository, bundle_key, tmp_path)
+
+    quarantined = tuple(source.glob(".archive-delete-*.quarantine"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"unrelated replacement"
+    assert repository.get_bundle(bundle_key).status == "blocked"
 
 
 def test_unexpected_member_blocks_without_using_prefix_or_glob_moves(

@@ -28,7 +28,7 @@ class LockOrderError(LockError):
     """A caller attempted to violate the global lease order."""
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class LockLease:
     """An already-acquired lease that can be passed into application services."""
 
@@ -62,6 +62,9 @@ class LockManager:
         self._profiles = root / "profiles"
         _secure_directory(self._profiles)
         self._held: list[LockLease] = []
+        self._issued: dict[
+            int, tuple[LockKind, tuple[str, ...], tuple[FileLock, ...]]
+        ] = {}
 
     def acquire_instance(self) -> LockLease:
         if self._held:
@@ -109,8 +112,41 @@ class LockManager:
             raise LockOrderError("profile lease does not own the requested profile")
 
     def _require(self, lease: LockLease, kind: LockKind) -> None:
-        if lease._manager is not self or not lease.active or lease.kind != kind:
+        if lease._manager is not self or not lease.active:
             raise LockOrderError("required already-held lease is invalid")
+        held_index = next(
+            (index for index, candidate in enumerate(self._held) if candidate is lease),
+            None,
+        )
+        issued = self._issued.get(id(lease))
+        if held_index is None or issued is None:
+            raise LockOrderError("required already-held lease is invalid")
+        issued_kind, issued_resources, issued_locks = issued
+        if (
+            lease.kind != kind
+            or lease.kind != issued_kind
+            or lease.resources != issued_resources
+            or len(lease._locks) != len(issued_locks)
+            or any(
+                current is not original
+                for current, original in zip(lease._locks, issued_locks, strict=True)
+            )
+        ):
+            raise LockOrderError("required already-held lease was mutated")
+        stack = tuple(candidate.kind for candidate in self._held)
+        if stack not in {
+            ("instance",),
+            ("instance", "maintenance"),
+            ("instance", "profiles"),
+            ("instance", "maintenance", "profiles"),
+        }:
+            raise LockOrderError("required already-held lease order is invalid")
+        if kind == "instance" and held_index != 0:
+            raise LockOrderError("required already-held lease order is invalid")
+        if kind == "maintenance" and held_index != 1:
+            raise LockOrderError("required already-held lease order is invalid")
+        if kind == "profiles" and held_index != len(self._held) - 1:
+            raise LockOrderError("required already-held lease order is invalid")
 
     def _acquire(
         self, kind: LockKind, resources: tuple[str, ...], paths: tuple[Path, ...]
@@ -140,17 +176,25 @@ class LockManager:
             raise
         lease = LockLease(self, kind, resources, tuple(acquired))
         self._held.append(lease)
+        self._issued[id(lease)] = (kind, resources, tuple(acquired))
         return lease
 
     def _release(self, lease: LockLease) -> None:
         if not lease.active:
+            if id(lease) in self._issued:
+                raise LockOrderError("required already-held lease was mutated")
             return
+        issued = self._issued.get(id(lease))
+        if issued is None:
+            raise LockOrderError("required already-held lease is invalid")
+        self._require(lease, issued[0])
         if not self._held or self._held[-1] is not lease:
             raise LockOrderError("lock leases must be released in reverse order")
         for lock in reversed(lease._locks):
             lock.release()
-        lease.active = False
+        object.__setattr__(lease, "active", False)
         self._held.pop()
+        self._issued.pop(id(lease), None)
 
 
 def _secure_directory(path: Path) -> None:
