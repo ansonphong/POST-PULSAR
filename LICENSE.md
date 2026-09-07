@@ -1,3 +1,11 @@
+# POST PULSAR license
+
+POST PULSAR is Copyright (C) 2024 Anson Phong.
+
+POST PULSAR is licensed under the GNU General Public License, version 3. The
+license terms and authorship are unchanged by the product-identity
+modernization. The complete GPL-3.0 text follows.
+
 # GNU GENERAL PUBLIC LICENSE
 
 Version 3, 29 June 2007
