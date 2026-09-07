@@ -103,3 +103,6 @@
 {"event":"commit","sha":"526aa43","message":"fix(ops): keep Windows verification dry","time":"2026-09-07T02:24:48Z"}
 {"event":"commit","sha":"142fbe1","message":"test(ops): export dry-run across WSL","time":"2026-09-07T02:25:36Z"}
 {"event":"commit","sha":"f3f370f","message":"test(ops): use WSL-to-Windows dry-run export","time":"2026-09-07T02:26:36Z"}
+{"event":"commit","sha":"30c044b","message":"chore(plan): mark T5.1 DONE","time":"2026-09-07T02:28:27Z"}
+{"event":"commit","sha":"81a8bec","message":"docs: rewrite operator and security guides","time":"2026-09-07T02:43:34Z"}
+{"event":"commit","sha":"7bbb596","message":"docs: preserve contract phrases across lines","time":"2026-09-07T02:44:17Z"}
