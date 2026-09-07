@@ -236,7 +236,7 @@ To do so, attach the following notices to the program. It is safest to attach th
 
 
 ```
-PHONG-BOT - For automatic random posting to social media.
+POST PULSAR - For automatic random posting to social media.
 Copyright (C) 2024 Anson Phong
 
 This program is free software: you can redistribute it and/or modify

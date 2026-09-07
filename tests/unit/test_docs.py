@@ -162,3 +162,10 @@ def test_license_keeps_gpl3_and_ansons_authorship() -> None:
     assert "GNU GENERAL PUBLIC LICENSE" in license_text
     assert "Version 3, 29 June 2007" in license_text
     assert "END OF TERMS AND CONDITIONS" in license_text
+
+
+def test_license_active_notice_uses_post_pulsar_identity() -> None:
+    license_text = _read("LICENSE.md")
+    active_notice = license_text.split("```", 2)[1]
+    assert "POST PULSAR - For automatic random posting to social media." in active_notice
+    assert "PHONG-BOT" not in active_notice
