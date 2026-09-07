@@ -53,5 +53,13 @@ jobs:
         run: uv run --frozen python -m build --no-isolation
         env:
           UV_OFFLINE: "true"
+      - name: Export the locked dependency graph for audit
+        run: |
+          mkdir -p .audit
+          uv export --frozen --all-groups --no-emit-project --format pylock.toml --output-file .audit/pylock.toml
+        env:
+          UV_OFFLINE: "true"
       - name: Audit the locked dependency graph
-        run: uv run --frozen pip-audit --locked .
+        run: uv run --frozen pip-audit --locked .audit
+        env:
+          UV_OFFLINE: "true"
