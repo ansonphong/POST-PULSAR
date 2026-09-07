@@ -2242,17 +2242,6 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
             idempotency_key="missing-bundle",
             expected_revision=1,
         )
-    assert (
-        repository.create_run_request(
-            profile_id="ansonphong",
-            action="pause",
-            arguments={},
-            idempotency_key="safe-pause",
-            expected_revision=1,
-        ).status
-        == "queued"
-    )
-
     intent = repository.create_confirmation_intent(
         action="run_now",
         arguments={
@@ -2322,6 +2311,16 @@ def test_run_request_matrix_and_intent_resource_drift_fail_closed(
         schedule_key=schedule.schedule_key,
     )
     assert schedule_request.schedule_key == schedule.schedule_key
+    assert (
+        repository.create_run_request(
+            profile_id="ansonphong",
+            action="pause",
+            arguments={},
+            idempotency_key="safe-pause",
+            expected_revision=1,
+        ).status
+        == "queued"
+    )
 
 
 @pytest.mark.parametrize("action", ["cancel", "delete"])

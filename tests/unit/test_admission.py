@@ -361,16 +361,27 @@ def test_rolled_back_admission_restarts_with_fresh_checkpoints_and_staging_ident
     assert len(old_temporary) == 1
     rolled_back = DraftAdmissionService(repository, root).recover()[0]
     assert rolled_back.phase == "rolled_back"
+    old_members = {
+        item.relative_name: item
+        for item in repository.list_admission_members(rolled_back.journal_id)
+    }
+    assert old_members["hello.jpg"].phase == "verified"
     _crash_admission(
         repository, root, fingerprint, intent_id, "after_member_planned:hello.jpg"
     )
     restarted = repository.list_recoverable_admissions()[0]
     assert restarted.journal_id != rolled_back.journal_id
-    assert [
-        item.phase for item in repository.list_admission_members(restarted.journal_id)
-    ] == ["planned"]
+    fresh_members = {
+        item.relative_name: item
+        for item in repository.list_admission_members(restarted.journal_id)
+    }
+    assert fresh_members["hello.jpg"].phase == "planned"
+    assert all(
+        item.journal_id == restarted.journal_id for item in fresh_members.values()
+    )
     new_temporary = tuple((root / "QUEUE").glob(".admitting-*"))
     assert len(new_temporary) == 1 and new_temporary != old_temporary
+    assert not (new_temporary[0] / "hello.jpg").exists()
     assert not (new_temporary[0] / ".ready").exists()
     # Reopening also proves the transactional reset restored the canonical schema.
     with StateRepository.open_existing(repository.path) as fresh:
