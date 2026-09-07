@@ -1,5 +1,4 @@
 # mypy: disable-error-code=import-untyped
-# ruff: noqa: E402
 """Offline end-to-end evidence for publication, recovery, and local control."""
 
 from __future__ import annotations
@@ -8,7 +7,6 @@ import hashlib
 import io
 import json
 import socket
-import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,12 +14,7 @@ from typing import cast
 
 import pytest
 from PIL import Image
-
-SUPPORT_ROOT = str(Path(__file__).parents[1] / "support")
-if SUPPORT_ROOT not in sys.path:
-    sys.path.insert(0, SUPPORT_ROOT)
-
-from fake_daemon import (
+from tests.support.fake_daemon import (
     HERMETIC_MP4_BYTES,
     AdapterPlan,
     FakeAdapterRegistry,
