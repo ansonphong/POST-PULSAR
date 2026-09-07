@@ -1286,10 +1286,45 @@ def test_real_loopback_daemon_control_confirmation_and_socket_sentinel(
             },
         )
         assert accepted == replayed == 202
-        assert first_response["data"] == second_response["data"]
+        first_data = cast(dict[str, object], first_response["data"])
+        second_data = cast(dict[str, object], second_response["data"])
+        stable_fields = (
+            "request_id",
+            "profile_id",
+            "action",
+            "arguments",
+            "idempotency_key",
+            "expected_revision",
+            "bundle_key",
+            "schedule_key",
+            "intent_id",
+        )
+        first_binding = {field: first_data[field] for field in stable_fields}
+        second_binding = {field: second_data[field] for field in stable_fields}
+        assert first_binding == second_binding == {
+            "request_id": first_data["request_id"],
+            "profile_id": "ansonphong",
+            "action": "run_now",
+            "arguments": arguments,
+            "idempotency_key": "consume-confirmed",
+            "expected_revision": intent.resource_revision,
+            "bundle_key": key,
+            "schedule_key": None,
+            "intent_id": intent.intent_id,
+        }
         assert running.completed.wait(2)
-        response_data = cast(dict[str, object], first_response["data"])
-        assert running.executed == [cast(int, response_data["request_id"])]
+        request_id = cast(int, first_data["request_id"])
+        with StateRepository.open_existing(database, clock=clock.now) as repository:
+            requests = repository.list_run_requests(profile_id="ansonphong")
+            assert len(requests) == 1
+            persisted = requests[0]
+            assert (
+                persisted.request_id,
+                persisted.idempotency_key,
+                persisted.intent_id,
+                persisted.bundle_key,
+            ) == (request_id, "consume-confirmed", intent.intent_id, key)
+        assert running.executed == [request_id]
         assert not source.exists() and len(registry.traces) == 1
 
         with pytest.raises(OSError, match="non-loopback"):
