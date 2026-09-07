@@ -1,9 +1,9 @@
 # POST PULSAR modernization report
 
-Report boundary: repository implementation and evidence through task T5.2.
+Report boundary: repository implementation and evidence through task T5.3.
 Refresh date: 2026-09-05.
 
-## Implemented through T5.2
+## Implemented through T5.3
 
 The former flat PHONG-BOT scripts have been replaced by the `post_pulsar`
 Python 3.12 package and `post-pulsar` CLI while retaining Anson Phong's
@@ -43,11 +43,15 @@ Completed implementation includes:
   user startup integration, service templates, operator hardened guidance, and
   the README, migration, security, licensing, and documentation contract
   delivered by T5.2.
+- A hermetic offline integration harness using temporary profile/state/content
+  roots, protocol-faithful fake official adapters, injected time, and a real
+  loopback daemon/control server. The harness retains a non-loopback denial
+  sentinel and is test-only, so it is absent from built runtime entry points.
 
 The implemented platform set is exactly X and Instagram professional-account
 publishing. There is no general platform plugin interface in core.
 
-## Evidence available through T5.2
+## Evidence available through T5.3
 
 Evidence is repository-local and does not rely on a live social account:
 
@@ -71,6 +75,15 @@ Evidence is repository-local and does not rely on a live social account:
   project-relative launcher/service behavior. `tests/unit/test_docs.py` is the
   focused T5.2 contract for current headings, commands, environment names,
   migration/security negations, licensing, and absence of active legacy claims.
+- `tests/integration/test_workflow.py` drives the real application, state,
+  scheduler, archive, daemon, control, and trusted-CLI approval paths with fake
+  adapters. It covers partial and exhausted retries, immutable drift,
+  post-create/pre-commit ambiguity, explicit published/not-published
+  reconciliation, interrupted archive recovery, restart idempotence, two
+  isolated profiles, every standard bucket, schedule restart/DST/misfire, and
+  authenticated bounded loopback control. `tests/support/fake_daemon.py`
+  exposes the same hermetic fake-adapter daemon launcher for sibling
+  compatibility checks without adding a runtime command or provider endpoint.
 
 These are automated, hermetic implementation checks. They do not constitute a
 provider-issued OAuth grant, a live post, public-host reachability from Meta, or
@@ -100,7 +113,8 @@ must be completed and recorded by the operator for each deployment:
   every positive and negative access test using a real agent logon/token, and
   operate the daemon as an administrator-enabled system service.
 - Independently review and verify any sibling MCP/plugin revision before
-  installation. No sibling compatibility revision is recorded through T5.2.
+  installation. T5.3 provides a reusable hermetic launcher, but records no
+  claim that an unreviewed sibling revision has passed compatibility checks.
 
 ## Lock and API refresh
 
