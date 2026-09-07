@@ -7,7 +7,6 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 VENV_DIR="$SCRIPT_DIR/.venv"
 PYTHON="$VENV_DIR/bin/python"
-UV_VERSION="0.12.10"
 
 fail() {
     printf 'POST PULSAR setup: %s\n' "$1" >&2
@@ -160,7 +159,7 @@ setup_environment() {
     if [[ ! -x "$PYTHON" ]]; then
         python3 -m venv "$VENV_DIR"
     fi
-    "$PYTHON" -m pip install --disable-pip-version-check "uv==$UV_VERSION"
+    "$PYTHON" -m pip install --disable-pip-version-check "uv==0.12.10"
     (
         cd -- "$SCRIPT_DIR"
         export VIRTUAL_ENV="$VENV_DIR"

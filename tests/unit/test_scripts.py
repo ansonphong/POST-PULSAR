@@ -53,9 +53,19 @@ def _windows_path(path: Path) -> str:
     ).stdout.strip()
 
 
-def _run_batch(path: Path, *arguments: str, env: dict[str, str] | None = None):
+def _run_batch(
+    path: Path,
+    *arguments: str,
+    dry_run: bool = False,
+    env: dict[str, str] | None = None,
+):
+    command = f'call "{_windows_path(path)}"'
+    if arguments:
+        command = f"{command} {subprocess.list2cmdline(list(arguments))}"
+    if dry_run:
+        command = f"set POST_PULSAR_DRY_RUN=1&& {command}"
     return subprocess.run(
-        ["cmd.exe", "/d", "/c", "call", _windows_path(path), *arguments],
+        ["cmd.exe", "/d", "/c", command],
         cwd=path.parent,
         env=env,
         capture_output=True,
@@ -227,7 +237,7 @@ def test_windows_task_dry_run_parses_in_a_space_containing_path() -> None:
         shutil.copy2(ROOT / "run-post-pulsar.bat", install / "run-post-pulsar.bat")
         result = _run_batch(
             task,
-            env={**os.environ, "POST_PULSAR_DRY_RUN": "1"},
+            dry_run=True,
         )
         output = result.stdout + result.stderr
         assert result.returncode == 0
