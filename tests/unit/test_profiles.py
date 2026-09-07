@@ -21,7 +21,7 @@ def _write_config(tmp_path: Path, profiles: str) -> Path:
 [app]
 state_directory = ".post-pulsar"
 log_file = ".post-pulsar/post_pulsar.log"
-deployment_mode = "hardened"
+deployment_mode = "simple"
 control_host = "::1"
 control_port = 8765
 agent_capability_file = ".post-pulsar/agent-capability"
