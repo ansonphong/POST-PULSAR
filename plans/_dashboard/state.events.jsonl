@@ -139,3 +139,7 @@
 {"event":"commit","sha":"e6ca6fe","message":"chore(plan): mark T6.4 DONE","time":"2026-09-07T05:24:11Z"}
 {"event":"commit","sha":"520d028","message":"chore: satisfy strict core quality gates","time":"2026-09-07T05:37:21Z"}
 {"event":"commit","sha":"520d028","message":"chore: satisfy strict core quality gates","time":"2026-09-07T05:43:37Z"}
+{"event":"commit","sha":"a50e3be","message":"chore(plan): mark T6.5 DONE","time":"2026-09-07T05:44:16Z"}
+{"event":"commit","sha":"6ea89f0","message":"fix: enqueue exact approved on-disk bundles","time":"2026-09-07T06:14:27Z"}
+{"event":"commit","sha":"70af5d3","message":"fix(ci): audit exported locked dependency graph","time":"2026-09-07T06:15:47Z"}
+{"event":"commit","sha":"70af5d3","message":"fix(ci): audit exported locked dependency graph","time":"2026-09-07T06:22:40Z"}

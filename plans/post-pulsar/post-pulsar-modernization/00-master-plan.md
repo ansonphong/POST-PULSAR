@@ -56,7 +56,7 @@ stage_state: active
 - [x] #232c `T6.3` **Task T6.3:** Expose read-only MCP tools and resources
 - [x] #6067 `T6.4` **Task T6.4:** Add confirmed scheduling, queue, publishing, and recovery tools
 - [x] #609f `T6.5` **Task T6.5:** Package provider-neutral skills for Codex and Claude Code
-- [ ] #6af4 `T6.6` **Task T6.6:** Prove cross-repository compatibility and document installation
+- [x] #6af4 `T6.6` **Task T6.6:** Prove cross-repository compatibility and document installation
 
 ### Phase 7: Ecosystem Report ([`07-ecosystem-report.md`](07-ecosystem-report.md))
 
