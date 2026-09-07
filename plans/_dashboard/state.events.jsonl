@@ -106,3 +106,9 @@
 {"event":"commit","sha":"30c044b","message":"chore(plan): mark T5.1 DONE","time":"2026-09-07T02:28:27Z"}
 {"event":"commit","sha":"81a8bec","message":"docs: rewrite operator and security guides","time":"2026-09-07T02:43:34Z"}
 {"event":"commit","sha":"7bbb596","message":"docs: preserve contract phrases across lines","time":"2026-09-07T02:44:17Z"}
+{"event":"commit","sha":"05fd2ec","message":"chore(plan): mark T5.2 DONE","time":"2026-09-07T02:45:33Z"}
+{"event":"commit","sha":"9431a3b","message":"test(integration): prove offline workflow","time":"2026-09-07T03:01:20Z"}
+{"event":"commit","sha":"97808b7","message":"fix(integration): load hermetic daemon support","time":"2026-09-07T03:02:52Z"}
+{"event":"commit","sha":"6b2219f","message":"fix(integration): correct workflow fixtures","time":"2026-09-07T03:03:30Z"}
+{"event":"commit","sha":"e0def49","message":"fix(integration): assert durable scheduler contracts","time":"2026-09-07T03:04:12Z"}
+{"event":"commit","sha":"5d71eff","message":"docs(report): record focused integration evidence","time":"2026-09-07T03:04:44Z"}

@@ -47,7 +47,7 @@ stage_state: active
 
 - [x] #c0d4 `T5.1` **Task T5.1:** Replace setup, launcher, and scheduled-task scripts
 - [x] #30ed `T5.2` **Task T5.2:** Rewrite operator, migration, and security documentation
-- [ ] #97cd `T5.3` **Task T5.3:** Prove the offline end-to-end workflow
+- [x] #97cd `T5.3` **Task T5.3:** Prove the offline end-to-end workflow
 
 ### Phase 6: MCP and Agent Plugins ([`06-mcp-and-agent-plugins.md`](06-mcp-and-agent-plugins.md))
 
