@@ -60,7 +60,7 @@ stage_state: active
 
 ### Phase 7: Ecosystem Report ([`07-ecosystem-report.md`](07-ecosystem-report.md))
 
-- [ ] #ce83 `T7.1` **Task T7.1:** Record verified plugin compatibility in the core report
+- [x] #ce83 `T7.1` **Task T7.1:** Record verified plugin compatibility in the core report
 
 ## File Structure
 

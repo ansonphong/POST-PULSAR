@@ -143,3 +143,5 @@
 {"event":"commit","sha":"6ea89f0","message":"fix: enqueue exact approved on-disk bundles","time":"2026-09-07T06:14:27Z"}
 {"event":"commit","sha":"70af5d3","message":"fix(ci): audit exported locked dependency graph","time":"2026-09-07T06:15:47Z"}
 {"event":"commit","sha":"70af5d3","message":"fix(ci): audit exported locked dependency graph","time":"2026-09-07T06:22:40Z"}
+{"event":"commit","sha":"be07b44","message":"chore(plan): mark T6.6 DONE","time":"2026-09-07T06:23:18Z"}
+{"event":"commit","sha":"e6bb600","message":"docs: close modernization evidence report","time":"2026-09-07T06:28:34Z"}
