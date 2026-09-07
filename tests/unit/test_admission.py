@@ -57,7 +57,12 @@ def _draft(tmp_path: Path) -> tuple[Path, str]:
     return root, bundle.fingerprint
 
 
-def _intent(repository: StateRepository, fingerprint: str) -> str:
+def _intent(
+    repository: StateRepository,
+    fingerprint: str,
+    *,
+    idempotency_key: str = "admit-hello",
+) -> str:
     arguments = {"bucket": "QUEUE", "bundle_id": "hello"}
     intent = repository.create_confirmation_intent(
         action="admit_draft",
@@ -78,7 +83,7 @@ def _intent(repository: StateRepository, fingerprint: str) -> str:
         profile_id="profile",
         resource_revision=1,
         fingerprint=fingerprint,
-        idempotency_key="admit-hello",
+        idempotency_key=idempotency_key,
     )
     return intent.intent_id
 
@@ -210,3 +215,243 @@ def test_atomic_install_never_replaces_a_concurrent_destination(tmp_path: Path) 
             intent_id=intent_id,
         )
     assert (root / "QUEUE/hello/competitor").read_text(encoding="utf-8") == "keep"
+
+
+_PRE_READY_BOUNDARIES = (
+    "after_journal",
+    "after_member_planned:hello.jpg",
+    "after_member_copied:hello.jpg",
+    "after_member_verified:hello.jpg",
+    "after_member_planned:hello.txt",
+    "after_member_copied:hello.txt",
+    "after_member_verified:hello.txt",
+    "before_ready_install",
+)
+
+
+def _crash_admission(
+    repository: StateRepository, root: Path, fingerprint: str, intent_id: str,
+    boundary: str,
+) -> None:
+    def fail(selected: str) -> None:
+        if selected == boundary:
+            raise RuntimeError("simulated admission crash")
+
+    with pytest.raises(RuntimeError, match="simulated admission crash"):
+        DraftAdmissionService(repository, root, fault_injector=fail).admit(
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            expected_fingerprint=fingerprint,
+            intent_id=intent_id,
+        )
+
+
+@pytest.mark.parametrize("boundary", _PRE_READY_BOUNDARIES)
+def test_daemon_replays_same_request_after_each_pre_ready_admission_crash(
+    tmp_path: Path, boundary: str,
+) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from post_pulsar.cli import _execute_daemon_request
+    from post_pulsar.daemon import ForegroundDaemon
+
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+    request = repository.claim_next_run_request("dead-daemon")
+    assert request is not None
+    _crash_admission(repository, root, fingerprint, intent_id, boundary)
+    prior_journal = repository.list_recoverable_admissions()[0]
+    database = repository.path
+    repository.close()
+    attempted = threading.Event()
+    recovered_phases = []
+
+    class Server:
+        server_address = ("127.0.0.1", 43210)
+
+        def __init__(self) -> None:
+            self.closed = threading.Event()
+
+        def serve_forever(self) -> None:
+            self.closed.wait()
+
+        def shutdown(self) -> None:
+            self.closed.set()
+
+        def server_close(self) -> None:
+            self.closed.set()
+
+    def recover() -> None:
+        with StateRepository.open_existing(database) as fresh:
+            restored = fresh.recover_claimed_run_requests(daemon._worker_token)
+            assert [item.request_id for item in restored] == [request.request_id]
+            recovered_phases.extend(
+                item.phase for item in DraftAdmissionService(fresh, root).recover()
+            )
+
+    settings = SimpleNamespace(
+        app=SimpleNamespace(state_directory=tmp_path / "state"),
+        profile=lambda _profile_id: SimpleNamespace(account_root=root),
+    )
+
+    def execute(replayed):
+        assert replayed.request_id == request.request_id
+        assert replayed.intent_id == intent_id
+        try:
+            return _execute_daemon_request(
+                settings,
+                replayed,
+                daemon=daemon,
+                environ={},
+                adapter_factory=None,
+                identity_verifier=lambda *_args: pytest.fail("admission used network"),
+                clock=lambda: datetime.now(UTC),
+            )
+        finally:
+            attempted.set()
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state",
+        tmp_path / "control/endpoint.json",
+        "127.0.0.1",
+        0,
+        recovery=recover,
+        request_executor=execute,
+        poll_seconds=0.001,
+        server_factory=lambda *_args: Server(),
+    )
+    try:
+        daemon.start()
+        assert attempted.wait(5), "recovered admission request was not executed"
+    finally:
+        daemon.stop()
+
+    with StateRepository.open_existing(database) as fresh:
+        completed = fresh.get_run_request(request.request_id)
+        assert recovered_phases == ["rolled_back"]
+        assert completed.status == "completed"
+        assert completed.result["phase"] == "installed"
+        assert completed.result["journal_id"] != prior_journal.journal_id
+        assert fresh.get_confirmation_intent(intent_id).state == "consumed"
+        assert len(fresh.list_run_requests()) == 1
+    assert (root / "QUEUE/hello/.ready").read_bytes() == b""
+    assert scan_inbox(root / "QUEUE/hello").bundles[0].fingerprint == fingerprint
+    assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+    assert (root / "DRAFTS/hello.txt").read_text(encoding="utf-8") == "caption"
+    assert not tuple((root / "QUEUE").glob(".admitting-*"))
+
+
+def test_rolled_back_admission_restarts_with_fresh_checkpoints_and_staging_identity(
+    tmp_path: Path,
+) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+    _crash_admission(
+        repository, root, fingerprint, intent_id, "after_member_verified:hello.jpg"
+    )
+    old_temporary = tuple((root / "QUEUE").glob(".admitting-*"))
+    assert len(old_temporary) == 1
+    rolled_back = DraftAdmissionService(repository, root).recover()[0]
+    assert rolled_back.phase == "rolled_back"
+    _crash_admission(
+        repository, root, fingerprint, intent_id, "after_member_planned:hello.jpg"
+    )
+    restarted = repository.list_recoverable_admissions()[0]
+    assert restarted.journal_id != rolled_back.journal_id
+    assert [item.phase for item in repository.list_admission_members(
+        restarted.journal_id
+    )] == ["planned"]
+    new_temporary = tuple((root / "QUEUE").glob(".admitting-*"))
+    assert len(new_temporary) == 1 and new_temporary != old_temporary
+    assert not (new_temporary[0] / ".ready").exists()
+    # Reopening also proves the transactional reset restored the canonical schema.
+    with StateRepository.open_existing(repository.path) as fresh:
+        assert fresh.get_admission(restarted.journal_id).phase == "copying"
+
+
+def test_fresh_approval_can_retry_failed_rolled_back_unchanged_draft(
+    tmp_path: Path,
+) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    original_intent = _intent(repository, fingerprint)
+    original_request = repository.claim_next_run_request("failed-daemon")
+    assert original_request is not None
+    _crash_admission(
+        repository, root, fingerprint, original_intent, "before_ready_install"
+    )
+    DraftAdmissionService(repository, root).recover()
+    repository.complete_run_request(
+        original_request.request_id,
+        worker_token="failed-daemon",
+        result={"code": "request_failed"},
+        failed=True,
+    )
+    new_intent = _intent(repository, fingerprint, idempotency_key="admit-hello-again")
+    admitted = DraftAdmissionService(repository, root).admit(
+        profile_id="profile",
+        bucket="QUEUE",
+        bundle_id="hello",
+        expected_fingerprint=fingerprint,
+        intent_id=new_intent,
+    )
+    assert admitted.phase == "installed" and admitted.intent_id == new_intent
+    assert repository.get_run_request(original_request.request_id).status == "failed"
+    assert repository.get_confirmation_intent(original_intent).state == "consumed"
+    assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_fresh_approval_cannot_supersede_a_live_admission_request(
+    tmp_path: Path, claimed: bool,
+) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    original_intent = _intent(repository, fingerprint)
+    if claimed:
+        assert repository.claim_next_run_request("active-daemon") is not None
+    _crash_admission(repository, root, fingerprint, original_intent, "after_journal")
+    rolled_back = DraftAdmissionService(repository, root).recover()[0]
+    new_intent = _intent(repository, fingerprint, idempotency_key="admit-hello-other")
+    with pytest.raises(ConflictError):
+        DraftAdmissionService(repository, root).admit(
+            profile_id="profile", bucket="QUEUE", bundle_id="hello",
+            expected_fingerprint=fingerprint, intent_id=new_intent,
+        )
+    assert repository.get_admission(rolled_back.journal_id).phase == "rolled_back"
+    assert not (root / "QUEUE/hello").exists()
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("confirmation_intents", "binding_sha256", "0" * 64),
+        ("run_requests", "request_sha256", "0" * 64),
+        ("run_requests", "action", "pause"),
+        ("run_requests", "expected_revision", 2),
+        ("run_requests", "intent_id", None),
+    ],
+)
+def test_rolled_back_retry_revalidates_consumed_intent_and_exact_request_binding(
+    tmp_path: Path, table: str, column: str, value: object,
+) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+    _crash_admission(repository, root, fingerprint, intent_id, "before_ready_install")
+    rolled_back = DraftAdmissionService(repository, root).recover()[0]
+    members = repository.list_admission_members(rolled_back.journal_id)
+    repository._connection.execute(f"UPDATE {table} SET {column} = ?", (value,))
+    with pytest.raises((AdmissionError, ConflictError)):
+        repository.start_admission(
+            profile_id="profile", bucket="QUEUE", bundle_id="hello",
+            fingerprint=fingerprint, source_path="DRAFTS",
+            destination_path="QUEUE/hello", intent_id=intent_id,
+        )
+    assert repository.get_admission(rolled_back.journal_id).phase == "rolled_back"
+    assert repository.list_admission_members(rolled_back.journal_id) == members
+    assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"

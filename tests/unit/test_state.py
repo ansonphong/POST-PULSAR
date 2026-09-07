@@ -36,6 +36,146 @@ class FakeClock:
         self.value += timedelta(**kwargs)
 
 
+def _local_replay_fixture(repository, action):
+    arguments = {}
+    bundle_key = schedule_key = None
+    fingerprint = None
+    settings = dict(schedule_id="fixture-schedule", bucket="QUEUE", timezone="UTC",
+                    weekdays=[5], local_time="12:00", misfire_grace_seconds=60,
+                    enabled=False)
+    if action.startswith("schedule_"):
+        if action != "schedule_create":
+            schedule = repository.create_schedule(profile_id="ansonphong", **settings)
+            schedule_key, fingerprint = schedule.schedule_key, schedule.config_hash
+        if action in {"schedule_create", "schedule_update"}:
+            arguments = {**settings, "local_time": "13:00"}
+    if action in {"cancel", "delete"}:
+        bundle_key, fingerprint = _bundle(repository), "b" * 64
+        arguments = {"bundle_id": "post", "fingerprint": fingerprint}
+    fields = dict(profile_id="ansonphong", action=action, arguments=arguments,
+                  idempotency_key="fixture-" + action, expected_revision=1,
+                  bundle_key=bundle_key, schedule_key=schedule_key)
+    if action in {"schedule_enable", "cancel", "delete"}:
+        intent = repository.create_confirmation_intent(
+            action=action, arguments=arguments, profile_id="ansonphong",
+            resource_revision=1, fingerprint=fingerprint,
+            consequence="Fixture-only exact local change.",
+            expires_at=FakeClock()() + timedelta(minutes=5),
+            bundle_key=bundle_key, schedule_key=schedule_key)
+        repository.approve_confirmation_intent(intent.intent_id, expected_revision=1)
+        fields.pop("expected_revision")
+        return repository.consume_intent_with_request(
+            **fields, intent_id=intent.intent_id, resource_revision=1,
+            fingerprint=fingerprint)
+    return repository.create_run_request(**fields)
+
+
+def _local_fixture_operation(repository, request):
+    action = request.action
+    if action in {"pause", "resume"}:
+        value = repository.set_paused(action == "pause", expected_revision=1)
+        return {"paused": value.paused, "revision": value.revision}
+    if action == "schedule_create":
+        value = repository.create_schedule(profile_id=request.profile_id,
+                                           **request.arguments, expected_revision=1)
+    elif action == "schedule_update":
+        value = repository.update_schedule(request.schedule_key,
+                                           profile_id=request.profile_id,
+                                           **request.arguments, expected_revision=1)
+    elif action in {"schedule_enable", "schedule_disable"}:
+        value = repository.set_schedule_enabled(request.schedule_key,
+                                               action == "schedule_enable",
+                                               expected_revision=1)
+    else:
+        value = repository.terminalize_pending_bundle(
+            profile_id=request.profile_id, bundle_key=request.bundle_key,
+            expected_revision=1, fingerprint=request.arguments["fingerprint"],
+            action=action)
+    return {"revision": value.revision}
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "schedule_create",
+    "schedule_update", "schedule_enable", "schedule_disable", "cancel", "delete"])
+@pytest.mark.parametrize("boundary", ["before_apply", "inside_apply", "after_apply"])
+def test_local_request_crash_recovery_is_atomic(tmp_path, action, boundary):
+    repository = _repository(tmp_path, FakeClock())
+    created = _local_replay_fixture(repository, action)
+    request = repository.claim_next_run_request("fixture-old-worker")
+    assert request.request_id == created.request_id
+
+    def apply():
+        result = _local_fixture_operation(repository, request)
+        if boundary == "inside_apply":
+            raise KeyboardInterrupt("fixture simulated crash; no signal")
+        return result
+
+    if boundary == "inside_apply":
+        with pytest.raises(KeyboardInterrupt):
+            repository.execute_local_run_request(request, apply)
+    elif boundary == "after_apply":
+        result = repository.execute_local_run_request(request, apply)
+    repository.close()
+    with StateRepository.open_existing(tmp_path / "state/post_pulsar.sqlite3") as recovered:
+        recovered.recover_claimed_run_requests("fixture-new-worker")
+        stored = recovered.get_run_request(created.request_id)
+        if boundary == "after_apply":
+            assert stored.status == "completed" and stored.result == result
+            assert recovered.claim_next_run_request("fixture-new-worker") is None
+        else:
+            replay = recovered.claim_next_run_request("fixture-new-worker")
+            assert replay.request_id == created.request_id
+            result = recovered.execute_local_run_request(
+                replay, lambda: _local_fixture_operation(recovered, replay))
+            stored = recovered.get_run_request(created.request_id)
+            assert stored.status == "completed" and stored.result == result
+
+
+def test_local_completion_rejects_similar_state_and_changed_binding(tmp_path):
+    repository = _repository(tmp_path, FakeClock())
+    _local_replay_fixture(repository, "pause")
+    request = repository.claim_next_run_request("fixture-worker")
+    called = []
+    with pytest.raises(ConflictError):
+        repository.execute_local_run_request(
+            replace(request, action="resume"), lambda: called.append(True))
+    assert called == []
+    repository.set_paused(True, expected_revision=1)
+    with pytest.raises(ConflictError):
+        repository.execute_local_run_request(
+            request, lambda: _local_fixture_operation(repository, request))
+    assert repository.get_run_request(request.request_id).status == "claimed"
+
+
+def test_accepted_pause_immediately_gates_queue_and_schedule(tmp_path):
+    repository = _repository(tmp_path, FakeClock())
+    older = _local_replay_fixture(repository, "schedule_enable")
+    pause = repository.create_run_request(profile_id="ansonphong", action="pause",
+        arguments={}, idempotency_key="fixture-pause", expected_revision=1)
+    state = repository.get_pause_state()
+    assert not state.paused and state.pause_requested
+    claimed = repository.claim_next_run_request("fixture-worker")
+    assert claimed.request_id == pause.request_id
+    assert repository.get_run_request(older.request_id).status == "queued"
+    repository.execute_local_run_request(
+        claimed, lambda: _local_fixture_operation(repository, claimed))
+    assert repository.get_pause_state().paused
+    assert not repository.get_pause_state().pause_requested
+    assert repository.claim_next_run_request("fixture-worker") is None
+
+
+def test_pending_pause_survives_failure_and_crash(tmp_path):
+    repository = _repository(tmp_path, FakeClock())
+    pause = _local_replay_fixture(repository, "pause")
+    repository.claim_next_run_request("fixture-old-worker")
+    repository.recover_claimed_run_requests("fixture-new-worker")
+    assert repository.get_pause_state().pause_requested
+    repository.claim_next_run_request("fixture-new-worker")
+    repository.complete_run_request(pause.request_id, worker_token="fixture-new-worker",
+                                    result={"code": "request_failed"}, failed=True)
+    assert repository.get_pause_state().paused
+    assert not repository.get_pause_state().pause_requested
+
+
 @pytest.mark.parametrize("published", [True, False])
 def test_operator_decision_recovers_linked_ambiguous_occurrence(
     tmp_path: Path, published: bool

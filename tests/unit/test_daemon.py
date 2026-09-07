@@ -196,3 +196,186 @@ def test_each_schedule_boundary_respects_shutdown(tmp_path: Path) -> None:
         daemon._stop.set()
     assert not daemon.dispatch_if_running(lambda: dispatched.append(2))
     assert dispatched == [1]
+
+
+def test_endpoint_recovery_never_probes_with_signals(tmp_path: Path, monkeypatch):
+    from post_pulsar import daemon as module
+
+    endpoint = tmp_path / "endpoint.json"
+    record = EndpointRecord(
+        "post-pulsar.control/v1", "127.0.0.1:1", os.getpid(), 1, "n", {}
+    )
+    record.write(endpoint)
+
+    def forbidden(*args):
+        pytest.fail("endpoint recovery must never signal or probe another process")
+
+    monkeypatch.setattr(module.os, "kill", forbidden)
+    daemon = ForegroundDaemon(
+        tmp_path / "state", endpoint, "127.0.0.1", 0,
+        server_factory=lambda *args: _Server(*args),
+    )
+    try:
+        daemon.start()
+        assert EndpointRecord.read(endpoint).startup_nonce == daemon._nonce
+    finally:
+        daemon.stop()
+
+
+def test_endpoint_with_unverifiable_process_identity_is_preserved(tmp_path: Path, monkeypatch):
+    import importlib
+
+    identity = importlib.import_module("post_pulsar.process_identity")
+    endpoint = tmp_path / "endpoint.json"
+    record = EndpointRecord(
+        "post-pulsar.control/v1", "127.0.0.1:1", 987, 1, "existing", {}
+    )
+    record.write(endpoint)
+    daemon = ForegroundDaemon(
+        tmp_path / "state", endpoint, "127.0.0.1", 0,
+        server_factory=lambda *args: _Server(*args),
+    )
+
+    def unverifiable(pid):
+        raise identity.ProcessIdentityError("process identity is unavailable")
+
+    monkeypatch.setattr(identity, "process_start_identity", unverifiable)
+    with pytest.raises(identity.ProcessIdentityError):
+        daemon.start()
+    assert EndpointRecord.read(endpoint) == record
+    assert daemon._lease is None
+
+
+def test_signals_are_installed_before_recovery_and_stop_skips_startup_work(
+    tmp_path: Path, monkeypatch
+):
+    from post_pulsar import daemon as module
+
+    installed = {}
+    history = []
+    originals = {module.signal.SIGINT: object(), module.signal.SIGTERM: object()}
+
+    def install(signum, handler):
+        previous = installed.get(signum, originals[signum])
+        installed[signum] = handler
+        history.append((signum, handler))
+        return previous
+
+    monkeypatch.setattr(module.signal, "signal", install)
+    during_recovery = []
+    scheduled = []
+    servers = []
+
+    def recover():
+        during_recovery.extend(installed)
+        if module.signal.SIGTERM in installed:
+            installed[module.signal.SIGTERM](module.signal.SIGTERM, None)
+        else:
+            daemon._stop.set()
+        assert daemon._lease is not None
+
+    def server_factory(*args):
+        servers.append(args)
+        return _Server(*args)
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
+        recovery=recover, schedule_admission=lambda: scheduled.append(True),
+        server_factory=server_factory,
+    )
+    daemon.run_forever()
+    assert set(during_recovery) == set(originals)
+    assert installed == originals
+    assert len(history) == 4
+    assert scheduled == [] and servers == []
+    assert daemon._lease is None
+
+
+@pytest.mark.parametrize("failure_phase", ["start", "stop"])
+def test_signal_handlers_restore_across_entire_lifecycle(
+    tmp_path: Path, monkeypatch, failure_phase
+):
+    from post_pulsar import daemon as module
+
+    originals = {module.signal.SIGINT: object(), module.signal.SIGTERM: object()}
+    installed = dict(originals)
+    history = []
+
+    def install(signum, handler):
+        previous = installed[signum]
+        installed[signum] = handler
+        history.append((signum, handler))
+        return previous
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0
+    )
+
+    def fail():
+        raise RuntimeError("injected lifecycle failure")
+
+    monkeypatch.setattr(module.signal, "signal", install)
+    monkeypatch.setattr(daemon, "start", fail if failure_phase == "start" else daemon._stop.set)
+    monkeypatch.setattr(daemon, "stop", fail if failure_phase == "stop" else lambda: None)
+    with pytest.raises(RuntimeError, match="injected lifecycle failure"):
+        daemon.run_forever()
+    assert len(history) == 4
+    assert installed == originals
+
+
+def test_concurrent_stop_drains_startup_callback_before_releasing_lease(tmp_path: Path):
+    entered = threading.Event()
+    release = threading.Event()
+    stop_requested = threading.Event()
+    stop_finished = threading.Event()
+    startup_finished = threading.Event()
+    failures = []
+    servers = []
+
+    def recover():
+        entered.set()
+        if not release.wait(2):
+            raise RuntimeError("test did not release startup callback")
+
+    def factory(*args):
+        servers.append(args)
+        return _Server(*args)
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
+        recovery=recover, server_factory=factory,
+    )
+
+    def start():
+        try:
+            daemon.start()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            startup_finished.set()
+
+    def stop():
+        stop_requested.set()
+        daemon.stop()
+        stop_finished.set()
+
+    starter = threading.Thread(target=start)
+    stopper = threading.Thread(target=stop)
+    starter.start()
+    try:
+        assert entered.wait(1)
+        stopper.start()
+        assert stop_requested.wait(1)
+        assert not stop_finished.wait(0.1)
+        assert daemon._lease is not None
+        assert not startup_finished.is_set()
+    finally:
+        release.set()
+        starter.join(2)
+        if stopper.ident is not None:
+            stopper.join(2)
+        daemon.stop()
+    assert not starter.is_alive() and not stopper.is_alive()
+    assert failures == []
+    assert servers == []
+    assert daemon._lease is None

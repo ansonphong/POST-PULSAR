@@ -14,6 +14,7 @@ from post_pulsar.bootstrap import BootstrapError, BootstrapRecord, write_bootstr
 from post_pulsar.cli import (
     EXIT_AUTH,
     EXIT_CONFLICT,
+    EXIT_DAEMON_UNAVAILABLE,
     EXIT_OK,
     EXIT_USAGE,
     main,
@@ -119,6 +120,43 @@ def _invoke(arguments: list[str], **kwargs: object) -> tuple[int, str, str]:
         **kwargs,  # type: ignore[arg-type]
     )
     return code, output.getvalue(), errors.getvalue()
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_shutdown_uses_authenticated_http_and_never_signals(
+    tmp_path: Path, monkeypatch, matching: bool
+):
+    from post_pulsar import cli
+
+    config, database = _setup(tmp_path)
+    _live_control(tmp_path, database)
+    monkeypatch.setattr(cli, "_endpoint_process_is_live", lambda endpoint: matching)
+
+    def forbidden(*args):
+        pytest.fail("shutdown must never send a signal or process probe")
+
+    monkeypatch.setattr(cli.os, "kill", forbidden)
+    requests = []
+
+    def transport(endpoint, request):
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.target == "/control/v1/shutdown"
+        assert request.headers["Authorization"] == "Bearer " + "c" * 64
+        assert json.loads(request.body) == {"startup_nonce": endpoint.startup_nonce}
+        return ControlResponse(
+            202, {},
+            json.dumps({"schema": "post-pulsar.control/v1", "ok": True,
+                        "data": {"status": "stopping"}}).encode(),
+        )
+
+    code, _, _ = _invoke(
+        ["shutdown", "--profile", "operator", "--confirm", "SHUTDOWN",
+         "--config", str(config), "--json"],
+        control_transport=transport,
+    )
+    assert code == (EXIT_OK if matching else EXIT_DAEMON_UNAVAILABLE)
+    assert len(requests) == int(matching)
 
 
 class _TTY(StringIO):

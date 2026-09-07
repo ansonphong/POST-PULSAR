@@ -35,6 +35,15 @@ def _schedule(
     )
 
 
+def test_pending_pause_prevents_retries_and_new_schedule_admission():
+    repository = _Repository()
+    repository.get_pause_state = lambda: SimpleNamespace(paused=False, pause_requested=True)
+    scheduler = DeterministicScheduler(repository,
+        wall_clock=lambda: datetime(2026, 9, 7, 9, 0, tzinfo=UTC))
+    assert scheduler.tick() == ()
+    assert repository.runs == {}
+
+
 def test_fold_uses_earlier_utc_and_gap_uses_first_valid_tick_with_bounded_grace() -> (
     None
 ):

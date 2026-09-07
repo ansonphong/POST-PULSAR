@@ -319,6 +319,21 @@ def _factory(
     return build
 
 
+def test_pending_pause_blocks_new_content_before_credentials(tmp_path: Path) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    _bundle(tmp_path, "post")
+    with StateRepository.open_existing(tmp_path / "state/post_pulsar.sqlite3") as repository:
+        repository.create_run_request(profile_id="operator", action="pause", arguments={},
+            idempotency_key="fixture-pause", expected_revision=1)
+    app = OneRunApplication(config, locks=locks, instance_lease=instance,
+                             environ={}, clock=lambda: NOW)
+    try:
+        result = app.run_once(RunOnceRequest("operator", "QUEUE", "fixture-run"))
+        assert result.code == "publication_paused"
+    finally:
+        instance.release()
+
+
 def test_run_once_preflights_every_target_before_any_prepare_or_commit(
     tmp_path: Path,
 ) -> None:
