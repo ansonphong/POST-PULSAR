@@ -1,0 +1,16 @@
+# PostPulsar-Repository=@POST_PULSAR_ROOT@
+[Unit]
+Description=POST PULSAR foreground daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory="@POST_PULSAR_ROOT@"
+EnvironmentFile=-"@POST_PULSAR_ROOT@/.env"
+ExecStart="@POST_PULSAR_ROOT@/run-post-pulsar.sh" daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
