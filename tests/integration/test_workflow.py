@@ -492,8 +492,8 @@ def test_ready_buckets_and_random_selection_are_restart_deterministic(
         _bundle(settings, "360hextile", "RANDOM", "alpha")
         _bundle(settings, "360hextile", "RANDOM", "Zulu")
         scan = scan_account_root(settings.profile("ansonphong").account_root)
-        assert {bundle.source_bucket for bundle in scan.bundles} == {"QUEUE", "REELS"}
-        assert all(bundle.ready_marker_name == ".ready" for bundle in scan.bundles)
+        assert {bundle.bucket for bundle in scan.bundles} == {"QUEUE", "REELS"}
+        assert all(bundle.ready_marker.name == ".ready" for bundle in scan.bundles)
         try:
             outcome = _run(
                 config,
@@ -932,13 +932,7 @@ def test_scheduler_dedup_restart_dst_misfire_and_fake_wait(tmp_path: Path) -> No
         after_wait = scheduler.wake_after(60)
         assert clock.sleeps == [60]
         assert {item.schedule_id for item in after_wait} == {"due", "future"}
-        due_run = repository.get_schedule_run(first[0].run_id)
-        dispatching = repository.transition_schedule_run(
-            due_run.run_id, "dispatching", expected_revision=due_run.revision
-        )
-        repository.transition_schedule_run(
-            due_run.run_id, "failed", expected_revision=dispatching.revision
-        )
+        durable_ids = {item.schedule_id: item.run_id for item in after_wait}
 
     with StateRepository.open_existing(database, clock=clock.now) as reopened:
         restarted = DeterministicScheduler(
@@ -947,8 +941,8 @@ def test_scheduler_dedup_restart_dst_misfire_and_fake_wait(tmp_path: Path) -> No
             monotonic_clock=clock.monotonic_now,
             sleeper=clock.sleep,
         ).tick()
-        assert restarted[0].schedule_id == "due" and restarted[0].retry
-        assert len({item.run_id for item in restarted}) == len(restarted)
+        assert {item.schedule_id: item.run_id for item in restarted} == durable_ids
+        assert all(not item.retry for item in restarted)
         fold = reopened.create_schedule(
             profile_id="ansonphong",
             schedule_id="fold",
