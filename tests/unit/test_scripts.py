@@ -293,6 +293,6 @@ def test_package_is_the_only_active_python_entry_surface() -> None:
     assert "POST PULSAR" in readme
     assert "setup-post-pulsar" in readme
     assert "run-post-pulsar" in readme
-    assert "python -m post_pulsar" in readme
+    assert "`post-pulsar` console command" in readme
     for stale_name in ("PHONG-BOT", "phong-bot.py", "requirements.txt", "config.json"):
         assert stale_name not in readme
