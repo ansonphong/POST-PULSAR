@@ -141,8 +141,8 @@ These are bounded opportunities, not current capabilities:
   redacted, bounded, and never treated as proof a later publish will succeed.
 
 Platform names sometimes suggested for expansion—such as Threads, Facebook or
-Bluesky—are not supported by this repository. No item in this future section
-was implemented through T5.2.
+Bluesky—are not supported by this repository.
+No item in this future section was implemented through T5.2.
 
 ## Original recommendations and disposition
 

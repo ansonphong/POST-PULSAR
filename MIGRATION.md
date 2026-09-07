@@ -35,8 +35,8 @@ store as exposed:
 4. Copy `post-pulsar.toml.example` to `post-pulsar.toml`; enter only non-secret
    IDs, usernames, paths, timeouts, and environment-variable names. Provision
    each `POST_PULSAR_...` token in the operator or service manager environment.
-   Use a secret manager or masked interactive facility and never print token
-   values. Never paste tokens into shell history, logs, TOML, tests, issue
+   Use a secret manager or masked interactive facility and never print token values.
+   Never paste tokens into shell history, logs, TOML, tests, issue
    reports, commits, or screenshots.
 5. Verify each numeric remote ID and username through the official identity
    endpoint before enabling its target. Verify `ffprobe -version` as the daemon
