@@ -285,6 +285,73 @@ def test_windows_task_modes_fail_closed_without_calling_schtasks() -> None:
                 assert "daemon" in output
             assert not marker.exists()
 
+        for arguments in (
+            ("dry-run", "install", "unexpected"),
+            ("dry-run", "remove", "unexpected"),
+            ("dry-run", "install", "", "unexpected"),
+        ):
+            result = _run_batch(task, *arguments, env=env)
+            output = result.stdout + result.stderr
+            assert result.returncode == 2
+            assert "Usage:" in output
+            assert not marker.exists()
+
+
+@pytest.mark.skipif(
+    shutil.which("cmd.exe") is None,
+    reason="Windows command processor is unavailable",
+)
+def test_windows_task_install_query_failure_never_forces_an_update() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="post pulsar task query failure ", dir=ROOT.parent
+    ) as raw:
+        install = Path(raw)
+        task = install / "task-setup-post-pulsar.bat"
+        shutil.copy2(ROOT / "task-setup-post-pulsar.bat", task)
+        shutil.copy2(ROOT / "run-post-pulsar.bat", install / "run-post-pulsar.bat")
+        marker = install / "task-ownership.txt"
+        marker.write_text("unrelated task ownership\n", encoding="utf-8")
+        invocation_log = install / "schtasks-invocations.txt"
+        stub_dir = install / "scheduler-shim"
+        stub_dir.mkdir()
+        (stub_dir / "schtasks.bat").write_text(
+            "@echo off\n"
+            ">> \"%POST_PULSAR_SCHTASKS_LOG%\" echo %*\n"
+            "if /i \"%~1\"==\"/query\" exit /b 5\n"
+            "if /i \"%~1\"==\"/create\" (\n"
+            "    echo %* | findstr /i /l /c:\"/f\" >nul\n"
+            "    if not errorlevel 1 > \"%POST_PULSAR_SCHTASKS_MARKER%\" echo overwritten by forced update\n"
+            "    exit /b 0\n"
+            ")\n"
+            "exit /b 9\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["POST_PULSAR_SCHTASKS_MARKER"] = str(marker)
+        env["POST_PULSAR_SCHTASKS_LOG"] = str(invocation_log)
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+        names = env.get("WSLENV", "")
+        entries = [entry for entry in names.split(":") if entry]
+        entries.extend(
+            (
+                "POST_PULSAR_SCHTASKS_MARKER/p",
+                "POST_PULSAR_SCHTASKS_LOG/p",
+                "PATH/l",
+            )
+        )
+        env["WSLENV"] = ":".join(entries)
+        assert env["PATH"].startswith(f"{stub_dir}:")
+
+        result = _run_batch(task, "install", env=env)
+
+        assert result.returncode == 0
+        invocations = invocation_log.read_text(encoding="utf-8").lower().splitlines()
+        assert any(line.startswith("/query ") for line in invocations)
+        create_calls = [line for line in invocations if line.startswith("/create ")]
+        assert create_calls
+        assert all("/f" not in line.split() for line in create_calls)
+        assert marker.read_text(encoding="utf-8") == "unrelated task ownership\n"
+
 
 def test_package_is_the_only_active_python_entry_surface() -> None:
     assert (ROOT / "src/post_pulsar/__main__.py").is_file()

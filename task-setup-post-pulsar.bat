@@ -9,6 +9,13 @@ set "TASK_ACTION=\"%LAUNCHER%\" daemon"
 set "MODE=%~1"
 set "ACTION=%~2"
 
+if not "%~3"=="" goto usage
+if not "%~4"=="" goto usage
+if not "%~5"=="" goto usage
+if not "%~6"=="" goto usage
+if not "%~7"=="" goto usage
+if not "%~8"=="" goto usage
+if not "%~9"=="" goto usage
 if /i "%MODE%"=="dry-run" goto dry-run
 if not "%ACTION%"=="" goto usage
 if /i "%MODE%"=="install" goto install
@@ -35,25 +42,31 @@ if not exist "%LAUNCHER%" (
     exit /b 2
 )
 set "TASK_XML=%TEMP%\PostPulsar-task-%RANDOM%-%RANDOM%.xml"
-schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
-if not errorlevel 1 (
-    findstr /i /l /c:"%LAUNCHER%" "%TASK_XML%" >nul
-    if errorlevel 1 (
-        del /q "%TASK_XML%" >nul 2>&1
-        1>&2 echo Refusing to replace an unrelated task named "%TASK_NAME%".
-        exit /b 3
-    )
-)
+set "CREATE_FORCE="
+call schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
+if errorlevel 1 goto install-create
+findstr /i /l /c:"%LAUNCHER%" "%TASK_XML%" >nul
+if errorlevel 1 goto install-unrelated
+findstr /i /l /c:"daemon" "%TASK_XML%" >nul
+if errorlevel 1 goto install-unrelated
+set "CREATE_FORCE=/f"
+
+:install-create
 del /q "%TASK_XML%" >nul 2>&1
-schtasks /create /tn "%TASK_NAME%" /tr "%TASK_ACTION%" /sc ONLOGON /rl LIMITED /it /f
+call schtasks /create /tn "%TASK_NAME%" /tr "%TASK_ACTION%" /sc ONLOGON /rl LIMITED /it %CREATE_FORCE%
 if errorlevel 1 exit /b 1
 echo Installed or updated user task "%TASK_NAME%". It was not started.
 echo Bootstrap service selection: --service-mode windows-task --service-identifier %TASK_NAME%
 exit /b 0
 
+:install-unrelated
+del /q "%TASK_XML%" >nul 2>&1
+1>&2 echo Refusing to replace an unrelated task named "%TASK_NAME%".
+exit /b 3
+
 :remove
 set "TASK_XML=%TEMP%\PostPulsar-task-%RANDOM%-%RANDOM%.xml"
-schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
+call schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
 if errorlevel 1 (
     del /q "%TASK_XML%" >nul 2>&1
     echo POST PULSAR task is not installed.
@@ -66,7 +79,7 @@ if errorlevel 1 (
     exit /b 3
 )
 del /q "%TASK_XML%" >nul 2>&1
-schtasks /delete /tn "%TASK_NAME%" /f
+call schtasks /delete /tn "%TASK_NAME%" /f
 if errorlevel 1 exit /b 1
 echo Removed POST PULSAR background startup. No process was stopped.
 exit /b 0
