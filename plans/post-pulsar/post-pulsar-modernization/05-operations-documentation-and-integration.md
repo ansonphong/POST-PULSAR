@@ -87,7 +87,7 @@ touching the developer environment.
 **Verify-After:**
 - `bash -n setup-post-pulsar.sh run-post-pulsar.sh` (focused)
 - `.venv/bin/python -m pytest tests/unit/test_scripts.py -q` (focused)
-- `cmd.exe /d /c "set POST_PULSAR_DRY_RUN=1&& task-setup-post-pulsar.bat"` (scoped_check)
+- `cmd.exe /d /c "task-setup-post-pulsar.bat dry-run install"` (scoped_check)
 - `! rg -n -i "phong[-_ ]?bot|/root/|run-bot" setup-post-pulsar.sh setup-post-pulsar.bat run-post-pulsar.sh run-post-pulsar.bat task-setup-post-pulsar.bat` (scoped_check)
 - `.venv/bin/python -m compileall -q src/post_pulsar && .venv/bin/python -m post_pulsar --help` (scoped_check)
 
