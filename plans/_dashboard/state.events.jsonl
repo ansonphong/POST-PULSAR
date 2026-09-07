@@ -127,3 +127,7 @@
 {"event":"commit","sha":"9be6963","message":"test: make workflow helper importable","time":"2026-09-07T03:59:32Z"}
 {"event":"commit","sha":"ffe92a4","message":"chore(plan): record Phase 5 review pass","time":"2026-09-07T04:03:29Z"}
 {"event":"commit","sha":"ffe92a4","message":"chore(plan): record Phase 5 review pass","time":"2026-09-07T04:11:48Z"}
+{"event":"commit","sha":"304c706","message":"chore(plan): mark T6.1 DONE","time":"2026-09-07T04:12:31Z"}
+{"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:25:59Z"}
+{"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:39:53Z"}
+{"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:43:46Z"}

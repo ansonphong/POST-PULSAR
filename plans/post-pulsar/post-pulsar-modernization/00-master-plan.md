@@ -52,7 +52,7 @@ stage_state: active
 ### Phase 6: MCP and Agent Plugins ([`06-mcp-and-agent-plugins.md`](06-mcp-and-agent-plugins.md))
 
 - [x] #ba2e `T6.1` **Task T6.1:** Create the POST-PULSAR-PLUGINS repository and package baseline
-- [ ] #f421 `T6.2` **Task T6.2:** Implement the versioned core bridge and safe daemon auto-start
+- [x] #f421 `T6.2` **Task T6.2:** Implement the versioned core bridge and safe daemon auto-start
 - [ ] #232c `T6.3` **Task T6.3:** Expose read-only MCP tools and resources
 - [ ] #6067 `T6.4` **Task T6.4:** Add confirmed scheduling, queue, publishing, and recovery tools
 - [ ] #609f `T6.5` **Task T6.5:** Package provider-neutral skills for Codex and Claude Code
