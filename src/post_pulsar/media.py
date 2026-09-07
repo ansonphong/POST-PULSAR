@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, Final, Literal, Protocol, TypeAlias, cast
+from typing import BinaryIO, Final, Literal, Protocol, cast
 from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
 
 import httpcore
@@ -31,12 +31,12 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from post_pulsar.config import InstagramSettings
 from post_pulsar.content import PublishableBundle, SourceBucket
 
-MediaTarget: TypeAlias = Literal["x", "instagram"]
-MediaKind: TypeAlias = Literal["image", "video", "animated_gif"]
-StagingKind: TypeAlias = Literal["private", "instagram_public"]
-CleanupPolicy: TypeAlias = Literal["known_terminal_hash_match"]
-TerminalOutcome: TypeAlias = Literal["published", "failed", "ambiguous"]
-SocketOption: TypeAlias = (
+type MediaTarget = Literal["x", "instagram"]
+type MediaKind = Literal["image", "video", "animated_gif"]
+type StagingKind = Literal["private", "instagram_public"]
+type CleanupPolicy = Literal["known_terminal_hash_match"]
+type TerminalOutcome = Literal["published", "failed", "ambiguous"]
+type SocketOption = (
     tuple[int, int, int]
     | tuple[int, int, bytes | bytearray]
     | tuple[int, int, None, int]
@@ -519,59 +519,55 @@ def verify_public_media_url(
         port = parsed_current.port or 443
         addresses = _validated_public_addresses(current, dns_resolver)
         try:
-            with httpx.Client(
-                transport=make_transport(addresses[0], host, port),
-                trust_env=False,
-            ) as client:
-                with client.stream(
+            with (
+                httpx.Client(
+                    transport=make_transport(addresses[0], host, port),
+                    trust_env=False,
+                ) as client,
+                client.stream(
                     "GET",
                     current,
                     headers={"Accept": staged.mime_type},
                     follow_redirects=False,
                     timeout=timeout_seconds,
-                ) as response:
-                    if response.status_code in _REDIRECT_STATUS:
-                        if redirects >= max_redirects:
-                            raise MediaSafetyError(
-                                "public media redirect limit exceeded"
-                            )
-                        location = response.headers.get("location")
-                        if not location:
-                            raise MediaSafetyError(
-                                "public media redirect has no location"
-                            )
-                        current = urljoin(current, location)
-                        redirects += 1
-                        continue
-                    if response.status_code != 200:
+                ) as response,
+            ):
+                if response.status_code in _REDIRECT_STATUS:
+                    if redirects >= max_redirects:
+                        raise MediaSafetyError("public media redirect limit exceeded")
+                    location = response.headers.get("location")
+                    if not location:
+                        raise MediaSafetyError("public media redirect has no location")
+                    current = urljoin(current, location)
+                    redirects += 1
+                    continue
+                if response.status_code != 200:
+                    raise MediaSafetyError("public media URL did not return HTTP 200")
+                mime_type = (
+                    response.headers.get("content-type", "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .casefold()
+                )
+                if mime_type != staged.mime_type.casefold():
+                    raise MediaSafetyError("public media MIME type does not match")
+                digest = hashlib.sha256()
+                size = 0
+                first = bytearray()
+                tail = bytearray()
+                byte_limit = min(max_response_bytes, staged.size_bytes)
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > byte_limit:
                         raise MediaSafetyError(
-                            "public media URL did not return HTTP 200"
+                            "public media response exceeded byte limit"
                         )
-                    mime_type = (
-                        response.headers.get("content-type", "")
-                        .split(";", 1)[0]
-                        .strip()
-                        .casefold()
-                    )
-                    if mime_type != staged.mime_type.casefold():
-                        raise MediaSafetyError("public media MIME type does not match")
-                    digest = hashlib.sha256()
-                    size = 0
-                    first = bytearray()
-                    tail = bytearray()
-                    byte_limit = min(max_response_bytes, staged.size_bytes)
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > byte_limit:
-                            raise MediaSafetyError(
-                                "public media response exceeded byte limit"
-                            )
-                        digest.update(chunk)
-                        if len(first) < 16:
-                            first.extend(chunk[: 16 - len(first)])
-                        tail.extend(chunk)
-                        if len(tail) > 16:
-                            del tail[:-16]
+                    digest.update(chunk)
+                    if len(first) < 16:
+                        first.extend(chunk[: 16 - len(first)])
+                    tail.extend(chunk)
+                    if len(tail) > 16:
+                        del tail[:-16]
         except MediaSafetyError:
             raise
         except httpx.HTTPError:
@@ -642,7 +638,9 @@ def _cleanup_staged_artifact(
         raise MediaSafetyError("unknown staging cleanup outcome")
     quarantine = f".delete-{secrets.token_hex(16)}"
     try:
-        with _open_descriptor_parent(Path(staging_root), relative) as parent_fd:
+        with _open_descriptor_parent(  # noqa: SIM117 - ordered fd ownership
+            Path(staging_root), relative
+        ) as parent_fd:
             with _open_cleanup_directory(parent_fd) as cleanup_fd:
                 metadata = os.stat(
                     relative.name, dir_fd=parent_fd, follow_symlinks=False
@@ -988,16 +986,18 @@ def _stage_public_video(
             _safe_unlink_at(directory_fd, temporary)
             raise
         try:
-            with destination:
-                with open_verified_private_media(
+            with (
+                destination,
+                open_verified_private_media(
                     private,
                     private_root,
                     expected_profile_id=profile_id,
                     expected_bucket=bucket,
-                ) as verified:
-                    size = _copy_stream(verified.stream, destination, digest)
-                    destination.flush()
-                    os.fsync(destination.fileno())
+                ) as verified,
+            ):
+                size = _copy_stream(verified.stream, destination, digest)
+                destination.flush()
+                os.fsync(destination.fileno())
             sha256 = digest.hexdigest()
             if sha256 != private.sha256 or size != private.size_bytes:
                 raise MediaSafetyError(
@@ -1089,7 +1089,9 @@ def _ensure_real_directory(path: Path, mode: int) -> None:
         except FileExistsError:
             existing = os.lstat(directory)
             if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
-                raise MediaSafetyError("staging path contains an unsafe component")
+                raise MediaSafetyError(
+                    "staging path contains an unsafe component"
+                ) from None
         metadata = os.lstat(directory)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise MediaSafetyError("staging path contains an unsafe component")
@@ -1104,7 +1106,7 @@ def _open_regular(path: Path) -> tuple[BinaryIO, os.stat_result]:
     def opener(filename: str, flags: int) -> int:
         return os.open(filename, flags | no_follow)
 
-    source = open(path, "rb", opener=opener)
+    source = open(path, "rb", opener=opener)  # noqa: SIM115 - returned after checks
     try:
         opened = os.fstat(source.fileno())
         after = os.lstat(path)
@@ -1253,7 +1255,9 @@ def _install_exclusive(
             actual_hash, actual_size = _hash_open_file(existing)
         if actual_hash != expected_hash or actual_size != expected_size:
             _safe_unlink_at(directory_fd, temporary)
-            raise MediaSafetyError("staging name collision has different bytes")
+            raise MediaSafetyError(
+                "staging name collision has different bytes"
+            ) from None
         _safe_unlink_at(directory_fd, temporary)
         return False
     except OSError:
@@ -1501,7 +1505,7 @@ def _run_process(
         tempfile.TemporaryFile() as stdout_file,
         tempfile.TemporaryFile() as stderr_file,
     ):
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - argv is fixed ffprobe plus a held fd
             argv,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -1640,9 +1644,12 @@ def _validate_platform_media(
     items: list[tuple[Path, StagedMedia, MediaMetadata]],
     targets: tuple[MediaTarget, ...],
 ) -> None:
-    if "x" in targets and any(item[2].kind == "animated_gif" for item in items):
-        if len(items) != 1:
-            raise MediaSafetyError("X animated GIF must be the sole media item")
+    if (
+        "x" in targets
+        and any(item[2].kind == "animated_gif" for item in items)
+        and len(items) != 1
+    ):
+        raise MediaSafetyError("X animated GIF must be the sole media item")
     for _source, descriptor, metadata in items:
         if "x" in targets:
             _validate_x(descriptor, metadata)
@@ -2100,9 +2107,9 @@ __all__ = [
     "MediaMetadata",
     "MediaSafetyError",
     "MediaWarning",
+    "PinnedTransportFactory",
     "PreparedMedia",
     "PreparedMediaItem",
-    "PinnedTransportFactory",
     "PublicURLVerification",
     "StagedMedia",
     "VerifiedPrivateMedia",

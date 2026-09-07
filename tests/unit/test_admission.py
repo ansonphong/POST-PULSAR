@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from post_pulsar.admission import AdmissionError, DraftAdmissionService
+from post_pulsar.content import scan_inbox
+from post_pulsar.state import ConflictError, ProfileTargetSnapshot, StateRepository
+
 
 def test_darwin_atomic_exclusive_rename(monkeypatch, tmp_path):
     import post_pulsar.admission as admission
@@ -20,16 +29,6 @@ def test_darwin_atomic_exclusive_rename(monkeypatch, tmp_path):
     monkeypatch.setattr(admission.ctypes, "CDLL", lambda *a, **k: Libc())
     admission._rename_no_replace(tmp_path / "source", tmp_path / "target")
     assert calls == [(bytes(tmp_path / "source"), bytes(tmp_path / "target"), 4)]
-
-
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
-
-import pytest
-
-from post_pulsar.admission import AdmissionError, DraftAdmissionService
-from post_pulsar.content import scan_inbox
-from post_pulsar.state import ConflictError, ProfileTargetSnapshot, StateRepository
 
 
 def _repository(tmp_path: Path) -> StateRepository:
@@ -322,6 +321,9 @@ def test_daemon_replays_same_request_after_each_pre_ready_admission_crash(
         tmp_path / "control/endpoint.json",
         "127.0.0.1",
         0,
+        installation_id="1" * 32,
+        bootstrap_record_file=tmp_path / "control/bootstrap.json",
+        agent_capability_file=tmp_path / "control/agent-capability",
         recovery=recover,
         request_executor=execute,
         poll_seconds=0.001,

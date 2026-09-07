@@ -1,4 +1,3 @@
-# ruff: noqa: BLE001, C901, CPY001, PLR0911, PLR0912, PLR0913, PLR0915, PLR0917
 """Safe one-run orchestration for one immutable profile publication."""
 
 from __future__ import annotations

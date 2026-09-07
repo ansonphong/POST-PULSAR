@@ -7,11 +7,11 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal
 
 from filelock import FileLock, Timeout
 
-LockKind: TypeAlias = Literal["instance", "maintenance", "profiles"]
+type LockKind = Literal["instance", "maintenance", "profiles"]
 
 _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 

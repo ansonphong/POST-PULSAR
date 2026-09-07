@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -22,9 +22,9 @@ from post_pulsar.platforms.base import (
     RetryClassification,
 )
 
-RequestValue: TypeAlias = str | int | float | bool
-RequestStage: TypeAlias = Literal["read_only", "pre_final", "final"]
-FileValue: TypeAlias = tuple[str, bytes, str]
+type RequestValue = str | int | float | bool
+type RequestStage = Literal["read_only", "pre_final", "final"]
+type FileValue = tuple[str, bytes, str]
 
 _RETRYABLE_STATUS: Final = frozenset({408, 425, 429, 500, 502, 503, 504})
 _ALLOWED_METHODS: Final = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE"})

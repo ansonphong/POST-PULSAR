@@ -21,8 +21,8 @@ from post_pulsar.archive import (
 )
 from post_pulsar.content import scan_account_root
 from post_pulsar.locking import (
-    LockLease,
     LockContentionError,
+    LockLease,
     LockManager,
     LockOrderError,
 )
@@ -140,7 +140,7 @@ def _archive(
     replace: Callable[[Path, Path], None] = os.replace,
 ) -> BundleRecord:
     locks = LockManager(root / "state")
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - explicit lock order
         with locks.acquire_profiles(instance, ["operator"]) as profiles:
             return ArchiveManager(
                 repository, locks, fault_injector=fault, replace=replace
@@ -225,7 +225,7 @@ def test_forged_and_mutated_leases_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(LockOrderError, match="already-held"):
         locks.require_profile(forged_profiles, "operator")
 
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - explicit lock order
         with locks.acquire_profiles(instance, ["operator"]) as profiles:
             object.__setattr__(profiles, "resources", ("operator", "other"))
             with pytest.raises(LockOrderError, match="mutated"):
@@ -325,7 +325,7 @@ def test_recovers_staged_only_container(tmp_path: Path) -> None:
 def test_crash_after_source_quarantine_recovers_without_data_loss(
     tmp_path: Path,
 ) -> None:
-    repository, bundle_key, source = _make_repository(tmp_path)
+    repository, bundle_key, _source = _make_repository(tmp_path)
 
     def crash(boundary: str) -> None:
         if boundary == "after_member_reservation:post.txt":
@@ -697,7 +697,7 @@ def test_unexpected_member_blocks_without_using_prefix_or_glob_moves(
 def test_wrong_profile_lease_is_rejected_before_filesystem_work(tmp_path: Path) -> None:
     repository, bundle_key, source = _make_repository(tmp_path)
     locks = LockManager(tmp_path / "state")
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - explicit lock order
         with locks.acquire_profiles(instance, ["other-profile"]) as profiles:
             with pytest.raises(LockOrderError, match="does not own"):
                 ArchiveManager(repository, locks).archive_bundle(

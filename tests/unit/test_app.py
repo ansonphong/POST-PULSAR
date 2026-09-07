@@ -126,7 +126,7 @@ class ResumableRemoteAdapter(FakeAdapter):
         self.prepares += 1
         self.prior = prior
         self._calls.append(prior)
-        delivery = checkpoints.advance_phase("processing")
+        checkpoints.advance_phase("processing")
         if len(self._calls) == 1:
             checkpoints.checkpoint_artifact(
                 ArtifactCheckpoint(
@@ -1188,7 +1188,9 @@ def test_injected_boundary_releases_owned_resources_but_not_instance(
     assert instance.active
     assert all(adapter.closed for adapter in adapters)
     assert not any((tmp_path / "state/staging/private").rglob("*.jpg"))
-    with locks.acquire_profiles(instance, ("operator",)):
+    with locks.acquire_profiles(  # noqa: SIM117 - explicit lock lifetime
+        instance, ("operator",)
+    ):
         with StateRepository.open_existing(
             tmp_path / "state/post_pulsar.sqlite3"
         ) as repository:

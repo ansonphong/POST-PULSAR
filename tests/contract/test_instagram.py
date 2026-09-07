@@ -303,9 +303,11 @@ class _RepositoryWriter:
 
 
 def _client(
-    snapshot: PublicationSnapshot, token: str = "instagram-token"
+    snapshot: PublicationSnapshot, token: str | None = None
 ) -> PlatformHTTPClient:
-    return PlatformHTTPClient(snapshot, SecretValue(token), base_url=GRAPH)
+    return PlatformHTTPClient(
+        snapshot, SecretValue(token or "instagram-token"), base_url=GRAPH
+    )
 
 
 def _identity(router: respx.MockRouter, snapshot: PublicationSnapshot) -> None:

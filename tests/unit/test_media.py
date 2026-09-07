@@ -238,7 +238,9 @@ def test_open_descriptor_is_not_reused_across_profiles(tmp_path: Path) -> None:
     )
 
     assert first.items[0].private.relative_path != second.items[0].private.relative_path
-    with pytest.raises(MediaSafetyError, match="profile"):
+    with pytest.raises(  # noqa: SIM117 - error can be raised during inner cleanup
+        MediaSafetyError, match="profile"
+    ):
         with open_verified_private_media(
             first.items[0].private,
             tmp_path / "private",
@@ -268,11 +270,13 @@ def test_verified_private_stream_rejects_path_replacement_before_open(
         outside.write_bytes(original)
         path.symlink_to(outside)
 
-    with pytest.raises(
-        MediaSafetyError, match="opened safely|identity or hash|unsafe component"
+    with (
+        pytest.raises(
+            MediaSafetyError, match=r"opened safely|identity or hash|unsafe component"
+        ),
+        open_verified_private_media(staged, tmp_path / "private") as verified,
     ):
-        with open_verified_private_media(staged, tmp_path / "private") as verified:
-            verified.stream.read()
+        verified.stream.read()
 
 
 def test_verified_private_stream_keeps_open_identity_across_path_swap(
@@ -288,7 +292,9 @@ def test_verified_private_stream_keeps_open_identity_across_path_swap(
     staged = prepared.items[0].private
     path = tmp_path / "private" / staged.relative_path
 
-    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+    with pytest.raises(  # noqa: SIM117 - error is raised during inner cleanup
+        MediaSafetyError, match="consumed completely and unchanged"
+    ):
         with open_verified_private_media(staged, tmp_path / "private") as verified:
             captured = path.with_name("captured-original.png")
             path.rename(captured)
@@ -305,7 +311,9 @@ def test_verified_private_stream_rejects_incomplete_consumption(tmp_path: Path) 
         private_staging_directory=tmp_path / "private",
     )
 
-    with pytest.raises(MediaSafetyError, match="consumed completely"):
+    with pytest.raises(  # noqa: SIM117 - error is raised during inner cleanup
+        MediaSafetyError, match="consumed completely"
+    ):
         with open_verified_private_media(
             prepared.items[0].private, tmp_path / "private"
         ) as verified:
@@ -326,7 +334,9 @@ def test_verified_private_stream_detects_same_inode_rewrite_with_restored_mtime(
     path = tmp_path / "private" / staged.relative_path
     timestamps = path.stat()
 
-    with pytest.raises(MediaSafetyError, match="consumed completely and unchanged"):
+    with pytest.raises(  # noqa: SIM117 - error is raised during inner cleanup
+        MediaSafetyError, match="consumed completely and unchanged"
+    ):
         with open_verified_private_media(staged, tmp_path / "private") as verified:
             assert verified.stream.read() == original
             path.chmod(0o600)

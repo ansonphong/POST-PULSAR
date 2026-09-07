@@ -12,14 +12,14 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Final, Literal, TypeAlias, cast
+from typing import Final, Literal, cast
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from post_pulsar.secure_files import RecordPolicy, SecureFileError
 
-TargetName: TypeAlias = Literal["x", "instagram"]
-DeploymentMode: TypeAlias = Literal["simple", "hardened"]
+type TargetName = Literal["x", "instagram"]
+type DeploymentMode = Literal["simple", "hardened"]
 
 _TARGETS: Final = frozenset({"x", "instagram"})
 _PROFILE_ID_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
@@ -777,7 +777,7 @@ def _validated_media_base_url(value: str, section: str) -> str:
         ipaddress.ip_address(hostname)
     except ValueError:
         if hostname == "localhost" or hostname.endswith(".localhost"):
-            raise ConfigurationError(f"{label} must use a public hostname")
+            raise ConfigurationError(f"{label} must use a public hostname") from None
     else:
         raise ConfigurationError(f"{label} must not contain an IP literal")
 

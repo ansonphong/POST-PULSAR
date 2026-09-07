@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Social media publishing automation"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { file = "LICENSE.md" }
+license = "GPL-3.0-only"
+license-files = ["LICENSE.md"]
 authors = [{ name = "Anson Phong" }]
 dependencies = [
     "filelock>=3.32.5,<4",
@@ -62,6 +63,9 @@ exclude-newer = "2026-09-06T00:00:00Z"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+post_pulsar = ["py.typed"]
 
 [tool.ruff]
 target-version = "py312"

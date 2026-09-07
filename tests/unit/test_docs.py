@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -95,8 +94,7 @@ def test_readme_documents_only_implemented_surfaces() -> None:
         assert text in readme
 
     active_docs = "\n".join(
-        _read(name)
-        for name in ("README.md", "SECURITY.md", "MODERNIZATION_REPORT.md")
+        _read(name) for name in ("README.md", "SECURITY.md", "MODERNIZATION_REPORT.md")
     )
     prohibited = (
         r"(?i)support(?:s|ed)?\s+(?:for\s+)?(?:meta\s+)?threads",
@@ -167,5 +165,7 @@ def test_license_keeps_gpl3_and_ansons_authorship() -> None:
 def test_license_active_notice_uses_post_pulsar_identity() -> None:
     license_text = _read("LICENSE.md")
     active_notice = license_text.split("```", 2)[1]
-    assert "POST PULSAR - For automatic random posting to social media." in active_notice
+    assert (
+        "POST PULSAR - For automatic random posting to social media." in active_notice
+    )
     assert "PHONG-BOT" not in active_notice

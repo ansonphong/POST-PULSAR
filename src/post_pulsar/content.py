@@ -11,10 +11,10 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Final, Literal, Protocol, TypeAlias, cast
+from typing import BinaryIO, Final, Literal, Protocol, cast
 
 IssueSeverity = Literal["error", "warning"]
-SourceBucket: TypeAlias = Literal["QUEUE", "RANDOM", "REELS"]
+type SourceBucket = Literal["QUEUE", "RANDOM", "REELS"]
 
 _BUNDLE_ID_RE: Final = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?\Z")
 _ORDINAL_RE: Final = re.compile(r"(?P<bundle_id>.+)-(?P<ordinal>[0-9]+)\Z")
@@ -1070,7 +1070,7 @@ def _open_regular(path: Path) -> BinaryIO:
         guarded_flags = flags if no_follow is None else flags | no_follow
         return os.open(filename, guarded_flags)
 
-    source = open(path, "rb", opener=opener)
+    source = open(path, "rb", opener=opener)  # noqa: SIM115 - returned after checks
     try:
         opened = os.fstat(source.fileno())
         after = os.lstat(path)

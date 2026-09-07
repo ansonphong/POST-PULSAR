@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Literal, Protocol, TypeAlias, cast
+from typing import Final, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 
 from post_pulsar.media import (
@@ -59,9 +59,9 @@ class InstagramAdapterError(AdapterContractError):
         self.retry_classification = retry_classification
 
 
-PublicMediaVerifier: TypeAlias = Callable[[StagedMedia], PublicURLVerification]
-CleanupOutcome: TypeAlias = Literal["published", "failed", "ambiguous"]
-PublicMediaCleaner: TypeAlias = Callable[[StagedMedia, CleanupOutcome], bool]
+type PublicMediaVerifier = Callable[[StagedMedia], PublicURLVerification]
+type CleanupOutcome = Literal["published", "failed", "ambiguous"]
+type PublicMediaCleaner = Callable[[StagedMedia, CleanupOutcome], bool]
 
 
 class WarningCheckpointWriter(Protocol):
@@ -1004,6 +1004,6 @@ __all__ = [
     "InstagramAdapter",
     "InstagramAdapterError",
     "PublicMediaCleaner",
-    "PublishingQuota",
     "PublicMediaVerifier",
+    "PublishingQuota",
 ]

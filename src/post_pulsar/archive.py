@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import errno
 import ctypes
+import errno
 import hashlib
 import os
 import stat
@@ -915,7 +915,7 @@ def _content_fingerprint(
     return digest.hexdigest()
 
 
-def _hash_field(digest: "hashlib._Hash", value: bytes) -> None:
+def _hash_field(digest: hashlib._Hash, value: bytes) -> None:
     digest.update(len(value).to_bytes(8, "big"))
     digest.update(value)
 

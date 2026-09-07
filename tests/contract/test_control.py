@@ -654,10 +654,7 @@ def test_profile_cursor_schema_matches_page_two_behavior(tmp_path: Path) -> None
     }
     assert parameters["Cursor"]["schema"] == {"type": "integer", "minimum": 0}
     for route in ("/schedules", "/requests"):
-        refs = {
-            item["$ref"]
-            for item in document["paths"][route]["get"]["parameters"]
-        }
+        refs = {item["$ref"] for item in document["paths"][route]["get"]["parameters"]}
         assert "#/components/parameters/Cursor" in refs
         assert "#/components/parameters/ProfileCursor" not in refs
 
@@ -689,9 +686,7 @@ def test_profile_cursor_schema_matches_page_two_behavior(tmp_path: Path) -> None
     )
     second_page = json.loads(second.body)["data"]
     assert second.status == 200
-    assert [item["profile_id"] for item in second_page["items"]] == [
-        "second-profile"
-    ]
+    assert [item["profile_id"] for item in second_page["items"]] == ["second-profile"]
     assert second_page["next_cursor"] == "second-profile"
 
 

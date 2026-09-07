@@ -37,7 +37,6 @@ from post_pulsar.state import (
     TargetSnapshot,
 )
 
-
 NOW = datetime(2026, 9, 5, 12, tzinfo=UTC)
 FINGERPRINT = "a" * 64
 
@@ -352,7 +351,7 @@ def test_wrong_identity_blocks_before_any_mutation(tmp_path: Path) -> None:
         return httpx.Response(200, json={"data": {"id": "999", "username": "intruder"}})
 
     post = request(tmp_path, ("image",))
-    with adapter(tmp_path, handler) as target:
+    with adapter(tmp_path, handler) as target:  # noqa: SIM117 - ordered cleanup
         with pytest.raises(AdapterContractError, match="identity"):
             target.prepare(post, prior=None, checkpoints=Writer())
     assert calls == ["/2/users/me"]
@@ -606,7 +605,7 @@ def test_x_processing_failures_have_explicit_retry_classification(
         "processing_timeout_seconds": 30,
     }
     publication = request(tmp_path, ("video",), settings=settings)
-    with adapter(tmp_path, handler, settings=settings) as target:
+    with adapter(tmp_path, handler, settings=settings) as target:  # noqa: SIM117
         with pytest.raises(XAdapterError, match=message) as caught:
             target.prepare(publication, prior=None, checkpoints=Writer())
 
@@ -1055,11 +1054,13 @@ def test_commit_rejects_unfinished_chunked_artifact_from_real_state(
             return identity_response()
         raise AssertionError("final create must not run for unfinished media")
 
-    with adapter(
-        tmp_path, handler, settings={"chunk_size_bytes": 4}, clock=timer
-    ) as target:
-        with pytest.raises(AdapterContractError, match="not ready"):
-            target.commit(prepared, delivery=final)
+    with (
+        adapter(
+            tmp_path, handler, settings={"chunk_size_bytes": 4}, clock=timer
+        ) as target,
+        pytest.raises(AdapterContractError, match="not ready"),
+    ):
+        target.commit(prepared, delivery=final)
     assert calls == ["/2/users/me"]
 
 
@@ -1111,7 +1112,9 @@ def test_processing_deadline_is_checkpointed_and_not_reset_on_resume(
             )
         raise AssertionError(req.url)
 
-    with adapter(tmp_path, handler, settings=settings, clock=timer) as first:
+    with adapter(  # noqa: SIM117 - ordered cleanup
+        tmp_path, handler, settings=settings, clock=timer
+    ) as first:
         with pytest.raises(XAdapterError, match="timed out") as first_error:
             first.prepare(publication, prior=None, checkpoints=writer)
     assert first_error.value.retry_classification == "safe_pre_final"
@@ -1127,7 +1130,9 @@ def test_processing_deadline_is_checkpointed_and_not_reset_on_resume(
             sorted(writer.records.values(), key=lambda item: (item.kind, item.ordinal))
         ),
     )
-    with adapter(tmp_path, handler, settings=settings, clock=timer) as resumed:
+    with adapter(  # noqa: SIM117 - ordered cleanup
+        tmp_path, handler, settings=settings, clock=timer
+    ) as resumed:
         with pytest.raises(XAdapterError, match="timed out") as resumed_error:
             resumed.prepare(publication, prior=prior, checkpoints=Writer())
     assert resumed_error.value.retry_classification == "safe_pre_final"
@@ -1180,7 +1185,9 @@ def test_processing_retry_after_cannot_overrun_monotonic_deadline(
         "processing_timeout_seconds": 5,
     }
     publication = request(tmp_path, ("video",), settings=settings)
-    with adapter(tmp_path, handler, settings=settings, clock=timer) as target:
+    with adapter(  # noqa: SIM117 - ordered cleanup
+        tmp_path, handler, settings=settings, clock=timer
+    ) as target:
         with pytest.raises(XAdapterError, match="timed out") as caught:
             target.prepare(publication, prior=None, checkpoints=Writer())
     assert caught.value.retry_classification == "safe_pre_final"

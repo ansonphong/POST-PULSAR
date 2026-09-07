@@ -1054,9 +1054,12 @@ def _emoji_cluster_end(value: str, start: int) -> int:
     if not _is_emoji_base(value, start):
         return start
     index = _consume_emoji_suffix(value, start + 1)
-    if 0x1F1E6 <= ord(value[start]) <= 0x1F1FF and index < len(value):
-        if 0x1F1E6 <= ord(value[index]) <= 0x1F1FF:
-            index = _consume_emoji_suffix(value, index + 1)
+    if (
+        0x1F1E6 <= ord(value[start]) <= 0x1F1FF
+        and index < len(value)
+        and 0x1F1E6 <= ord(value[index]) <= 0x1F1FF
+    ):
+        index = _consume_emoji_suffix(value, index + 1)
     while index + 1 < len(value) and value[index] == "\u200d":
         if not _is_emoji_base(value, index + 1):
             break

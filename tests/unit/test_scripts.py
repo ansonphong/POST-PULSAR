@@ -45,8 +45,10 @@ def _read(relative: str) -> str:
 def _windows_path(path: Path) -> str:
     if os.name == "nt":
         return str(path)
-    return subprocess.run(
-        ["wslpath", "-w", str(path)],
+    wslpath = shutil.which("wslpath")
+    assert wslpath is not None
+    return subprocess.run(  # noqa: S603 - resolved trusted system utility
+        [wslpath, "-w", str(path)],
         check=True,
         capture_output=True,
         text=True,
@@ -72,7 +74,7 @@ def _run_batch(
     command_processor = shutil.which("cmd.exe")
     assert command_processor is not None
     expected_stub = _windows_path(Path(run_env["POST_PULSAR_SCHTASKS_STUB"]))
-    resolution = subprocess.run(
+    resolution = subprocess.run(  # noqa: S603 - resolved command processor
         [command_processor, "/d", "/c", "where", "schtasks"],
         cwd=path.parent,
         env=run_env,
@@ -83,7 +85,7 @@ def _run_batch(
     )
     assert resolution.returncode == 0, resolution.stderr
     assert resolution.stdout.splitlines()[0].casefold() == expected_stub.casefold()
-    probe = subprocess.run(
+    probe = subprocess.run(  # noqa: S603 - stub-first PATH verified below
         [command_processor, "/d", "/c", "call", "schtasks", "/post-pulsar-stub-probe"],
         cwd=path.parent,
         env=run_env,
@@ -94,7 +96,7 @@ def _run_batch(
     )
     assert probe.returncode == 0
     assert probe.stdout.strip() == "POST_PULSAR_SCHTASKS_STUB_PROBE"
-    return subprocess.run(
+    return subprocess.run(  # noqa: S603 - resolved command and fixed batch path
         [command_processor, "/d", "/c", "call", _windows_path(path), *arguments],
         cwd=path.parent,
         env=run_env,
@@ -253,7 +255,7 @@ def test_posix_launcher_resolves_spaces_forwards_args_and_returns_exit() -> None
             encoding="utf-8",
         )
         interpreter.chmod(0o755)
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - repository launcher fixture
             [launcher, "status", "--profile", "profile-one"],
             cwd=ROOT.parent,
             env={**os.environ, "POST_PULSAR_CAPTURE": str(capture)},
@@ -280,8 +282,10 @@ def test_posix_setup_rejects_windows_venv_without_deleting_it() -> None:
         foreign_python = install / ".venv/Scripts/python.exe"
         foreign_python.parent.mkdir(parents=True)
         foreign_python.write_bytes(b"foreign-layout")
-        result = subprocess.run(
-            ["bash", str(install / "setup-post-pulsar.sh")],
+        bash = shutil.which("bash")
+        assert bash is not None
+        result = subprocess.run(  # noqa: S603 - resolved trusted system utility
+            [bash, str(install / "setup-post-pulsar.sh")],
             capture_output=True,
             text=True,
             check=False,

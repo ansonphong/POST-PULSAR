@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO, Final, Literal, Protocol, cast
 from urllib.parse import quote
 
-from post_pulsar.archive import (  # noqa: PLC2701
+from post_pulsar.archive import (
     _atomic_noreplace,
     _DirectoryGuard,
     _fsync_guard,
@@ -164,7 +164,7 @@ def migrate_legacy_layout(
 
     injector = cast(MigrationFaultInjector | None, fault_injector)
     locks = LockManager(state_root)
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - lock order is explicit
         with locks.acquire_maintenance(instance) as maintenance:
             with locks.acquire_profiles(
                 instance, (selected_profile_id,), maintenance=maintenance
@@ -985,7 +985,7 @@ def _validate_bound_recovery_state(
         "selection_counters",
     )
     if any(
-        int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])  # noqa: S608 - closed constant table set
         for table in forbidden_tables
     ):
         raise MigrationError("migration recovery state contains unrelated records")

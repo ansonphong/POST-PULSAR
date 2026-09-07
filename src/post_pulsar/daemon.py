@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from post_pulsar.control import CONTROL_SCHEMA, ControlApplication, ControlRequest
 from post_pulsar.control_identity import DaemonIdentity, DiscoveryPaths
@@ -31,7 +31,8 @@ RequestExecutor = Callable[[RunRequestRecord], Mapping[str, object]]
 
 
 class _Server(Protocol):
-    server_address: tuple[object, ...]
+    @property
+    def server_address(self) -> tuple[object, ...]: ...
 
     def serve_forever(self) -> None: ...
     def shutdown(self) -> None: ...
@@ -244,7 +245,7 @@ class ForegroundDaemon:
 
     def run_forever(self) -> None:
         """Start and block until SIGINT/SIGTERM requests an orderly stop."""
-        previous: dict[int, object] = {}
+        previous: dict[signal.Signals, object] = {}
 
         def request_stop(_signum: int, _frame: object) -> None:
             # Signal handlers can interrupt code holding the claim gate on this
@@ -428,7 +429,7 @@ def _handler_for(
                 "origin",
                 "expect",
             }
-            for name in self.headers.keys():
+            for name in self.headers:
                 if (
                     name.lower() in singleton_headers
                     or name.lower().startswith("x-post-pulsar-")
@@ -480,8 +481,8 @@ def _make_http_server(
         class IPv6HTTPServer(HTTPServer):
             address_family = socket.AF_INET6
 
-        return IPv6HTTPServer(address, handler, bind_and_activate=True)
-    return HTTPServer(address, handler, bind_and_activate=True)
+        return cast(_Server, IPv6HTTPServer(address, handler, bind_and_activate=True))
+    return cast(_Server, HTTPServer(address, handler, bind_and_activate=True))
 
 
 def _record_process_is_live(record: EndpointRecord) -> bool:

@@ -9,9 +9,11 @@ import re
 import stat
 import sys
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 
 class SecureFileError(RuntimeError):
@@ -142,6 +144,12 @@ def _core_group(policy: RecordPolicy) -> int:
     return pwd.getpwuid(int(policy.core_principal)).pw_gid
 
 
+def _agent_group(policy: RecordPolicy) -> int:
+    if policy.agent_group is None:
+        raise SecureFileError("hardened POSIX agent group is unavailable")
+    return policy.agent_group
+
+
 def _validate_directory(
     path: Path, policy: RecordPolicy, *, agent_read: bool = True
 ) -> None:
@@ -224,7 +232,7 @@ def secure_directory(path: Path, *, policy: RecordPolicy | None = None) -> None:
                 _windows_create_directory(path, policy=policy)
             else:
                 path.mkdir(mode=0o700)
-                os.chown(path, int(policy.core_principal), policy.agent_group)
+                os.chown(path, int(policy.core_principal), _agent_group(policy))
                 path.chmod(0o750)
         _validate_directory(path, policy)
         return
@@ -291,7 +299,7 @@ def atomic_owner_write(
                 os.fchown(
                     descriptor,
                     int(policy.core_principal),
-                    policy.agent_group if agent_read else _core_group(policy),
+                    _agent_group(policy) if agent_read else _core_group(policy),
                 )
             os.fchmod(descriptor, 0o640 if policy is not None and agent_read else 0o600)
         with os.fdopen(descriptor, "wb") as stream:
@@ -312,14 +320,15 @@ def atomic_owner_write(
         temporary.unlink(missing_ok=True)
 
 
-def _windows_api():
+def _windows_api() -> tuple[Any, Any]:
     """Declare pointer-sized Win32 security signatures; never invoke a shell."""
     from ctypes import wintypes as w
 
-    adv = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    win_dll = cast(Any, getattr(ctypes, "WinDLL"))  # noqa: B009 - absent on POSIX
+    adv = win_dll("advapi32", use_last_error=True)
+    kernel = win_dll("kernel32", use_last_error=True)
     pointer = ctypes.c_void_p
-    signatures = {
+    signatures: dict[str, tuple[list[Any], Any]] = {
         "OpenProcessToken": ([w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)], w.BOOL),
         "GetTokenInformation": (
             [w.HANDLE, ctypes.c_int, pointer, w.DWORD, ctypes.POINTER(w.DWORD)],
@@ -506,7 +515,7 @@ def _windows_sddl(
 @contextmanager
 def _windows_descriptor(
     directory: bool, policy: RecordPolicy | None = None, *, agent_read: bool = True
-):
+) -> Iterator[tuple[Any, Any, ctypes.c_void_p, ctypes.c_void_p]]:
     from ctypes import wintypes as w
 
     adv, kernel = _windows_api()
@@ -652,7 +661,8 @@ def _windows_validate(
             for index in range(size.count):
                 ace = ctypes.c_void_p()
                 _win_check(adv.GetAce(dacl, index, ctypes.byref(ace)))
-                header = AceHeader.from_address(ace.value)
+                ace_address = cast(int, ace.value)
+                header = AceHeader.from_address(ace_address)
                 _win_check(header.size >= ctypes.sizeof(AceHeader) + 8)
                 if policy is None:
                     _win_check(
@@ -660,13 +670,14 @@ def _windows_validate(
                         and not header.flags & 0x18
                         and header.mask == 0x1F01FF
                     )
-                    _win_check(adv.EqualSid(ctypes.c_void_p(ace.value + 8), sid))
+                    _win_check(adv.EqualSid(ctypes.c_void_p(ace_address + 8), sid))
                 else:
                     expected_ace = ctypes.c_void_p()
                     _win_check(
                         adv.GetAce(expected_acl, index, ctypes.byref(expected_ace))
                     )
-                    expected_header = AceHeader.from_address(expected_ace.value)
+                    expected_address = cast(int, expected_ace.value)
+                    expected_header = AceHeader.from_address(expected_address)
                     _win_check(
                         header.kind == 0
                         and header.flags == expected_header.flags
@@ -675,8 +686,8 @@ def _windows_validate(
                     )
                     _win_check(
                         adv.EqualSid(
-                            ctypes.c_void_p(ace.value + 8),
-                            ctypes.c_void_p(expected_ace.value + 8),
+                            ctypes.c_void_p(ace_address + 8),
+                            ctypes.c_void_p(expected_address + 8),
                         )
                     )
         finally:

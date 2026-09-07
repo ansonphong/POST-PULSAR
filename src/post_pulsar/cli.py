@@ -44,6 +44,7 @@ from post_pulsar.config import (
     load_local_settings,
     validate_publishing_credentials,
 )
+from post_pulsar.content import SourceBucket
 from post_pulsar.locking import LockContentionError, LockError, LockManager
 from post_pulsar.migration import MigrationError, migrate_legacy_layout
 from post_pulsar.platforms.base import (
@@ -67,6 +68,8 @@ from post_pulsar.state import (
 if TYPE_CHECKING:
     from post_pulsar.control import ControlRequest, ControlResponse
     from post_pulsar.daemon import EndpointRecord, ForegroundDaemon
+    from post_pulsar.scheduler import ScheduledWork
+    from post_pulsar.secure_files import RecordPolicy
 
 CONTROL_API_MAJOR: Final = 1
 CONTROL_SCHEMA: Final = "post-pulsar.control/v1"
@@ -1228,7 +1231,7 @@ def _daemon_foreground(
             raise StateError("daemon instance lease is unavailable")
         for bundle in protected:
 
-            def recover_bundle() -> None:
+            def recover_bundle(bundle: BundleRecord = bundle) -> None:
                 try:
                     OneRunApplication(
                         settings.config_path,
@@ -1273,7 +1276,7 @@ def _daemon_foreground(
             raise StateError("daemon instance lease is unavailable")
         for item in work:
 
-            def dispatch_occurrence() -> None:
+            def dispatch_occurrence(item: ScheduledWork = item) -> None:
                 try:
                     OneRunApplication(
                         settings.config_path,
@@ -1285,7 +1288,7 @@ def _daemon_foreground(
                     ).run_once(
                         RunOnceRequest(
                             item.profile_id,
-                            item.bucket,
+                            cast(SourceBucket, item.bucket),
                             f"schedule-{item.run_id}",
                             schedule_run_id=item.run_id,
                         )
@@ -1674,7 +1677,7 @@ def _request_platform(request: RunRequestRecord) -> Platform:
     value = request.arguments.get("platform")
     if value not in {"x", "instagram"}:
         raise StateError("durable request platform is invalid")
-    return cast(Platform, value)
+    return value
 
 
 def _migrate(
@@ -1845,7 +1848,9 @@ def _secret_input(stream: IO[str]) -> IO[str] | _GetpassInput:
     return _GetpassInput(stream) if stream is sys.stdin else stream
 
 
-def _assert_owner_file(path: Path, label: str, *, policy=None) -> None:
+def _assert_owner_file(
+    path: Path, label: str, *, policy: RecordPolicy | None = None
+) -> None:
     from post_pulsar.control import ControlSecurityError
     from post_pulsar.secure_files import SecureFileError, assert_owner_file
 

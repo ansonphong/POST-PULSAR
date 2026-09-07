@@ -14,21 +14,21 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
-from typing import Final, Literal, TypeAlias, cast
+from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-Platform: TypeAlias = Literal["x", "instagram"]
-SourceBucket: TypeAlias = Literal["QUEUE", "RANDOM", "REELS"]
-BundleStatus: TypeAlias = Literal[
+type Platform = Literal["x", "instagram"]
+type SourceBucket = Literal["QUEUE", "RANDOM", "REELS"]
+type BundleStatus = Literal[
     "active", "blocked", "archiving", "archived", "cancelled", "deleted"
 ]
-DeliveryStatus: TypeAlias = Literal[
+type DeliveryStatus = Literal[
     "pending", "in_flight", "published", "failed", "ambiguous"
 ]
-DeliveryPhase: TypeAlias = Literal[
+type DeliveryPhase = Literal[
     "preparing", "processing", "ready", "final_dispatch_started"
 ]
-ScheduleRunState: TypeAlias = Literal[
+type ScheduleRunState = Literal[
     "queued",
     "due",
     "missed",
@@ -182,7 +182,7 @@ _SCHEDULE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 # The HTTP schema and durable validation share the same action argument contract.
-_ARGUMENT_FIELDS: Final = {
+_ARGUMENT_FIELDS: Final[dict[str, dict[str, object]]] = {
     "bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
     "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "bucket": {"type": "string", "enum": ["QUEUE", "RANDOM", "REELS"]},
@@ -211,7 +211,7 @@ _ARGUMENT_FIELDS: Final = {
     "enabled": {"type": "boolean"},
     "text": {"type": "string", "maxLength": 10000},
 }
-_ACTION_FIELDS: Final = {
+_ACTION_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "admit_draft": ("bucket", "bundle_id"),
     "enqueue": ("bucket", "bundle_id", "fingerprint", "trigger_id"),
     "run_now": ("bucket", "bundle_id", "fingerprint", "trigger_id"),
@@ -245,7 +245,7 @@ _ACTION_FIELDS: Final = {
     "edit_caption": ("bucket", "bundle_id", "fingerprint", "text"),
     "edit_alt": ("bucket", "bundle_id", "fingerprint", "text"),
 }
-REQUEST_ARGUMENT_SCHEMAS: Final = {
+REQUEST_ARGUMENT_SCHEMAS: Final[dict[str, dict[str, object]]] = {
     action: {
         "type": "object",
         "additionalProperties": False,
@@ -265,16 +265,18 @@ REQUEST_ARGUMENT_SCHEMAS: Final = {
 
 def validate_action_arguments(action: str, arguments: object) -> None:
     schema = REQUEST_ARGUMENT_SCHEMAS.get(action)
+    required = () if schema is None else cast(list[str], schema["required"])
     if (
         schema is None
         or not isinstance(arguments, dict)
-        or set(arguments) != set(schema["required"])
+        or set(arguments) != set(required)
     ):
         raise StateValidationError("action arguments do not match the exact contract")
+    properties = cast(dict[str, Mapping[str, object]], schema["properties"])
     for field, value in arguments.items():
-        _validate_argument_value(value, schema["properties"][field])
+        _validate_argument_value(value, properties[field])
     if action in {"schedule_create", "schedule_update"}:
-        _validate_timezone(arguments["timezone"])
+        _validate_timezone(cast(str, arguments["timezone"]))
 
 
 def _validate_argument_value(value: object, schema: Mapping[str, object]) -> None:
@@ -282,7 +284,7 @@ def _validate_argument_value(value: object, schema: Mapping[str, object]) -> Non
         valid = value == schema["const"]
     else:
         types = schema["type"]
-        allowed = [types] if isinstance(types, str) else types
+        allowed = [types] if isinstance(types, str) else cast(list[object], types)
         kind = (
             "null"
             if value is None
@@ -295,26 +297,33 @@ def _validate_argument_value(value: object, schema: Mapping[str, object]) -> Non
         raise StateValidationError("action argument type is invalid")
     if value is None:
         return
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and value not in cast(list[object], schema["enum"]):
         raise StateValidationError("action argument value is invalid")
     if isinstance(value, str):
         if (
-            not schema.get("minLength", 0)
+            not cast(int, schema.get("minLength", 0))
             <= len(value)
-            <= schema.get("maxLength", 10000)
+            <= cast(int, schema.get("maxLength", 10000))
         ):
             raise StateValidationError("action argument length is invalid")
-        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+        if (
+            "pattern" in schema
+            and re.fullmatch(cast(str, schema["pattern"]), value) is None
+        ):
             raise StateValidationError("action argument format is invalid")
-    if type(value) is int and not schema.get("minimum", 0) <= value <= schema.get(
-        "maximum", 86400
+    if type(value) is int and not cast(int, schema.get("minimum", 0)) <= value <= cast(
+        int, schema.get("maximum", 86400)
     ):
         raise StateValidationError("action argument bound is invalid")
     if isinstance(value, list):
-        if not schema["minItems"] <= len(value) <= schema["maxItems"]:
+        if (
+            not cast(int, schema["minItems"])
+            <= len(value)
+            <= cast(int, schema["maxItems"])
+        ):
             raise StateValidationError("action argument array length is invalid")
         for item in value:
-            _validate_argument_value(item, schema["items"])
+            _validate_argument_value(item, cast(Mapping[str, object], schema["items"]))
         if schema.get("uniqueItems") and len(set(value)) != len(value):
             raise StateValidationError("action argument array contains duplicates")
 
@@ -4608,7 +4617,7 @@ class StateRepository:
         )
         if stored_request != expected_request:
             raise ConflictError("admission durable request binding drift")
-        return request
+        return cast(sqlite3.Row, request)
 
     def _reset_rolled_back_admission_locked(self, journal: sqlite3.Row) -> None:
         """Replace a fully rolled-back attempt without changing the canonical schema.
@@ -5705,11 +5714,12 @@ def _random_selection_score(
 
 
 __all__ = [
+    "SCHEMA_VERSION",
     "AdmissionMemberRecord",
     "AdmissionRecord",
     "ArtifactRecord",
-    "BundleFileSnapshot",
     "BundleAdmissionCandidate",
+    "BundleFileSnapshot",
     "BundleRecord",
     "ConfirmationIntentRecord",
     "ConflictError",
@@ -5719,7 +5729,6 @@ __all__ = [
     "ProfileRecord",
     "ProfileTargetSnapshot",
     "RunRequestRecord",
-    "SCHEMA_VERSION",
     "ScheduleRecord",
     "ScheduleRunRecord",
     "StateError",

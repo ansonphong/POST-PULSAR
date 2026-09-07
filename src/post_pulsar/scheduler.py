@@ -166,7 +166,7 @@ class DeterministicScheduler:
         new_work: list[ScheduledWork] = []
         for schedule in self._repository.list_enabled_schedules():
 
-            def admit_occurrence() -> None:
+            def admit_occurrence(schedule: ScheduleRecord = schedule) -> None:
                 current_pause = getattr(
                     self._repository, "get_pause_state", lambda: None
                 )()

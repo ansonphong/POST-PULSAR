@@ -218,17 +218,19 @@ def test_read_only_retry_budget_caps_retry_after_and_aborts_before_repeat() -> N
         route = router.get("https://api.example.test/status").mock(
             return_value=httpx.Response(429, headers={"Retry-After": "60"})
         )
-        with PlatformHTTPClient(
-            _snapshot(),
-            SecretValue("budget-token"),
-            base_url="https://api.example.test",
-            policy=HTTPPolicy(max_pre_final_attempts=3),
-            sleeper=sleep,
-        ) as client:
-            with pytest.raises(PlatformHTTPError, match="retry budget"):
-                client.read_only_request(
-                    "GET", "/status", retry_budget_seconds=lambda: remaining
-                )
+        with (
+            PlatformHTTPClient(
+                _snapshot(),
+                SecretValue("budget-token"),
+                base_url="https://api.example.test",
+                policy=HTTPPolicy(max_pre_final_attempts=3),
+                sleeper=sleep,
+            ) as client,
+            pytest.raises(PlatformHTTPError, match="retry budget"),
+        ):
+            client.read_only_request(
+                "GET", "/status", retry_budget_seconds=lambda: remaining
+            )
 
     assert sleeps == [3.0]
     assert route.call_count == 1
@@ -466,11 +468,13 @@ def test_wrong_remote_or_publication_identity_blocks_before_mutation() -> None:
 
 
 def test_unmocked_socket_attempt_fails_closed_with_sanitized_error() -> None:
-    with PlatformHTTPClient(
-        _snapshot(),
-        SecretValue("socket-token"),
-        base_url="https://unmocked.invalid",
-        policy=HTTPPolicy(max_pre_final_attempts=1),
-    ) as client:
-        with pytest.raises(SocketBlockedError):
-            client.read_only_request("GET", "/me")
+    with (
+        PlatformHTTPClient(
+            _snapshot(),
+            SecretValue("socket-token"),
+            base_url="https://unmocked.invalid",
+            policy=HTTPPolicy(max_pre_final_attempts=1),
+        ) as client,
+        pytest.raises(SocketBlockedError),
+    ):
+        client.read_only_request("GET", "/me")

@@ -24,8 +24,11 @@ from post_pulsar.secure_files import RecordPolicy
 from post_pulsar.state import (
     SCHEMA_VERSION,
     BundleRecord,
+    ConfirmationIntentRecord,
     ConflictError,
     ProfileRecord,
+    RunRequestRecord,
+    ScheduleRecord,
     StateError,
     StateRepository,
     StateValidationError,
@@ -421,12 +424,12 @@ class ControlApplication:
             matches = [item for item in scan.bundles if item.bundle_id == route[5]]
             if len(matches) != 1:
                 raise StateValidationError("bundle is missing or ambiguous")
-            bundle = matches[0]
+            content_bundle = matches[0]
             return {
                 "profile_id": route[1],
                 "bucket": bucket,
-                "bundle_id": bundle.bundle_id,
-                "fingerprint": bundle.fingerprint,
+                "bundle_id": content_bundle.bundle_id,
+                "fingerprint": content_bundle.fingerprint,
                 "members": [
                     {
                         "name": item.relative_name,
@@ -437,31 +440,31 @@ class ControlApplication:
                         "size_bytes": item.size_bytes,
                         "sha256": item.sha256,
                     }
-                    for item in bundle.member_snapshots
+                    for item in content_bundle.member_snapshots
                 ],
                 "preview": len(route) == 7 and route[6] == "preview",
             }, 200
         if method == "GET" and route == ("schedules",):
             profile_id = _required_profile_query(query)
-            values = repository.list_schedules(
+            schedules = repository.list_schedules(
                 profile_id=profile_id,
                 after_schedule_key=_query_cursor(query),
                 limit=_page_limit(query, self._max_results),
             )
             return _page(
-                [_schedule(item) for item in values],
-                values[-1].schedule_key if values else None,
+                [_schedule(item) for item in schedules],
+                schedules[-1].schedule_key if schedules else None,
             ), 200
         if method == "GET" and route == ("requests",):
             profile_id = _required_profile_query(query)
-            values = repository.list_run_requests(
+            requests = repository.list_run_requests(
                 profile_id=profile_id,
                 after_request_id=_query_cursor(query),
                 limit=_page_limit(query, self._max_results),
             )
             return _page(
-                [_request(item) for item in values],
-                values[-1].request_id if values else None,
+                [_request(item) for item in requests],
+                requests[-1].request_id if requests else None,
             ), 200
         if method == "GET" and len(route) == 2 and route[0] == "requests":
             return _request(repository.get_run_request(_positive(route[1]))), 200
@@ -619,12 +622,12 @@ class ControlApplication:
                 schedule_key=_optional_integer(body, "schedule_key"),
             )
             return _request(result), 202
-        action = _action_for_route(method, route, body)
-        if action is not None:
+        requested_action = _action_for_route(method, route, body)
+        if requested_action is not None:
             key, revision = _write_headers(headers)
-            if action in {"edit_caption", "edit_alt"}:
+            if requested_action in {"edit_caption", "edit_alt"}:
                 _exact_body(body, {"text"}, {"text"})
-            elif action == "admit_draft":
+            elif requested_action == "admit_draft":
                 _exact_body(body, {"arguments"}, {"arguments"})
             else:
                 _exact_body(
@@ -639,7 +642,7 @@ class ControlApplication:
             )
             arguments = dict(_object(body, "arguments", default={}))
             if len(route) >= 6 and route[0] == "profiles":
-                if action in {"edit_caption", "edit_alt"}:
+                if requested_action in {"edit_caption", "edit_alt"}:
                     arguments.update({"bucket": route[3], "bundle_id": route[5]})
                 elif arguments.get("bundle_id") != route[5]:
                     raise StateValidationError("draft path and body identity disagree")
@@ -648,7 +651,7 @@ class ControlApplication:
                     if not isinstance(text_value, str) or len(text_value) > 10000:
                         raise StateValidationError("text is invalid")
                     arguments["text"] = text_value
-                if action in {"edit_caption", "edit_alt"}:
+                if requested_action in {"edit_caption", "edit_alt"}:
                     draft_scan = scan_inbox(
                         repository.get_profile(profile_id).account_root / "DRAFTS"
                     )
@@ -668,9 +671,9 @@ class ControlApplication:
                 if schedule_key != route_schedule_key:
                     raise StateValidationError("schedule path and body keys disagree")
                 schedule_key = route_schedule_key
-            validate_action_arguments(action, arguments)
+            validate_action_arguments(requested_action, arguments)
             enabling = _publication_enabling(
-                repository, action, arguments, schedule_key
+                repository, requested_action, arguments, schedule_key
             )
             if enabling:
                 if not self._allow_agent_publish:
@@ -678,7 +681,7 @@ class ControlApplication:
                 raise TransitionError("approved confirmation intent must be consumed")
             result = repository.create_run_request(
                 profile_id=profile_id,
-                action=action,
+                action=requested_action,
                 arguments=arguments,
                 idempotency_key=key,
                 expected_revision=revision,
@@ -1030,12 +1033,12 @@ def _profile(item: ProfileRecord) -> Mapping[str, object]:
     }
 
 
-def _schedule(value: object) -> Mapping[str, object]:
-    return asdict(value)  # type: ignore[arg-type]
+def _schedule(value: ScheduleRecord) -> Mapping[str, object]:
+    return asdict(value)
 
 
-def _request(value: object) -> Mapping[str, object]:
-    return asdict(value)  # type: ignore[arg-type]
+def _request(value: RunRequestRecord) -> Mapping[str, object]:
+    return asdict(value)
 
 
 def _bundle(repository: StateRepository, item: BundleRecord) -> Mapping[str, object]:
@@ -1048,7 +1051,7 @@ def _bundle(repository: StateRepository, item: BundleRecord) -> Mapping[str, obj
         "archive_path": item.archive_path,
         "warnings": sorted(
             {
-                event["event_code"]
+                cast(str, event["event_code"])
                 for event in repository.list_events(item.bundle_key)
                 if event["event_type"] == "warning"
             }
@@ -1067,8 +1070,8 @@ def _bundle(repository: StateRepository, item: BundleRecord) -> Mapping[str, obj
     }
 
 
-def _intent(value: object) -> Mapping[str, object]:
-    result = asdict(value)  # type: ignore[arg-type]
+def _intent(value: ConfirmationIntentRecord) -> Mapping[str, object]:
+    result = asdict(value)
     result["expires_at"] = cast(datetime, result["expires_at"]).isoformat()
     return result
 

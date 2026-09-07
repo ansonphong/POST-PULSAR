@@ -190,12 +190,12 @@ def test_hardened_discovery_cannot_overlap_account_content(tmp_path, monkeypatch
 def test_unknown_fields_and_legacy_top_level_targets_are_rejected(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ConfigurationError, match="app.mystery"):
+    with pytest.raises(ConfigurationError, match=r"app\.mystery"):
         load_local_settings(_write_config(tmp_path, extra="mystery = 1"))
 
     path = _write_config(tmp_path)
     path.write_text(path.read_text(encoding="utf-8") + "\n[x]\nenabled = false\n")
-    with pytest.raises(ConfigurationError, match="unknown configuration field.*x"):
+    with pytest.raises(ConfigurationError, match=r"unknown configuration field.*x"):
         load_local_settings(path)
 
 
@@ -317,7 +317,10 @@ def test_deployment_mode_is_strict(tmp_path: Path, deployment_mode: str) -> None
         load_local_settings(path)
 
 
-@pytest.mark.parametrize("control_host", ["localhost", "0.0.0.0", "127.0.0.2"])
+@pytest.mark.parametrize(
+    "control_host",
+    ["localhost", "0.0.0.0", "127.0.0.2"],  # noqa: S104
+)
 def test_control_host_is_a_literal_supported_loopback(
     tmp_path: Path, control_host: str
 ) -> None:
@@ -361,9 +364,9 @@ def test_timeout_settings_must_be_finite(tmp_path: Path, invalid: str) -> None:
         "https://127.1/post-pulsar/",
         "https://%31%32%37.0.0.1/post-pulsar/",
         "https://127%2e0%2e0%2e1/post-pulsar/",
-        "https://１２７。０。０。１/post-pulsar/",
-        "https://１2７．０.0｡１/post-pulsar/",
-        "https://２１３０７０６４３３/post-pulsar/",
+        "https://１２７。０。０。１/post-pulsar/",  # noqa: RUF001
+        "https://１2７．０.0｡１/post-pulsar/",  # noqa: RUF001
+        "https://２１３０７０６４３３/post-pulsar/",  # noqa: RUF001
         f"https://{'é' * 64}.example/post-pulsar/",
         "https://media.example.com/../private/",
         "https://media.example.com/%2e%2e/private/",
@@ -488,7 +491,7 @@ def test_boolean_is_not_accepted_as_integer_setting(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ConfigurationError, match="app.log_backups"):
+    with pytest.raises(ConfigurationError, match=r"app\.log_backups"):
         load_local_settings(path)
 
 
@@ -601,5 +604,5 @@ def test_log_file_may_be_inside_state_but_not_an_account_root(
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ConfigurationError, match="app.log_file"):
+    with pytest.raises(ConfigurationError, match=r"app\.log_file"):
         load_local_settings(path)

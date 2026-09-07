@@ -1,7 +1,7 @@
 """Owner-only filesystem boundaries, including the Windows API dispatch."""
 
-from pathlib import Path
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +11,7 @@ import pytest
 def hardened_policy(monkeypatch):
     import grp
     import pwd
+
     from post_pulsar import secure_files
 
     core, agent, group = os.getuid(), os.getuid() + 12345, os.getgid()
@@ -83,6 +84,7 @@ def test_hardened_posix_rejects_same_identity_extra_members_and_private_ancestor
 ):
     import dataclasses
     import grp
+
     from post_pulsar import secure_files
 
     with pytest.raises(secure_files.SecureFileError):
@@ -197,6 +199,7 @@ def test_windows_hardened_native_acl_validation_rejects_drift(
     import ctypes
     import struct
     from contextlib import contextmanager
+
     from post_pulsar import secure_files
 
     def ace(mask, sid, flags=0):
@@ -290,11 +293,8 @@ def test_hardened_posix_rejects_extended_acl_and_wrong_owner_group(
     path = tmp_path / "discovery" / "fixture"
     secure_files.atomic_owner_write(path, b"fixture", policy=hardened_policy)
     actual_lstat = Path.lstat
-    for changed in (
-        {"st_uid": int(hardened_policy.agent_principal)},
-        {"st_gid": hardened_policy.agent_group + 1},
-    ):
 
+    def metadata_for(changed):
         def metadata(candidate):
             original = actual_lstat(candidate)
             return (
@@ -308,8 +308,14 @@ def test_hardened_posix_rejects_extended_acl_and_wrong_owner_group(
                 else original
             )
 
+        return metadata
+
+    for changed in (
+        {"st_uid": int(hardened_policy.agent_principal)},
+        {"st_gid": hardened_policy.agent_group + 1},
+    ):
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "lstat", metadata)
+            patch.setattr(Path, "lstat", metadata_for(changed))
             with pytest.raises(secure_files.SecureFileError):
                 secure_files.assert_owner_file(path, policy=hardened_policy)
     monkeypatch.setattr(os, "getxattr", lambda *args, **kwargs: b"fixture-extended-acl")
@@ -321,6 +327,7 @@ def test_hardened_posix_rejects_extended_acl_and_wrong_owner_group(
 
 def test_windows_hardened_identity_validation_fails_closed(monkeypatch):
     import dataclasses
+
     from post_pulsar import secure_files
 
     policy = secure_files.RecordPolicy("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002")
@@ -360,6 +367,7 @@ def test_windows_acl_validator_rejects_foreign_owner_inheritance_and_extra_grant
     monkeypatch, tmp_path: Path, owner_matches: bool, protected: bool, ace_count: int
 ) -> None:
     from contextlib import contextmanager
+
     from post_pulsar import secure_files
 
     freed = []

@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import Final, Literal, Protocol, TypeAlias, cast
+from typing import Final, Literal, Protocol, cast
 
 from post_pulsar.media import PreparedMedia
 from post_pulsar.state import (
@@ -20,10 +20,10 @@ from post_pulsar.state import (
     TargetSnapshot,
 )
 
-RetryClassification: TypeAlias = Literal["safe_pre_final", "permanent", "ambiguous"]
-PublishOutcome: TypeAlias = Literal["published", "failed", "ambiguous"]
-PreFinalPhase: TypeAlias = Literal["processing", "ready"]
-IssueSeverity: TypeAlias = Literal["error", "warning"]
+type RetryClassification = Literal["safe_pre_final", "permanent", "ambiguous"]
+type PublishOutcome = Literal["published", "failed", "ambiguous"]
+type PreFinalPhase = Literal["processing", "ready"]
+type IssueSeverity = Literal["error", "warning"]
 
 _PROFILE_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _BUNDLE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -499,8 +499,8 @@ __all__ = [
     "ArtifactCheckpoint",
     "BasePlatformAdapter",
     "CheckpointWriter",
-    "PreFinalPhase",
     "PlatformAdapter",
+    "PreFinalPhase",
     "PreparedPublication",
     "PublicationRequest",
     "PublicationSnapshot",

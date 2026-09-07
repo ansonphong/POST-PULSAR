@@ -311,9 +311,8 @@ def test_symlinked_member_and_profile_mismatch_fail_without_external_mutation(
 def test_daemon_instance_contention_stops_before_migration(tmp_path: Path) -> None:
     root = _legacy(tmp_path)
     locks = LockManager(tmp_path / "state")
-    with locks.acquire_instance():
-        with pytest.raises(LockContentionError):
-            _run(tmp_path, mode="apply")
+    with locks.acquire_instance(), pytest.raises(LockContentionError):
+        _run(tmp_path, mode="apply")
 
     assert (root / "cat.jpg").exists()
     assert not (tmp_path / "state/post_pulsar.sqlite3").exists()
@@ -339,7 +338,7 @@ def test_profile_contention_stops_before_cutover_and_lease_is_released(
 
     _run(tmp_path, mode="apply")
     locks = LockManager(state)
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - explicit lock order
         with locks.acquire_maintenance(instance) as maintenance:
             with locks.acquire_profiles(
                 instance, ("operator",), maintenance=maintenance
@@ -483,7 +482,7 @@ migrate_legacy_layout(
     environment["PYTHONPATH"] = os.pathsep.join(
         (str(source_root), environment.get("PYTHONPATH", ""))
     )
-    crashed = subprocess.run(
+    crashed = subprocess.run(  # noqa: S603 - controlled test interpreter
         [sys.executable, "-c", script, str(tmp_path)],
         cwd=Path.cwd(),
         env=environment,
@@ -520,7 +519,7 @@ migrate_legacy_layout(
             == 2
         )
     locks = LockManager(tmp_path / "state")
-    with locks.acquire_instance() as instance:
+    with locks.acquire_instance() as instance:  # noqa: SIM117 - explicit lock order
         with locks.acquire_maintenance(instance) as maintenance:
             with locks.acquire_profiles(
                 instance, ("operator",), maintenance=maintenance
@@ -557,7 +556,7 @@ os._exit(74)
     environment["PYTHONPATH"] = os.pathsep.join(
         (str(source_root), environment.get("PYTHONPATH", ""))
     )
-    crashed = subprocess.run(
+    crashed = subprocess.run(  # noqa: S603 - controlled test interpreter
         [sys.executable, "-c", script, str(database), str(tmp_path / "foreign")],
         cwd=Path.cwd(),
         env=environment,

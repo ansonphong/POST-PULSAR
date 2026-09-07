@@ -1536,7 +1536,7 @@ def test_transactional_random_admission_selects_fixed_sha256_score_and_links_tri
         digest = hashlib.sha256()
         digest.update(b"POST-PULSAR-RANDOM-SELECTION\x00V1\x00")
         for value in (
-            "ansonphong".encode(),
+            b"ansonphong",
             b"0",
             candidate.bundle_id.encode(),
             candidate.fingerprint.encode(),
