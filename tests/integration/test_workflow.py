@@ -12,37 +12,25 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import pytest
 from PIL import Image
 
-TESTS_ROOT = str(Path(__file__).parents[1])
-if TESTS_ROOT not in sys.path:
-    sys.path.insert(0, TESTS_ROOT)
+SUPPORT_ROOT = str(Path(__file__).parents[1] / "support")
+if SUPPORT_ROOT not in sys.path:
+    sys.path.insert(0, SUPPORT_ROOT)
 
-if TYPE_CHECKING:
-    from tests.support.fake_daemon import (
-        HERMETIC_MP4_BYTES,
-        AdapterPlan,
-        FakeAdapterRegistry,
-        FakeClock,
-        FakeMediaProbe,
-        InjectedCrash,
-        LoopbackSocketGuard,
-        launch_fake_daemon,
-    )
-else:
-    from support.fake_daemon import (
-        HERMETIC_MP4_BYTES,
-        AdapterPlan,
-        FakeAdapterRegistry,
-        FakeClock,
-        FakeMediaProbe,
-        InjectedCrash,
-        LoopbackSocketGuard,
-        launch_fake_daemon,
-    )
+from fake_daemon import (
+    HERMETIC_MP4_BYTES,
+    AdapterPlan,
+    FakeAdapterRegistry,
+    FakeClock,
+    FakeMediaProbe,
+    InjectedCrash,
+    LoopbackSocketGuard,
+    launch_fake_daemon,
+)
 
 from post_pulsar import cli
 from post_pulsar.app import (
