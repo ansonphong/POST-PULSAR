@@ -59,15 +59,17 @@ def _run_batch(
     dry_run: bool = False,
     env: dict[str, str] | None = None,
 ):
-    command = f'call "{_windows_path(path)}"'
-    if arguments:
-        command = f"{command} {subprocess.list2cmdline(list(arguments))}"
+    run_env = dict(os.environ if env is None else env)
     if dry_run:
-        command = f"set POST_PULSAR_DRY_RUN=1&& {command}"
+        run_env["POST_PULSAR_DRY_RUN"] = "1"
+        if os.name != "nt":
+            names = run_env.get("WSLENV", "")
+            entry = "POST_PULSAR_DRY_RUN/u"
+            run_env["WSLENV"] = f"{names}:{entry}" if names else entry
     return subprocess.run(
-        ["cmd.exe", "/d", "/c", command],
+        ["cmd.exe", "/d", "/c", "call", _windows_path(path), *arguments],
         cwd=path.parent,
-        env=env,
+        env=run_env,
         capture_output=True,
         text=True,
         timeout=30,
