@@ -77,6 +77,26 @@ def _run_batch(
     )
 
 
+def _stubbed_schtasks_env(stub_dir: Path, marker: Path) -> dict[str, str]:
+    """Put a recording schtasks shim ahead of every real scheduler binary."""
+    stub = stub_dir / "schtasks.bat"
+    stub_dir.mkdir()
+    stub.write_text(
+        "@echo off\n"
+        "> \"%POST_PULSAR_SCHTASKS_MARKER%\" echo schtasks was invoked\n"
+        "exit /b 99\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["POST_PULSAR_SCHTASKS_MARKER"] = str(marker)
+    env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    names = env.get("WSLENV", "")
+    entries = [entry for entry in names.split(":") if entry]
+    entries.extend(("POST_PULSAR_SCHTASKS_MARKER/p", "PATH/l"))
+    env["WSLENV"] = ":".join(entries)
+    return env
+
+
 def test_cutover_has_only_post_pulsar_operational_paths() -> None:
     assert all(not (ROOT / path).exists() for path in LEGACY_PATHS)
     assert all((ROOT / path).is_file() for path in NEW_PATHS)
@@ -229,7 +249,7 @@ def test_windows_scripts_quote_paths_and_task_is_daemon_only() -> None:
     shutil.which("cmd.exe") is None,
     reason="Windows command processor is unavailable",
 )
-def test_windows_task_dry_run_parses_in_a_space_containing_path() -> None:
+def test_windows_task_modes_fail_closed_without_calling_schtasks() -> None:
     with tempfile.TemporaryDirectory(
         prefix="post pulsar task ", dir=ROOT.parent
     ) as raw:
@@ -237,16 +257,33 @@ def test_windows_task_dry_run_parses_in_a_space_containing_path() -> None:
         task = install / "task-setup-post-pulsar.bat"
         shutil.copy2(ROOT / "task-setup-post-pulsar.bat", task)
         shutil.copy2(ROOT / "run-post-pulsar.bat", install / "run-post-pulsar.bat")
-        result = _run_batch(
-            task,
-            dry_run=True,
-        )
-        output = result.stdout + result.stderr
-        assert result.returncode == 0
-        assert "DRY RUN" in output
-        assert "PostPulsar" in output
-        assert "run-post-pulsar.bat" in output
-        assert "daemon" in output
+        marker = install / "schtasks-invoked.txt"
+        env = _stubbed_schtasks_env(install / "scheduler-shim", marker)
+        assert env["PATH"].startswith(f"{install / 'scheduler-shim'}:")
+        assert not marker.exists()
+
+        for arguments in ((), ("unexpected",)):
+            result = _run_batch(task, *arguments, env=env)
+            output = result.stdout + result.stderr
+            assert result.returncode == 2
+            assert "Usage:" in output
+            assert not marker.exists()
+
+        expected_commands = {
+            ("dry-run", "install"): "/create /tn \"PostPulsar\"",
+            ("dry-run", "remove"): "/delete /tn \"PostPulsar\" /f",
+        }
+        for arguments, command in expected_commands.items():
+            result = _run_batch(task, *arguments, env=env)
+            output = result.stdout + result.stderr
+            assert result.returncode == 0
+            assert "DRY RUN" in output
+            assert "schtasks" in output
+            assert command in output
+            if arguments == ("dry-run", "install"):
+                assert "run-post-pulsar.bat" in output
+                assert "daemon" in output
+            assert not marker.exists()
 
 
 def test_package_is_the_only_active_python_entry_surface() -> None:

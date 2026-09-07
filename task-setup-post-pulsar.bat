@@ -7,21 +7,32 @@ set "TASK_NAME=PostPulsar"
 set "LAUNCHER=%~dp0run-post-pulsar.bat"
 set "TASK_ACTION=\"%LAUNCHER%\" daemon"
 set "MODE=%~1"
-if "%MODE%"=="" set "MODE=install"
+set "ACTION=%~2"
 
+if /i "%MODE%"=="dry-run" goto dry-run
+if not "%ACTION%"=="" goto usage
 if /i "%MODE%"=="install" goto install
 if /i "%MODE%"=="remove" goto remove
 goto usage
+
+:dry-run
+if /i "%ACTION%"=="install" goto dry-run-install
+if /i "%ACTION%"=="remove" goto dry-run-remove
+goto usage
+
+:dry-run-install
+echo DRY RUN: schtasks /create /tn "%TASK_NAME%" /tr "%TASK_ACTION%" /sc ONLOGON /rl LIMITED /it /f
+echo DRY RUN: existing task ownership would be checked before update.
+exit /b 0
+
+:dry-run-remove
+echo DRY RUN: verify ownership, then schtasks /delete /tn "%TASK_NAME%" /f
+exit /b 0
 
 :install
 if not exist "%LAUNCHER%" (
     1>&2 echo POST PULSAR launcher not found: "%LAUNCHER%"
     exit /b 2
-)
-if "%POST_PULSAR_DRY_RUN%"=="1" (
-    echo DRY RUN: schtasks /create /tn "%TASK_NAME%" /tr "%TASK_ACTION%" /sc ONLOGON /rl LIMITED /it /f
-    echo DRY RUN: existing task ownership would be checked before update.
-    exit /b 0
 )
 set "TASK_XML=%TEMP%\PostPulsar-task-%RANDOM%-%RANDOM%.xml"
 schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
@@ -41,10 +52,6 @@ echo Bootstrap service selection: --service-mode windows-task --service-identifi
 exit /b 0
 
 :remove
-if "%POST_PULSAR_DRY_RUN%"=="1" (
-    echo DRY RUN: verify ownership, then schtasks /delete /tn "%TASK_NAME%" /f
-    exit /b 0
-)
 set "TASK_XML=%TEMP%\PostPulsar-task-%RANDOM%-%RANDOM%.xml"
 schtasks /query /tn "%TASK_NAME%" /xml >"%TASK_XML%" 2>nul
 if errorlevel 1 (
@@ -65,5 +72,5 @@ echo Removed POST PULSAR background startup. No process was stopped.
 exit /b 0
 
 :usage
-1>&2 echo Usage: "%~f0" [install^|remove]
+1>&2 echo Usage: "%~f0" ^<install^|remove^|dry-run install^|dry-run remove^>
 exit /b 2
