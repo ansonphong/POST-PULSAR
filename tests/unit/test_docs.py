@@ -49,8 +49,8 @@ def test_operator_documents_have_the_required_contract_sections() -> None:
             "reporting a vulnerability",
         },
         "MODERNIZATION_REPORT.md": {
-            "implemented through t5.2",
-            "evidence available through t5.2",
+            "implemented through t5.3",
+            "evidence available through t5.3",
             "operator-only gates",
             "lock and api refresh",
             "easy future platform and api opportunities — not implemented",
@@ -147,7 +147,8 @@ def test_report_is_closed_evidence_not_a_future_capability_claim() -> None:
     report = _read("MODERNIZATION_REPORT.md")
     assert "2026-09-05" in report
     assert "NOT IMPLEMENTED" in report
-    assert "No item in this future section was implemented through T5.2." in report
+    assert "through T5.2" not in report
+    assert "No item in this future section was implemented through T5.3." in report
     stale_evidence = (
         r"(?i)pending" + r" evidence|evidence " + r"pending|to be " + "verified"
     )

@@ -42,7 +42,7 @@ Completed implementation includes:
 - Frozen dependency setup, project-relative POSIX/Windows launchers, explicit
   user startup integration, service templates, operator hardened guidance, and
   the README, migration, security, licensing, and documentation contract
-  delivered by T5.2.
+  delivered by T5.3.
 - A hermetic offline integration harness using temporary profile/state/content
   roots, protocol-faithful fake official adapters, injected time, and a real
   loopback daemon/control server. The harness retains a non-loopback denial
@@ -73,20 +73,23 @@ Evidence is repository-local and does not rely on a live social account:
   contracts for the local control and secretless discovery records.
 - `tests/unit/test_ci.py` and `test_scripts.py` inspect locked CI/setup and
   project-relative launcher/service behavior. `tests/unit/test_docs.py` is the
-  focused T5.2 contract for current headings, commands, environment names,
+  focused T5.3 contract for current headings, commands, environment names,
   migration/security negations, licensing, and absence of active legacy claims.
 - `tests/integration/test_workflow.py` drives the real application, state,
   scheduler, archive, daemon, control, and trusted-CLI approval paths with fake
   adapters. It covers partial and exhausted retries, immutable drift,
   post-create/pre-commit ambiguity, explicit published/not-published
   reconciliation, interrupted archive recovery, restart idempotence, two
-  isolated profiles, every standard bucket, schedule restart/DST/misfire, and
+  isolated profiles, every standard bucket, application-level REELS execution
+  with deterministic fake `ffprobe` metadata, post-admission exact-member
+  fingerprint drift before adapter mutation, schedule restart/DST/misfire, and
   authenticated bounded loopback control. `tests/support/fake_daemon.py`
-  exposes the same hermetic fake-adapter daemon launcher for sibling
-  compatibility checks without adding a runtime command or provider endpoint.
+  exposes the same hermetic fake-adapter daemon launcher and media probe for
+  sibling compatibility checks without adding a runtime command or provider
+  endpoint.
 
 Observed Stage 5 focused evidence for T5.3: `.venv/bin/uv run --frozen pytest
-tests/integration/test_workflow.py -q` exited 0 with `8 passed in 2.37s`; the
+tests/integration/test_workflow.py -q` exited 0 with `10 passed`; the
 scoped Ruff and mypy commands exited 0, and `git diff --exit-code -- uv.lock`
 exited 0. No broad suite, build, coverage, packaging, or audit result is claimed
 here; those remain Stage 6/CI evidence.
@@ -162,7 +165,7 @@ These are bounded opportunities, not current capabilities:
 
 Platform names sometimes suggested for expansion—such as Threads, Facebook or
 Bluesky—are not supported by this repository.
-No item in this future section was implemented through T5.2.
+No item in this future section was implemented through T5.3.
 
 ## Original recommendations and disposition
 
@@ -183,5 +186,5 @@ implemented above; it did not turn the core into a hosted service or a social
 platform plugin framework.
 
 For clarity, none of the future opportunities listed in the preceding section
-was implemented through T5.2. This report contains no forecast presented as
+was implemented through T5.3. This report contains no forecast presented as
 test evidence and no assertion of a sibling repository revision.

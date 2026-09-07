@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import socket
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
         AdapterPlan,
         FakeAdapterRegistry,
         FakeClock,
+        FakeMediaProbe,
+        HERMETIC_MP4_BYTES,
         InjectedCrash,
         LoopbackSocketGuard,
         launch_fake_daemon,
@@ -34,6 +37,8 @@ else:
         AdapterPlan,
         FakeAdapterRegistry,
         FakeClock,
+        FakeMediaProbe,
+        HERMETIC_MP4_BYTES,
         InjectedCrash,
         LoopbackSocketGuard,
         launch_fake_daemon,
@@ -41,6 +46,7 @@ else:
 
 from post_pulsar import cli
 from post_pulsar.app import (
+    MediaPreparer,
     OneRunApplication,
     OrchestrationFaultInjector,
     RunOnceRequest,
@@ -52,6 +58,7 @@ from post_pulsar.content import PublishableBundle, scan_account_root
 from post_pulsar.control import initialize_operator_secret, rotate_agent_capability
 from post_pulsar.daemon import EndpointRecord, ForegroundDaemon
 from post_pulsar.locking import LockContentionError, LockLease, LockManager
+from post_pulsar.media import prepare_bundle_media
 from post_pulsar.platforms.base import PublishResult, ValidationIssue
 from post_pulsar.scheduler import DeterministicScheduler, evaluate_schedule
 from post_pulsar.state import (
@@ -235,7 +242,7 @@ def _bundle(
     if media_suffix == ".jpg":
         Image.new("RGB", (4, 4), "purple").save(media)
     else:
-        media.write_bytes(b"fake-container-bytes")
+        media.write_bytes(HERMETIC_MP4_BYTES)
     (directory / f"{bundle_id}.txt").write_text(
         f"offline caption for {bundle_id}\n", encoding="utf-8"
     )
@@ -255,6 +262,7 @@ def _run(
     trigger: str,
     *,
     fault: OrchestrationFaultInjector | None = None,
+    media_preparer: MediaPreparer = prepare_bundle_media,
 ) -> RunOutcome:
     return OneRunApplication(
         config,
@@ -263,6 +271,7 @@ def _run(
         environ=FAKE_ENV,
         clock=clock.now,
         adapter_factory=registry.factory,
+        media_preparer=media_preparer,
         fault_injector=fault,
     ).run_once(RunOnceRequest(profile_id, bucket, trigger))
 
@@ -510,6 +519,163 @@ def test_ready_buckets_and_random_selection_are_restart_deterministic(
         finally:
             instance.release()
     assert selected[0] == selected[1]
+
+
+def test_reels_video_runs_through_application_probe_and_isolated_adapters(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(NOW)
+    config, settings, locks, instance = _initialize(
+        tmp_path,
+        clock,
+        enabled={"ansonphong": ("x",), "360hextile": ("x",)},
+    )
+    source = _bundle(
+        settings,
+        "ansonphong",
+        "REELS",
+        "reel-publish",
+        media_suffix=".mp4",
+    )
+    isolated = _bundle(
+        settings,
+        "360hextile",
+        "REELS",
+        "other-profile",
+        media_suffix=".mp4",
+    )
+    probe = FakeMediaProbe()
+    registry = FakeAdapterRegistry()
+    try:
+        outcome = _run(
+            config,
+            locks,
+            instance,
+            clock,
+            registry,
+            "ansonphong",
+            "REELS",
+            "reels-application",
+            media_preparer=probe.prepare,
+        )
+
+        assert (outcome.status, outcome.bundle_id) == ("archived", "reel-publish")
+        assert len(probe.traces) == 1
+        assert probe.traces[0].source_suffix == ".mp4"
+        assert probe.traces[0].shell is False
+        assert len(registry.traces) == 1
+        trace = registry.traces[0]
+        assert (trace.profile_id, trace.platform) == ("ansonphong", "x")
+        assert (trace.preflights, trace.prepares, trace.commits, trace.closed) == (
+            1,
+            1,
+            1,
+            True,
+        )
+        assert not source.exists() and isolated.is_dir()
+        archived = (
+            settings.profile("ansonphong").account_root
+            / "POSTED/REELS/reel-publish"
+        )
+        assert {path.name for path in archived.iterdir()} == {
+            ".ready",
+            "reel-publish.mp4",
+            "reel-publish.txt",
+        }
+    finally:
+        instance.release()
+
+
+def test_recovery_blocks_member_fingerprint_drift_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(NOW)
+    config, settings, locks, instance = _initialize(
+        tmp_path,
+        clock,
+        enabled={"ansonphong": ("x",), "360hextile": ()},
+    )
+    source = _bundle(settings, "ansonphong", "QUEUE", "drift-recovery")
+    registry = FakeAdapterRegistry()
+
+    def crash_after_admission(boundary: str) -> None:
+        if boundary == "after_bundle_admission":
+            raise InjectedCrash
+
+    try:
+        with pytest.raises(InjectedCrash):
+            _run(
+                config,
+                locks,
+                instance,
+                clock,
+                registry,
+                "ansonphong",
+                "QUEUE",
+                "drift-admit",
+                fault=crash_after_admission,
+            )
+        database = settings.app.state_directory / "post_pulsar.sqlite3"
+        with StateRepository.open_existing(database, clock=clock.now) as repository:
+            admitted = repository.list_protected_bundles("ansonphong")
+            assert len(admitted) == 1
+            bundle_key = admitted[0].bundle_key
+            stored_fingerprint = admitted[0].fingerprint
+            stored_files = repository.list_bundle_files(bundle_key)
+            assert repository.get_delivery(bundle_key, "x").status == "pending"
+
+        caption = source / "drift-recovery.txt"
+        caption.write_text("mutated only after durable admission\n", encoding="utf-8")
+        stored_caption = next(item for item in stored_files if item.role == "caption")
+        assert hashlib.sha256(caption.read_bytes()).hexdigest() != stored_caption.sha256
+
+        recovered = _run(
+            config,
+            locks,
+            instance,
+            clock,
+            registry,
+            "ansonphong",
+            "QUEUE",
+            "drift-recover",
+        )
+
+        assert (recovered.status, recovered.code, recovered.bundle_key) == (
+            "blocked",
+            "fingerprint_drift",
+            bundle_key,
+        )
+        assert registry.traces == []
+        assert source.is_dir() and caption.read_text(encoding="utf-8").startswith(
+            "mutated only"
+        )
+        assert not (
+            settings.profile("ansonphong").account_root
+            / "POSTED/QUEUE/drift-recovery"
+        ).exists()
+        with StateRepository.open_existing(database, clock=clock.now) as repository:
+            blocked = repository.get_bundle(bundle_key)
+            delivery = repository.get_delivery(bundle_key, "x")
+            assert blocked.status == "blocked"
+            assert blocked.fingerprint == stored_fingerprint
+            assert repository.list_bundle_files(bundle_key) == stored_files
+            assert (
+                delivery.status,
+                delivery.attempt_count,
+                delivery.remote_id,
+                delivery.error_code,
+            ) == ("pending", 0, None, None)
+            assert repository.list_events(bundle_key) == (
+                {
+                    "occurred_at": "2026-09-05T12:00:00.000000Z",
+                    "platform": None,
+                    "event_type": "bundle_blocked",
+                    "event_code": "fingerprint_drift",
+                    "details": {"reason": "fingerprint_drift"},
+                },
+            )
+    finally:
+        instance.release()
 
 
 def test_partial_retry_waits_for_exact_due_time_and_skips_published_target(

@@ -6,18 +6,22 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import os
 import socket
+import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
 from post_pulsar import cli
-from post_pulsar.config import SecretValue, load_local_settings
+from post_pulsar.config import InstagramSettings, SecretValue, load_local_settings
+from post_pulsar.content import PublishableBundle
 from post_pulsar.control import ControlApplication, load_agent_capability
 from post_pulsar.daemon import EndpointRecord, ForegroundDaemon
+from post_pulsar.media import PreparedMedia, prepare_bundle_media
 from post_pulsar.platforms.base import (
     CheckpointWriter,
     PlatformAdapter,
@@ -28,6 +32,8 @@ from post_pulsar.platforms.base import (
     ValidationIssue,
 )
 from post_pulsar.state import DeliveryRecord, RunRequestRecord
+
+HERMETIC_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
 
 
 class InjectedCrash(BaseException):
@@ -63,6 +69,84 @@ class FakeClock:
     def advance(self, delta: timedelta) -> None:
         self.wall += delta
         self.monotonic += delta.total_seconds()
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeTrace:
+    """Sanitized evidence that the real media pipeline invoked fake ffprobe."""
+
+    source_suffix: str
+    timeout_seconds: float
+    shell: bool
+
+
+@dataclass(slots=True)
+class FakeMediaProbe:
+    """Feed valid deterministic video metadata into the real media preparer."""
+
+    traces: list[ProbeTrace] = field(default_factory=list)
+
+    def prepare(
+        self,
+        bundle: PublishableBundle,
+        *,
+        profile_id: str,
+        targets: Iterable[str],
+        private_staging_directory: str | os.PathLike[str],
+        instagram: InstagramSettings | None = None,
+    ) -> PreparedMedia:
+        return prepare_bundle_media(
+            bundle,
+            profile_id=profile_id,
+            targets=targets,
+            private_staging_directory=private_staging_directory,
+            instagram=instagram,
+            ffprobe_timeout_seconds=7.0,
+            process_runner=self._run,
+        )
+
+    def _run(
+        self,
+        argv: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+        shell: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        assert argv[0] == "ffprobe"
+        assert capture_output and text and not check and not shell
+        source = Path(argv[-1])
+        self.traces.append(ProbeTrace(source.suffix.casefold(), timeout, shell))
+        document = {
+            "format": {
+                "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                "duration": "10.0",
+                "size": str(source.stat().st_size),
+            },
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "profile": "High",
+                    "pix_fmt": "yuv420p",
+                    "width": 1024,
+                    "height": 1024,
+                    "r_frame_rate": "30/1",
+                    "avg_frame_rate": "30/1",
+                    "bit_rate": "1000000",
+                },
+                {
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "profile": "LC",
+                    "sample_rate": "48000",
+                    "bit_rate": "128000",
+                },
+            ],
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(document), "")
 
 
 @dataclass(slots=True)
@@ -308,8 +392,11 @@ __all__ = [
     "ClassifiedFailure",
     "FakeAdapterRegistry",
     "FakeClock",
+    "FakeMediaProbe",
+    "HERMETIC_MP4_BYTES",
     "InjectedCrash",
     "LoopbackSocketGuard",
+    "ProbeTrace",
     "RunningFakeDaemon",
     "launch_fake_daemon",
 ]
