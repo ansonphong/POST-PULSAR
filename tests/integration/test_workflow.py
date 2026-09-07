@@ -23,22 +23,22 @@ if TESTS_ROOT not in sys.path:
 
 if TYPE_CHECKING:
     from tests.support.fake_daemon import (
+        HERMETIC_MP4_BYTES,
         AdapterPlan,
         FakeAdapterRegistry,
         FakeClock,
         FakeMediaProbe,
-        HERMETIC_MP4_BYTES,
         InjectedCrash,
         LoopbackSocketGuard,
         launch_fake_daemon,
     )
 else:
     from support.fake_daemon import (
+        HERMETIC_MP4_BYTES,
         AdapterPlan,
         FakeAdapterRegistry,
         FakeClock,
         FakeMediaProbe,
-        HERMETIC_MP4_BYTES,
         InjectedCrash,
         LoopbackSocketGuard,
         launch_fake_daemon,
