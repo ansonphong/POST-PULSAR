@@ -64,7 +64,7 @@ def _run_batch(
         run_env["POST_PULSAR_DRY_RUN"] = "1"
         if os.name != "nt":
             names = run_env.get("WSLENV", "")
-            entry = "POST_PULSAR_DRY_RUN/u"
+            entry = "POST_PULSAR_DRY_RUN/w"
             run_env["WSLENV"] = f"{names}:{entry}" if names else entry
     return subprocess.run(
         ["cmd.exe", "/d", "/c", "call", _windows_path(path), *arguments],
