@@ -131,3 +131,6 @@
 {"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:25:59Z"}
 {"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:39:53Z"}
 {"event":"commit","sha":"5f846a6","message":"fix(control): bind discovery to daemon installation and incarnation","time":"2026-09-07T04:43:46Z"}
+{"event":"commit","sha":"929ccf6","message":"chore(plan): mark T6.2 DONE","time":"2026-09-07T04:45:36Z"}
+{"event":"commit","sha":"25a2920","message":"fix(control): type profile pagination cursor","time":"2026-09-07T04:49:41Z"}
+{"event":"commit","sha":"25a2920","message":"fix(control): type profile pagination cursor","time":"2026-09-07T05:03:46Z"}
