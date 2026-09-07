@@ -319,6 +319,37 @@ def _factory(
     return build
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"expected_bundle_id": "post"},
+        {"expected_fingerprint": "b" * 64},
+        {"expected_bundle_id": "post", "expected_fingerprint": "b" * 64},
+        {
+            "expected_bundle_id": "post",
+            "expected_fingerprint": "b" * 64,
+            "expected_profile_revision": 1,
+            "expected_bundle_key": 1,
+        },
+    ],
+)
+def test_incomplete_or_mixed_disk_selector_never_admits(tmp_path: Path, fields):
+    config, locks, instance = _initialize(tmp_path)
+    _bundle(tmp_path, "post")
+    app = OneRunApplication(
+        config, locks=locks, instance_lease=instance, environ={}, clock=lambda: NOW
+    )
+    try:
+        result = app.run_once(RunOnceRequest("operator", "QUEUE", "exact", **fields))
+        assert result.code == "exact_bundle_conflict"
+        with StateRepository.open_existing(
+            tmp_path / "state/post_pulsar.sqlite3"
+        ) as repository:
+            assert repository.list_protected_bundles("operator") == ()
+    finally:
+        instance.release()
+
+
 def test_pending_pause_blocks_new_content_before_credentials(tmp_path: Path) -> None:
     config, locks, instance = _initialize(tmp_path)
     _bundle(tmp_path, "post")

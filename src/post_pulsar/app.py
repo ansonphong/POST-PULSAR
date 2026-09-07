@@ -87,6 +87,8 @@ class RunOnceRequest:
     expected_fingerprint: str | None = None
     only_platform: Platform | None = None
     archive_only: bool = False
+    expected_bundle_id: str | None = None
+    expected_profile_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,20 +209,45 @@ class OneRunApplication:
                 )
             except ConflictError:
                 return RunOutcome("invalid", code="trigger_conflict")
-            if triggered is not None and triggered.status == "archived":
-                return _outcome("archived", triggered)
             protected = repository.list_protected_bundles(request.profile_id)
+            disk_requested = request.expected_bundle_id is not None
+            key_requested = request.expected_bundle_key is not None
             exact_requested = (
-                request.expected_bundle_key is not None
+                key_requested
                 or request.expected_fingerprint is not None
+                or disk_requested
+                or request.expected_profile_revision is not None
             )
             if exact_requested and (
-                request.expected_bundle_key is None
+                key_requested == disk_requested
                 or request.expected_fingerprint is None
                 or schedule_run is not None
+                or (disk_requested and request.expected_profile_revision is None)
+                or (
+                    not disk_requested and request.expected_profile_revision is not None
+                )
             ):
                 return RunOutcome("invalid", code="exact_bundle_conflict")
-            if exact_requested:
+            if disk_requested:
+                if stored_profile.revision != request.expected_profile_revision:
+                    return RunOutcome("invalid", code="profile_revision_drift")
+                if triggered is not None and (
+                    triggered.bundle_id != request.expected_bundle_id
+                    or triggered.fingerprint != request.expected_fingerprint
+                ):
+                    return RunOutcome("invalid", code="exact_bundle_conflict")
+            if triggered is not None and triggered.status == "archived":
+                if request.expected_bundle_key not in {None, triggered.bundle_key} or (
+                    exact_requested
+                    and request.expected_fingerprint != triggered.fingerprint
+                ):
+                    return RunOutcome("invalid", code="exact_bundle_conflict")
+                return _outcome("archived", triggered)
+            if disk_requested:
+                bundle = triggered
+                if bundle is None and protected:
+                    return RunOutcome("deferred", code="profile_has_recoverable_work")
+            elif exact_requested:
                 try:
                     exact = repository.get_bundle(
                         cast(int, request.expected_bundle_key)
@@ -287,6 +314,15 @@ class OneRunApplication:
                 if scan.issues:
                     return RunOutcome("invalid", code=scan.issues[0].code)
                 candidates = scan.for_bucket(request.bucket)
+                if disk_requested:
+                    candidates = tuple(
+                        item
+                        for item in candidates
+                        if item.bundle_id == request.expected_bundle_id
+                        and item.fingerprint == request.expected_fingerprint
+                    )
+                    if len(candidates) != 1:
+                        return RunOutcome("invalid", code="exact_bundle_conflict")
                 if not candidates:
                     if schedule_run is not None:
                         repository.transition_schedule_run(
@@ -296,6 +332,8 @@ class OneRunApplication:
                         )
                     return RunOutcome("empty")
                 global_scan = scan_account_root(profile.account_root)
+                if disk_requested and global_scan.issues:
+                    return RunOutcome("invalid", code=global_scan.issues[0].code)
                 candidate_ids = {item.bundle_id.casefold() for item in candidates}
                 collision = next(
                     (

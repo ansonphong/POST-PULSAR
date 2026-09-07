@@ -21,6 +21,64 @@ from post_pulsar.state import ProfileTargetSnapshot, StateRepository
 
 
 @pytest.mark.parametrize(
+    "change", [None, "disabled", "bytes", "missing", "collision", "symlink"]
+)
+def test_disk_enqueue_confirmation_is_exact_and_opted_in(tmp_path: Path, change):
+    from PIL import Image
+
+    from post_pulsar.content import scan_account_root
+
+    app = _application(tmp_path, allow_publish=change != "disabled")
+    token = (tmp_path / "agent").read_text().strip()
+    directory = tmp_path / "account/QUEUE/post"
+    directory.mkdir(parents=True)
+    Image.new("RGB", (4, 4)).save(directory / "post.jpg")
+    (directory / ".ready").write_bytes(b"")
+    fingerprint = scan_account_root(tmp_path / "account").bundles[0].fingerprint
+    body = dict(
+        action="enqueue",
+        profile_id="profile",
+        resource_revision=1,
+        consequence="Exact fixture",
+        fingerprint=fingerprint,
+        arguments=dict(
+            bucket="QUEUE", bundle_id="post", fingerprint=fingerprint, trigger_id="disk"
+        ),
+    )
+    document = json.loads(
+        (Path(__file__).parents[2] / "api/control-v1.openapi.json").read_text()
+    )
+    schema = document["components"]["schemas"]["Confirmation"]
+    Draft202012Validator(schema).validate(body)
+    assert not Draft202012Validator(schema).is_valid({**body, "action": "run_now"})
+    if change == "bytes":
+        (directory / "post.txt").write_text("changed")
+    elif change == "missing":
+        (directory / ".ready").unlink()
+    elif change == "collision":
+        other = tmp_path / "account/RANDOM/post"
+        other.mkdir(parents=True)
+        Image.new("RGB", (4, 4)).save(other / "post.jpg")
+        (other / ".ready").write_bytes(b"")
+    elif change == "symlink":
+        (directory / ".ready").unlink()
+        (directory / ".ready").symlink_to(directory / "post.jpg")
+    response = _call(
+        app,
+        "POST",
+        "/control/v1/confirmations",
+        token=token,
+        body=body,
+        headers={"Idempotency-Key": "disk", "If-Match": "1"},
+    )
+    assert response.status == (
+        201 if change is None else 403 if change == "disabled" else 409
+    ), response.body
+    with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+        assert repository.claim_next_run_request("worker") is None
+
+
+@pytest.mark.parametrize(
     "path,arguments",
     [
         ("pause", {"unexpected": True}),

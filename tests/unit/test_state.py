@@ -36,6 +36,45 @@ class FakeClock:
         self.value += timedelta(**kwargs)
 
 
+def test_disk_enqueue_requires_approval_and_exact_profile_revision(tmp_path: Path):
+    clock = FakeClock()
+    with _repository(tmp_path, clock) as repository:
+        arguments = dict(
+            bucket="QUEUE", bundle_id="post", fingerprint="b" * 64, trigger_id="disk"
+        )
+        fields = dict(action="enqueue", profile_id="ansonphong", arguments=arguments)
+        with pytest.raises(TransitionError, match="approved"):
+            repository.create_run_request(
+                **fields, idempotency_key="disk", expected_revision=1
+            )
+        with pytest.raises(ConflictError, match="fingerprint disagrees"):
+            repository.create_confirmation_intent(
+                **fields,
+                resource_revision=1,
+                fingerprint="c" * 64,
+                consequence="Exact fixture",
+                expires_at=clock() + timedelta(minutes=5),
+            )
+        intent = repository.create_confirmation_intent(
+            **fields,
+            resource_revision=1,
+            fingerprint="b" * 64,
+            consequence="Exact fixture",
+            expires_at=clock() + timedelta(minutes=5),
+        )
+        repository.approve_confirmation_intent(intent.intent_id, expected_revision=1)
+        repository._connection.execute("UPDATE profiles SET revision = revision + 1")
+        with pytest.raises(ConflictError):
+            repository.consume_intent_with_request(
+                **fields,
+                intent_id=intent.intent_id,
+                resource_revision=1,
+                fingerprint="b" * 64,
+                idempotency_key="disk",
+            )
+        assert repository.claim_next_run_request("worker") is None
+
+
 def _local_replay_fixture(repository, action):
     arguments = {}
     bundle_key = schedule_key = None

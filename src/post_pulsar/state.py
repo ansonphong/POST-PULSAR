@@ -4236,6 +4236,8 @@ class StateRepository:
         now = self._now_text()
         with self._transaction():
             self._require_profile(profile_id)
+            if action == "enqueue" and fingerprint != arguments.get("fingerprint"):
+                raise ConflictError("enqueue confirmation fingerprint disagrees")
             confirmation_required = self._validate_request_action_locked(
                 action,
                 json.loads(arguments_json),
@@ -4337,6 +4339,8 @@ class StateRepository:
         expired = False
         result: RunRequestRecord | None = None
         with self._transaction():
+            if action == "enqueue" and fingerprint != arguments.get("fingerprint"):
+                raise ConflictError("enqueue confirmation fingerprint disagrees")
             arguments_json = self._safe_json(arguments)
             binding = self._intent_binding(
                 action,
@@ -4994,7 +4998,10 @@ class StateRepository:
     ) -> bool:
         if not isinstance(arguments, dict):
             raise StateValidationError("run request arguments must be an object")
-        if action in _BUNDLE_REQUEST_ACTIONS:
+        if action == "enqueue" and bundle_key is None:
+            if schedule_key is not None:
+                raise StateValidationError("on-disk enqueue is bound to its profile")
+        elif action in _BUNDLE_REQUEST_ACTIONS:
             if bundle_key is None or schedule_key is not None:
                 raise StateValidationError(
                     "run request action requires exactly one bundle resource"
@@ -5070,7 +5077,7 @@ class StateRepository:
             and str(self._bundle_row(bundle_key)["profile_id"]) != profile_id
         ):
             raise ConflictError("run request bundle belongs to another profile")
-        if action in {
+        if bundle_key is not None and action in {
             "cancel",
             "delete",
             "retry",
@@ -5079,7 +5086,7 @@ class StateRepository:
             "run_now",
             "publish_now",
         }:
-            exact_bundle = self._bundle_row(cast(int, bundle_key))
+            exact_bundle = self._bundle_row(bundle_key)
             if (
                 str(exact_bundle["bundle_id"]) != arguments["bundle_id"]
                 or str(exact_bundle["fingerprint"]) != arguments["fingerprint"]
@@ -5227,10 +5234,10 @@ class StateRepository:
                 resource_revision,
                 "confirmation profile",
             )
-        if action == "admit_draft":
+        if action in {"admit_draft", "enqueue"}:
             if fingerprint is None:
                 raise StateValidationError(
-                    "draft admission confirmation requires a fingerprint"
+                    "content confirmation requires a fingerprint"
                 )
         elif fingerprint is not None:
             raise StateValidationError(

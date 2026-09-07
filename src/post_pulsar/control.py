@@ -18,7 +18,7 @@ from typing import Final, Protocol, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from post_pulsar import __version__
-from post_pulsar.content import scan_inbox
+from post_pulsar.content import scan_account_root, scan_inbox
 from post_pulsar.control_identity import DaemonIdentity
 from post_pulsar.secure_files import RecordPolicy
 from post_pulsar.state import (
@@ -500,6 +500,7 @@ class ControlApplication:
             resource_revision = _integer(body, "resource_revision")
             if revision != resource_revision:
                 raise ConflictError("intent revision header drift")
+            self._check_disk_enqueue(repository, action, body)
             intent = repository.create_confirmation_intent(
                 action=action,
                 arguments=_object(body, "arguments", default={}),
@@ -543,6 +544,7 @@ class ControlApplication:
             resource_revision = _integer(body, "resource_revision")
             if revision != resource_revision:
                 raise ConflictError("intent revision header drift")
+            self._check_disk_enqueue(repository, action, body)
             intent = repository.create_confirmation_intent(
                 action=action,
                 arguments=_object(body, "arguments", default={}),
@@ -690,6 +692,30 @@ class ControlApplication:
             )
             return _request(result), 202
         raise StateValidationError("unknown control route")
+
+    @staticmethod
+    def _check_disk_enqueue(
+        repository: StateRepository, action: str, body: Mapping[str, object]
+    ) -> None:
+        if action != "enqueue" or _optional_integer(body, "bundle_key") is not None:
+            return
+        arguments = _object(body, "arguments", default={})
+        validate_action_arguments(action, arguments)
+        profile = repository.get_profile(_text(body, "profile_id"))
+        scan = scan_account_root(profile.account_root)
+        matches = [
+            item
+            for item in scan.bundles
+            if item.bucket == arguments["bucket"]
+            and item.bundle_id == arguments["bundle_id"]
+        ]
+        if (
+            scan.issues
+            or len(matches) != 1
+            or matches[0].fingerprint != arguments["fingerprint"]
+            or matches[0].fingerprint != _optional_text(body, "fingerprint")
+        ):
+            raise ConflictError("enqueue bundle is missing, unsafe, or changed")
 
     def _authenticate(self, headers: Mapping[str, str]) -> None:
         authorization = headers.get("authorization", "")

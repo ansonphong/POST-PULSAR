@@ -1439,6 +1439,16 @@ def _execute_daemon_request(
                 cast(str, request.arguments["trigger_id"]),
                 expected_bundle_key=request.bundle_key,
                 expected_fingerprint=cast(str, request.arguments["fingerprint"]),
+                expected_bundle_id=(
+                    cast(str, request.arguments["bundle_id"])
+                    if request.action == "enqueue" and request.bundle_key is None
+                    else None
+                ),
+                expected_profile_revision=(
+                    request.expected_revision
+                    if request.action == "enqueue" and request.bundle_key is None
+                    else None
+                ),
             )
         )
         return _run_result(outcome)

@@ -1089,7 +1089,6 @@
             "required": [
               "action",
               "arguments",
-              "bundle_key",
               "fingerprint"
             ]
           },
@@ -1648,7 +1647,6 @@
             "required": [
               "action",
               "arguments",
-              "bundle_key",
               "fingerprint"
             ]
           },
@@ -2260,12 +2258,12 @@
         }
       },
       "Write_enqueue": {
+        "description": "Requires an approved enqueue confirmation. With bundle_key, the revision binds the existing bundle. Without bundle_key, it binds the profile revision and the exact ready on-disk bucket, bundle_id and fingerprint; the daemon admits immutable snapshots before dispatch.",
         "type": "object",
         "additionalProperties": false,
         "required": [
           "profile_id",
-          "arguments",
-          "bundle_key"
+          "arguments"
         ],
         "properties": {
           "profile_id": {
