@@ -530,3 +530,44 @@ def test_accepted_pause_drains_current_request_and_blocks_older_queue_and_due_wo
     with StateRepository.open_existing(database) as repository:
         assert repository.get_run_request(2).status == "queued"
         assert repository.get_pause_state().paused
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Authorization",
+        "X-Post-Pulsar-Principal",
+        "X-Post-Pulsar-Version",
+        "X-Post-Pulsar-Control-Version",
+        "If-Match",
+        "Idempotency-Key",
+        "X-Post-Pulsar-Startup-Nonce",
+        "X-Post-Pulsar-Operator-Secret",
+        "Content-Length",
+        "Content-Type",
+        "Transfer-Encoding",
+        "Host",
+    ],
+)
+@pytest.mark.parametrize("second", ["fixture", "different-fixture"])
+def test_http_adapter_rejects_duplicate_singletons_before_dispatch(header, second):
+    from email.message import Message
+    from io import BytesIO
+    from types import SimpleNamespace
+    from post_pulsar.daemon import _handler_for
+
+    dispatched, statuses = [], []
+    application = SimpleNamespace(handle=lambda request: dispatched.append(request))
+    handler = object.__new__(_handler_for(application))
+    handler.headers = Message()
+    handler.headers[header] = "fixture"
+    handler.headers[header.lower()] = second
+    handler.command, handler.path = "POST", "/control/v1/shutdown"
+    handler.rfile, handler.wfile = BytesIO(), BytesIO()
+    handler.send_response = lambda status, *args: statuses.append(status)
+    handler.send_header = lambda *args: None
+    handler.end_headers = lambda: None
+    handler.send_error = lambda status, *args: statuses.append(status)
+    handler._serve()
+    assert statuses == [400]
+    assert dispatched == []

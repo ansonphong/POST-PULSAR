@@ -405,6 +405,111 @@ def test_operator_secret_requires_tty_and_stores_only_memory_hard_verifier(
     assert verifier.stat().st_mode & 0o077 == 0
 
 
+def test_hardened_lifecycle_threads_discovery_policy_and_keeps_operator_private(
+    tmp_path, monkeypatch
+):
+    import grp
+    import pwd
+    from types import SimpleNamespace
+    from post_pulsar import secure_files
+    from post_pulsar.bootstrap import load_bootstrap
+    from post_pulsar.config import load_local_settings
+    from post_pulsar.control import load_agent_capability, verify_operator_secret
+
+    core, agent, group = os.getuid(), os.getuid() + 12345, os.getgid()
+    accounts = [
+        SimpleNamespace(pw_uid=uid, pw_name=name, pw_gid=group)
+        for uid, name in ((core, "fixture-core"), (agent, "fixture-agent"))
+    ]
+    monkeypatch.setattr(pwd, "getpwall", lambda: accounts)
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda uid: next(a for a in accounts if a.pw_uid == uid)
+    )
+    monkeypatch.setattr(
+        grp,
+        "getgrgid",
+        lambda gid: SimpleNamespace(gr_gid=gid, gr_mem=["fixture-agent"]),
+    )
+    monkeypatch.setattr(os, "getgrouplist", lambda name, gid: [group])
+    monkeypatch.setattr(os, "getgroups", lambda: [group])
+    monkeypatch.setattr(os, "getegid", lambda: group)
+    monkeypatch.setattr(secure_files, "_validate_ancestors", lambda path, policy: None)
+    config, database = _setup(tmp_path)
+    content = config.read_text().replace(
+        "[app]",
+        f'[app]\ndeployment_mode = "hardened"\nhardened_core_principal = "{core}"\nhardened_agent_principal = "{agent}"\nhardened_agent_group = {group}',
+    )
+    for filename in ("agent-capability", "bootstrap.json", "endpoint.json"):
+        content = content.replace("state/control/" + filename, "discovery/" + filename)
+    config.write_text(content)
+    policy = load_local_settings(config).app.record_policy
+    args = [
+        "control",
+        "agent-capability",
+        "initialize",
+        "--config",
+        str(config),
+        "--installation-id",
+        "a" * 32,
+        "--service-mode",
+        "manual",
+        "--service-identifier",
+        "post-pulsar",
+        "--json",
+    ]
+    code, output, errors = _invoke(args)
+    assert code == EXIT_OK and not errors
+    bootstrap = load_bootstrap(tmp_path / "discovery/bootstrap.json", policy=policy)
+    first = load_agent_capability(bootstrap.agent_capability, policy=policy)
+    assert first not in output
+    code, output, errors = _invoke(
+        ["control", "agent-capability", "rotate", "--config", str(config), "--json"]
+    )
+    second = load_agent_capability(bootstrap.agent_capability, policy=policy)
+    assert code == EXIT_OK and not errors and second != first and second not in output
+    code, output, errors = _invoke(
+        ["control", "operator-secret", "initialize", "--config", str(config), "--json"],
+        stdin=_TTY("fixture operator phrase\n"),
+    )
+    assert code == EXIT_OK and not errors and "fixture operator phrase" not in output
+    verifier = tmp_path / "state/control/operator-verifier"
+    assert verify_operator_secret(verifier, "fixture operator phrase", policy=policy)
+    assert verifier.stat().st_mode & 0o7777 == 0o600
+    assert verifier.parent.stat().st_mode & 0o7777 == 0o700
+    endpoint = EndpointRecord(
+        "post-pulsar.control/v1", "127.0.0.1:8765", os.getpid(), 1, "fixture-nonce", {}
+    )
+    endpoint.write(bootstrap.endpoint_record, policy=policy)
+    assert EndpointRecord.read(bootstrap.endpoint_record, policy=policy) == endpoint
+    for path in (
+        tmp_path / "discovery/bootstrap.json",
+        bootstrap.agent_capability,
+        bootstrap.endpoint_record,
+    ):
+        assert path.stat().st_mode & 0o7777 == 0o640
+    application = ControlApplication(
+        database, bootstrap.agent_capability, record_policy=policy
+    )
+    assert (
+        application.handle(
+            ControlRequest(
+                "GET", "/control/v1/health", {"Authorization": "Bearer " + second}
+            )
+        ).status
+        == 200
+    )
+    monkeypatch.setattr(os, "getuid", lambda: agent)
+    monkeypatch.setattr(os, "geteuid", lambda: agent)
+    assert (
+        load_bootstrap(tmp_path / "discovery/bootstrap.json", policy=policy)
+        == bootstrap
+    )
+    assert load_agent_capability(bootstrap.agent_capability, policy=policy) == second
+    assert EndpointRecord.read(bootstrap.endpoint_record, policy=policy) == endpoint
+    with pytest.raises(secure_files.SecureFileError):
+        secure_files.assert_owner_file(verifier, policy=policy, agent_read=False)
+
+
 def test_bootstrap_rejects_arbitrary_service_commands_and_symlink_targets(
     tmp_path: Path,
 ) -> None:

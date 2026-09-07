@@ -23,6 +23,7 @@ from post_pulsar.process_identity import (
     process_identity_matches,
     process_start_identity,
 )
+from post_pulsar.secure_files import RecordPolicy
 from post_pulsar.state import RunRequestRecord, StateRepository
 
 RequestExecutor = Callable[[RunRequestRecord], Mapping[str, object]]
@@ -48,17 +49,19 @@ class EndpointRecord:
     capabilities: Mapping[str, object]
 
     @classmethod
-    def read(cls, path: str | Path) -> EndpointRecord:
+    def read(
+        cls, path: str | Path, *, policy: RecordPolicy | None = None
+    ) -> EndpointRecord:
         source = Path(path)
         from post_pulsar.secure_files import assert_owner_file
 
-        assert_owner_file(source)
+        assert_owner_file(source, policy=policy)
         metadata = source.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("endpoint record is unsafe")
         if metadata.st_nlink != 1:
             raise RuntimeError("endpoint record is unsafe")
-        if os.name != "nt" and metadata.st_mode & 0o077:
+        if policy is None and os.name != "nt" and metadata.st_mode & 0o077:
             raise RuntimeError("endpoint record permissions are too broad")
         value = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or set(value) != {
@@ -72,14 +75,14 @@ class EndpointRecord:
             raise RuntimeError("endpoint record schema is invalid")
         return cls(**value)
 
-    def write(self, path: str | Path) -> None:
+    def write(self, path: str | Path, *, policy: RecordPolicy | None = None) -> None:
         from post_pulsar.secure_files import atomic_owner_write
 
         destination = Path(path)
         payload = (
             json.dumps(asdict(self), sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
-        atomic_owner_write(destination, payload)
+        atomic_owner_write(destination, payload, policy=policy)
 
 
 class ForegroundDaemon:
@@ -94,6 +97,7 @@ class ForegroundDaemon:
         *,
         control_application: ControlApplication | None = None,
         agent_capability_file: str | Path | None = None,
+        record_policy: RecordPolicy | None = None,
         recovery: Callable[[], object] | None = None,
         schedule_admission: Callable[[], object] | None = None,
         request_executor: RequestExecutor | None = None,
@@ -118,6 +122,7 @@ class ForegroundDaemon:
         self._host = host
         self._port = port
         self._control = control_application
+        self._record_policy = record_policy
         self._capability_file = (
             None if agent_capability_file is None else str(Path(agent_capability_file))
         )
@@ -160,7 +165,9 @@ class ForegroundDaemon:
         self._lease = lease
         try:
             if self._endpoint.exists():
-                existing = EndpointRecord.read(self._endpoint)
+                existing = EndpointRecord.read(
+                    self._endpoint, policy=self._record_policy
+                )
                 if _record_process_is_live(existing):
                     raise RuntimeError("endpoint record is owned by a live process")
             if self._recovery is not None:
@@ -184,7 +191,7 @@ class ForegroundDaemon:
                     "agent_capability_file": self._capability_file,
                 },
             )
-            record.write(self._endpoint)
+            record.write(self._endpoint, policy=self._record_policy)
             self._http_thread = threading.Thread(
                 target=self._server.serve_forever,
                 name="post-pulsar-control",
@@ -328,7 +335,7 @@ class ForegroundDaemon:
             self._server.server_close()
             self._server = None
         try:
-            record = EndpointRecord.read(self._endpoint)
+            record = EndpointRecord.read(self._endpoint, policy=self._record_policy)
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
             record = None
         if (
@@ -373,6 +380,29 @@ def _handler_for(
             return
 
         def _serve(self) -> None:
+            singleton_headers = {
+                "authorization",
+                "if-match",
+                "idempotency-key",
+                "content-length",
+                "content-type",
+                "transfer-encoding",
+                "host",
+                "origin",
+                "expect",
+            }
+            for name in self.headers.keys():
+                if (
+                    name.lower() in singleton_headers
+                    or name.lower().startswith("x-post-pulsar-")
+                ) and len(self.headers.get_all(name, [])) != 1:
+                    self.close_connection = True
+                    self.send_error(400, "Ambiguous singleton header")
+                    return
+            if self.headers.get("Transfer-Encoding") is not None:
+                self.close_connection = True
+                self.send_error(400, "Transfer encoding is unsupported")
+                return
             length_text = self.headers.get("Content-Length", "0")
             try:
                 length = int(length_text)

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from post_pulsar import __version__
 from post_pulsar.content import scan_inbox
+from post_pulsar.secure_files import RecordPolicy
 from post_pulsar.state import (
     SCHEMA_VERSION,
     BundleRecord,
@@ -64,9 +65,10 @@ _FORBIDDEN_INPUT_KEYS: Final = frozenset(
         "platform_response_body",
     }
 )
-_OPERATIONS: Final = (
+SUPPORTED_OPERATIONS: Final = (
     "health",
     "capabilities",
+    "shutdown",
     "status",
     "dashboard",
     "profiles",
@@ -78,7 +80,11 @@ _OPERATIONS: Final = (
     "readyBundle",
     "enqueue",
     "schedules",
+    "createSchedule",
+    "modifySchedule",
+    "disableSchedule",
     "requests",
+    "requestStatus",
     "pause",
     "resume",
     "runNow",
@@ -118,19 +124,23 @@ class ControlResponse:
     body: bytes
 
 
-def rotate_agent_capability(path: str | Path) -> str:
+def rotate_agent_capability(
+    path: str | Path, *, policy: RecordPolicy | None = None
+) -> str:
     """Generate and atomically install a fresh 256-bit bearer capability."""
     destination = Path(path)
-    _assert_secret_target(destination, allow_missing=True)
+    _assert_secret_target(destination, allow_missing=True, policy=policy)
     token = secrets.token_hex(32)
-    _atomic_owner_write(destination, (token + "\n").encode("ascii"))
+    _atomic_owner_write(destination, (token + "\n").encode("ascii"), policy=policy)
     return token
 
 
-def load_agent_capability(path: str | Path) -> str:
+def load_agent_capability(
+    path: str | Path, *, policy: RecordPolicy | None = None
+) -> str:
     """Load a capability only from an owner-only regular non-symlink file."""
     source = Path(path)
-    _assert_secret_target(source, allow_missing=False)
+    _assert_secret_target(source, allow_missing=False, policy=policy)
     token = source.read_text(encoding="ascii").strip()
     if not _TOKEN_RE.fullmatch(token):
         raise ControlSecurityError("agent capability file is invalid")
@@ -143,6 +153,7 @@ def initialize_operator_secret(
     input_stream: _TTYInput,
     max_failures: int = 5,
     lockout_seconds: int = 300,
+    policy: RecordPolicy | None = None,
 ) -> None:
     """Read a secret once from a real terminal and persist only a scrypt verifier."""
     if not input_stream.isatty():
@@ -169,16 +180,22 @@ def initialize_operator_secret(
         "max_failures": max_failures,
         "lockout_seconds": lockout_seconds,
     }
-    _atomic_owner_write(Path(path), _canonical_json(document))
+    _atomic_owner_write(
+        Path(path), _canonical_json(document), policy=policy, agent_read=False
+    )
 
 
 def verify_operator_secret(
-    path: str | Path, supplied: str, *, now: float | None = None
+    path: str | Path,
+    supplied: str,
+    *,
+    now: float | None = None,
+    policy: RecordPolicy | None = None,
 ) -> bool:
     """Verify and atomically checkpoint a bounded failed-attempt lockout."""
     moment = time.time() if now is None else now
     source = Path(path)
-    _assert_secret_target(source, allow_missing=False)
+    _assert_secret_target(source, allow_missing=False, policy=policy, agent_read=False)
     try:
         document = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(document, dict) or document.get("kdf") != "scrypt":
@@ -212,7 +229,9 @@ def verify_operator_secret(
             failures = 0
             document["locked_until"] = moment + lockout
         document["failed_attempts"] = failures
-    _atomic_owner_write(source, _canonical_json(document))
+    _atomic_owner_write(
+        source, _canonical_json(document), policy=policy, agent_read=False
+    )
     return accepted
 
 
@@ -229,8 +248,10 @@ class ControlApplication:
         max_body_bytes: int = DEFAULT_MAX_BODY,
         max_results: int = DEFAULT_MAX_RESULTS,
         confirmation_ttl_seconds: int = 300,
+        record_policy: RecordPolicy | None = None,
     ) -> None:
         self._database = Path(database_path)
+        self._record_policy = record_policy
         self._capability_file = Path(capability_file)
         self._operator_verifier_file = (
             None if operator_verifier_file is None else Path(operator_verifier_file)
@@ -320,7 +341,7 @@ class ControlApplication:
                 "core_semver": __version__,
                 "control_api_major": CONTROL_API_MAJOR,
                 "state_schema": SCHEMA_VERSION,
-                "operations": list(_OPERATIONS),
+                "operations": list(SUPPORTED_OPERATIONS),
                 "allow_agent_publish": self._allow_agent_publish,
             }, 200
         if method == "GET" and route in {("status",), ("dashboard",)}:
@@ -660,7 +681,9 @@ class ControlApplication:
     def _authenticate(self, headers: Mapping[str, str]) -> None:
         authorization = headers.get("authorization", "")
         supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
-        expected = load_agent_capability(self._capability_file)
+        expected = load_agent_capability(
+            self._capability_file, policy=self._record_policy
+        )
         candidate = supplied if _TOKEN_RE.fullmatch(supplied) else "0" * 64
         if not hmac.compare_digest(candidate.encode("ascii"), expected.encode("ascii")):
             raise ControlSecurityError("authentication failed")
@@ -669,7 +692,9 @@ class ControlApplication:
         if self._operator_verifier_file is None:
             raise ControlSecurityError("operator approval is unavailable")
         supplied = headers.get("x-post-pulsar-operator-secret", "")
-        if not verify_operator_secret(self._operator_verifier_file, supplied):
+        if not verify_operator_secret(
+            self._operator_verifier_file, supplied, policy=self._record_policy
+        ):
             raise ControlSecurityError("operator authentication failed")
 
     @staticmethod
@@ -861,11 +886,19 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _assert_secret_target(path: Path, *, allow_missing: bool) -> None:
+def _assert_secret_target(
+    path: Path,
+    *,
+    allow_missing: bool,
+    policy: RecordPolicy | None = None,
+    agent_read: bool = True,
+) -> None:
     from post_pulsar.secure_files import SecureFileError, assert_owner_file
 
     try:
-        assert_owner_file(path, allow_missing=allow_missing)
+        assert_owner_file(
+            path, allow_missing=allow_missing, policy=policy, agent_read=agent_read
+        )
     except (OSError, SecureFileError):
         raise ControlSecurityError("credential file is unsafe or unavailable") from None
     try:
@@ -880,16 +913,24 @@ def _assert_secret_target(path: Path, *, allow_missing: bool) -> None:
         or metadata.st_nlink != 1
     ):
         raise ControlSecurityError("credential file is unsafe")
-    if os.name != "nt" and metadata.st_mode & 0o077:
+    if policy is None and os.name != "nt" and metadata.st_mode & 0o077:
         raise ControlSecurityError("credential file permissions are too broad")
 
 
-def _atomic_owner_write(path: Path, payload: bytes) -> None:
+def _atomic_owner_write(
+    path: Path,
+    payload: bytes,
+    *,
+    policy: RecordPolicy | None = None,
+    agent_read: bool = True,
+) -> None:
     from post_pulsar.secure_files import SecureFileError, atomic_owner_write
 
-    _assert_secret_target(path, allow_missing=True)
+    _assert_secret_target(
+        path, allow_missing=True, policy=policy, agent_read=agent_read
+    )
     try:
-        atomic_owner_write(path, payload)
+        atomic_owner_write(path, payload, policy=policy, agent_read=agent_read)
     except (OSError, SecureFileError):
         raise ControlSecurityError("credential file write is unsafe") from None
 

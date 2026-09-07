@@ -561,7 +561,7 @@ def _control_call(
     if not endpoint_path.exists():
         return None
     try:
-        endpoint = EndpointRecord.read(endpoint_path)
+        endpoint = EndpointRecord.read(endpoint_path, policy=settings.app.record_policy)
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise StateError("daemon endpoint record is invalid") from exc
     if endpoint.protocol != CONTROL_SCHEMA:
@@ -577,7 +577,9 @@ def _control_call(
             "incompatible_control_version",
             "daemon control version is incompatible",
         )
-    capability = load_agent_capability(settings.app.agent_capability_file)
+    capability = load_agent_capability(
+        settings.app.agent_capability_file, policy=settings.app.record_policy
+    )
     request_headers = {
         "Authorization": f"Bearer {capability}",
         "X-Post-Pulsar-Control-Version": str(CONTROL_API_MAJOR),
@@ -1125,7 +1127,9 @@ def _shutdown(
 
     settings.profile(profile_id)
     try:
-        endpoint = EndpointRecord.read(settings.app.endpoint_record_file)
+        endpoint = EndpointRecord.read(
+            settings.app.endpoint_record_file, policy=settings.app.record_policy
+        )
     except FileNotFoundError:
         raise _RemoteControlError(
             503, "daemon_unavailable", "foreground daemon is not running"
@@ -1179,7 +1183,9 @@ def _daemon_foreground(
     from post_pulsar.control import ControlApplication, load_agent_capability
     from post_pulsar.daemon import ForegroundDaemon
 
-    load_agent_capability(settings.app.agent_capability_file)
+    load_agent_capability(
+        settings.app.agent_capability_file, policy=settings.app.record_policy
+    )
     database = settings.app.state_directory / "post_pulsar.sqlite3"
     control = ControlApplication(
         database,
@@ -1189,6 +1195,7 @@ def _daemon_foreground(
         max_body_bytes=settings.app.control_max_body_bytes,
         max_results=settings.app.control_max_results,
         confirmation_ttl_seconds=settings.app.confirmation_ttl_seconds,
+        record_policy=settings.app.record_policy,
     )
     holder: dict[str, ForegroundDaemon] = {}
 
@@ -1306,6 +1313,7 @@ def _daemon_foreground(
         settings.app.control_port,
         control_application=control,
         agent_capability_file=settings.app.agent_capability_file,
+        record_policy=settings.app.record_policy,
         recovery=recover,
         schedule_admission=admit_schedules,
         request_executor=execute,
@@ -1703,9 +1711,9 @@ def _control_lifecycle(
         action = cast(str, arguments.capability_command)
         if action == "initialize":
             if path.exists():
-                load_agent_capability(path)
+                load_agent_capability(path, policy=settings.app.record_policy)
                 raise ControlSecurityError("agent capability is already initialized")
-            rotate_agent_capability(path)
+            rotate_agent_capability(path, policy=settings.app.record_policy)
             record = write_bootstrap(
                 settings.app.bootstrap_file,
                 BootstrapRecord(
@@ -1715,6 +1723,7 @@ def _control_lifecycle(
                     service_mode=arguments.service_mode,
                     service_identifier=arguments.service_identifier,
                 ),
+                policy=settings.app.record_policy,
             )
             return {
                 "status": "initialized",
@@ -1722,25 +1731,35 @@ def _control_lifecycle(
                 "installation_id": record.installation_id,
             }
         if action == "rotate":
-            load_agent_capability(path)
-            rotate_agent_capability(path)
+            load_agent_capability(path, policy=settings.app.record_policy)
+            rotate_agent_capability(path, policy=settings.app.record_policy)
             return {"status": "rotated"}
-        load_agent_capability(path)
+        load_agent_capability(path, policy=settings.app.record_policy)
+        if settings.app.record_policy is not None:
+            from post_pulsar.secure_files import SecureFileError
+
+            try:
+                settings.app.record_policy.validate(write=True)
+            except SecureFileError:
+                raise ControlSecurityError(
+                    "capability revocation requires the core principal"
+                ) from None
         path.unlink()
         _fsync_directory(path.parent)
         return {"status": "revoked"}
     path = settings.app.operator_verifier_file
     action = cast(str, arguments.operator_command)
     if action == "initialize" and path.exists():
-        _assert_owner_file(path, "operator verifier")
+        _assert_owner_file(path, "operator verifier", policy=settings.app.record_policy)
         raise ControlSecurityError("operator secret is already initialized")
     if action == "rotate":
-        _assert_owner_file(path, "operator verifier")
+        _assert_owner_file(path, "operator verifier", policy=settings.app.record_policy)
     initialize_operator_secret(
         path,
         input_stream=_secret_input(input_stream),
         max_failures=settings.app.operator_max_failures,
         lockout_seconds=settings.app.operator_lockout_seconds,
+        policy=settings.app.record_policy,
     )
     return {"status": "initialized" if action == "initialize" else "rotated"}
 
@@ -1777,7 +1796,9 @@ def _approve_confirmation(
         if remote.get("profile_id") != profile_id:
             raise StateError("confirmation does not belong to the requested profile")
         return {"confirmation": remote}
-    if not verify_operator_secret(settings.app.operator_verifier_file, supplied):
+    if not verify_operator_secret(
+        settings.app.operator_verifier_file, supplied, policy=settings.app.record_policy
+    ):
         raise ControlSecurityError("operator authentication failed")
     locks = LockManager(settings.app.state_directory)
     database = settings.app.state_directory / "post_pulsar.sqlite3"
@@ -1813,12 +1834,12 @@ def _secret_input(stream: IO[str]) -> IO[str] | _GetpassInput:
     return _GetpassInput(stream) if stream is sys.stdin else stream
 
 
-def _assert_owner_file(path: Path, label: str) -> None:
+def _assert_owner_file(path: Path, label: str, *, policy=None) -> None:
     from post_pulsar.control import ControlSecurityError
     from post_pulsar.secure_files import SecureFileError, assert_owner_file
 
     try:
-        assert_owner_file(path)
+        assert_owner_file(path, policy=policy, agent_read=False)
     except (OSError, SecureFileError):
         raise ControlSecurityError(f"{label} file is unsafe or missing") from None
 

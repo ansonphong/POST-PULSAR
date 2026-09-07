@@ -21,6 +21,58 @@
     }
   ],
   "paths": {
+    "/shutdown": {
+      "post": {
+        "operationId": "shutdown",
+        "description": "Requires the agent bearer capability. Any bearer holder (agent or operator) may request graceful shutdown; the principal header alone grants no authority and an operator secret is not required. The startup_nonce must exactly match the discovered endpoint incarnation. This operation is independent of publication permission and uses the nonce instead of If-Match or Idempotency-Key. Acceptance means stopping has been requested, not that shutdown has completed.",
+        "security": [{"agentCapability": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["startup_nonce"],
+                "properties": {
+                  "startup_nonce": {"type": "string", "minLength": 1, "maxLength": 512}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Authenticated shutdown accepted for the exact daemon incarnation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["schema", "ok", "data", "request_id"],
+                  "properties": {
+                    "schema": {"const": "post-pulsar.control/v1"},
+                    "ok": {"const": true},
+                    "request_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+                    "data": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["status"],
+                      "properties": {"status": {"const": "stopping"}}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "409": {"description": "Stale startup nonce, incompatible control version, or shutdown is unavailable.", "$ref": "#/components/responses/Error"},
+          "413": {"$ref": "#/components/responses/Error"},
+          "422": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/health": {
       "get": {
         "operationId": "health",

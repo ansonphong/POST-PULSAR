@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
+from post_pulsar.secure_files import RecordPolicy
+
 BOOTSTRAP_SCHEMA: Final = "post-pulsar.bootstrap/v1"
 SERVICE_MODES: Final = frozenset(
     {"manual", "systemd-user", "launchd-agent", "windows-service", "windows-task"}
@@ -97,28 +99,33 @@ def validate_bootstrap(
 
 
 def write_bootstrap(
-    path: str | Path, value: BootstrapRecord | Mapping[str, object]
+    path: str | Path,
+    value: BootstrapRecord | Mapping[str, object],
+    *,
+    policy: RecordPolicy | None = None,
 ) -> BootstrapRecord:
     """Atomically write a validated owner-only bootstrap record."""
     destination = Path(path)
     record = validate_bootstrap(value)
-    _assert_safe_target(destination, allow_missing=True)
+    _assert_safe_target(destination, allow_missing=True, policy=policy)
     from post_pulsar.secure_files import SecureFileError, atomic_owner_write
 
     try:
         payload = (
             json.dumps(record.document(), sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        atomic_owner_write(destination, payload)
+        atomic_owner_write(destination, payload, policy=policy)
     except (OSError, SecureFileError):
         raise BootstrapError("bootstrap target is unsafe") from None
     return record
 
 
-def load_bootstrap(path: str | Path) -> BootstrapRecord:
+def load_bootstrap(
+    path: str | Path, *, policy: RecordPolicy | None = None
+) -> BootstrapRecord:
     """Load an owner-only, regular bootstrap record through its closed schema."""
     source = Path(path)
-    _assert_safe_target(source, allow_missing=False)
+    _assert_safe_target(source, allow_missing=False, policy=policy)
     try:
         value = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -128,11 +135,13 @@ def load_bootstrap(path: str | Path) -> BootstrapRecord:
     return validate_bootstrap(cast(Mapping[str, object], value))
 
 
-def _assert_safe_target(path: Path, *, allow_missing: bool) -> None:
+def _assert_safe_target(
+    path: Path, *, allow_missing: bool, policy: RecordPolicy | None = None
+) -> None:
     from post_pulsar.secure_files import SecureFileError, assert_owner_file
 
     try:
-        assert_owner_file(path, allow_missing=allow_missing)
+        assert_owner_file(path, allow_missing=allow_missing, policy=policy)
     except (OSError, SecureFileError):
         raise BootstrapError("bootstrap target is unsafe or missing") from None
     try:
@@ -147,7 +156,7 @@ def _assert_safe_target(path: Path, *, allow_missing: bool) -> None:
         or metadata.st_nlink != 1
     ):
         raise BootstrapError("bootstrap target is unsafe")
-    if os.name != "nt" and metadata.st_mode & 0o077:
+    if policy is None and os.name != "nt" and metadata.st_mode & 0o077:
         raise BootstrapError("bootstrap permissions are too broad")
 
 

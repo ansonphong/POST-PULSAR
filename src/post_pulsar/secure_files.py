@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
+import re
 import stat
+import sys
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -14,11 +18,172 @@ class SecureFileError(RuntimeError):
     """A local record cannot be kept private to the current user."""
 
 
+@dataclass(frozen=True, slots=True)
+class RecordPolicy:
+    """Pinned OS identities for core mutation and optional agent discovery reads."""
+
+    core_principal: str
+    agent_principal: str
+    agent_group: int | None = None
+
+    def validate(self, *, write: bool = False) -> None:
+        if self.core_principal == self.agent_principal:
+            raise SecureFileError("hardened mode requires distinct principals")
+        if _is_windows():
+            if self.agent_group is not None:
+                raise SecureFileError(
+                    "Windows hardened policy cannot use a POSIX group"
+                )
+            _windows_validate_user_sid(self.core_principal)
+            _windows_validate_user_sid(self.agent_principal)
+            current = _windows_current_sid()
+        else:
+            import grp
+            import pwd
+
+            if any(
+                not re.fullmatch(r"0|[1-9][0-9]*", value)
+                for value in (self.core_principal, self.agent_principal)
+            ):
+                raise SecureFileError("hardened POSIX principals must be numeric UIDs")
+            core, agent = int(self.core_principal), int(self.agent_principal)
+            if agent == 0 or type(self.agent_group) is not int or self.agent_group <= 0:
+                raise SecureFileError("hardened agent identity or group is invalid")
+            try:
+                users = pwd.getpwall()
+                core_user, agent_user = pwd.getpwuid(core), pwd.getpwuid(agent)
+                group = grp.getgrgid(self.agent_group)
+                if any(
+                    sum(user.pw_uid == uid for user in users) != 1
+                    for uid in (core, agent)
+                ):
+                    raise SecureFileError("hardened principal identity is ambiguous")
+                members = set(group.gr_mem) | {
+                    u.pw_name for u in users if u.pw_gid == self.agent_group
+                }
+                if agent_user.pw_name not in members or not members <= {
+                    core_user.pw_name,
+                    agent_user.pw_name,
+                }:
+                    raise SecureFileError("hardened discovery group is not dedicated")
+                # Reject supplementary grants to the agent: the dedicated group
+                # must be its sole group, making traversal decisions unambiguous.
+                if set(os.getgrouplist(agent_user.pw_name, agent_user.pw_gid)) != {
+                    self.agent_group
+                }:
+                    raise SecureFileError("hardened agent has additional groups")
+            except (KeyError, OSError, AttributeError):
+                raise SecureFileError(
+                    "hardened identity cannot be established"
+                ) from None
+            if os.getuid() != os.geteuid():
+                raise SecureFileError("hardened set-user-ID execution is unsupported")
+            current = str(os.geteuid())
+            if current == self.agent_principal and (
+                os.getegid() != self.agent_group
+                or set(os.getgroups()) - {self.agent_group}
+            ):
+                raise SecureFileError(
+                    "hardened agent process has stale group membership"
+                )
+        if current not in (
+            {self.core_principal}
+            if write
+            else {self.core_principal, self.agent_principal}
+        ):
+            raise SecureFileError(
+                "process does not match the hardened principal policy"
+            )
+
+
+def _reject_posix_acl(path: Path) -> None:
+    if sys.platform != "linux" or not hasattr(os, "getxattr"):
+        raise SecureFileError("POSIX ACL validation is unavailable")
+    for name in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            os.getxattr(path, name, follow_symlinks=False)
+        except OSError as error:
+            if error.errno in {errno.ENODATA, errno.ENOTSUP}:
+                continue
+            raise SecureFileError("POSIX ACL validation failed") from None
+        raise SecureFileError("hardened records cannot have extended POSIX ACLs")
+
+
+def _validate_ancestors(path: Path, policy: RecordPolicy) -> None:
+    """Validate pre-provisioned traversal without broadening existing directories."""
+    for ancestor in path.absolute().parents:
+        metadata = ancestor.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise SecureFileError("hardened ancestor is unsafe")
+        if _is_windows():
+            # Require the same protected core/agent policy on every ancestor
+            # below the volume root; an operator must provision this hierarchy.
+            if ancestor != Path(ancestor.anchor):
+                _windows_validate(ancestor, policy=policy)
+        else:
+            _reject_posix_acl(ancestor)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if metadata.st_uid not in {0, int(policy.core_principal)} or mode & 0o022:
+                raise SecureFileError(
+                    "hardened ancestor can be replaced by another principal"
+                )
+            traversal = 0o010 if metadata.st_gid == policy.agent_group else 0o001
+            if not mode & traversal:
+                raise SecureFileError("hardened agent cannot traverse an ancestor")
+
+
+def _core_group(policy: RecordPolicy) -> int:
+    import pwd
+
+    return pwd.getpwuid(int(policy.core_principal)).pw_gid
+
+
+def _validate_directory(
+    path: Path, policy: RecordPolicy, *, agent_read: bool = True
+) -> None:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise SecureFileError("hardened directory is unsafe")
+    if _is_windows():
+        _windows_validate(path, policy=policy, agent_read=agent_read)
+    else:
+        _reject_posix_acl(path)
+        if (
+            metadata.st_uid != int(policy.core_principal)
+            or metadata.st_gid
+            != (policy.agent_group if agent_read else _core_group(policy))
+            or stat.S_IMODE(metadata.st_mode) != (0o750 if agent_read else 0o700)
+        ):
+            raise SecureFileError("hardened directory policy does not match")
+    if agent_read:
+        _validate_ancestors(path, policy)
+
+
 def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def assert_owner_file(path: Path, *, allow_missing: bool = False) -> None:
+def assert_owner_file(
+    path: Path,
+    *,
+    allow_missing: bool = False,
+    policy: RecordPolicy | None = None,
+    agent_read: bool = True,
+) -> None:
+    if policy is not None:
+        policy.validate(write=not agent_read)
+        if path.parent.exists():
+            _validate_directory(path.parent, policy, agent_read=agent_read)
+        elif agent_read:
+            _validate_ancestors(path.parent, policy)
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -33,12 +198,36 @@ def assert_owner_file(path: Path, *, allow_missing: bool = False) -> None:
     ):
         raise SecureFileError("local record is unsafe")
     if _is_windows():
-        _windows_validate(path)
+        if policy is None:
+            _windows_validate(path)
+        else:
+            _windows_validate(path, policy=policy, agent_read=agent_read)
+    elif policy is not None:
+        _reject_posix_acl(path)
+        if (
+            metadata.st_uid != int(policy.core_principal)
+            or metadata.st_gid
+            != (policy.agent_group if agent_read else _core_group(policy))
+            or stat.S_IMODE(metadata.st_mode) != (0o640 if agent_read else 0o600)
+        ):
+            raise SecureFileError("hardened file policy does not match")
     elif metadata.st_mode & 0o077 or metadata.st_uid != os.getuid():
         raise SecureFileError("local record permissions are too broad")
 
 
-def secure_directory(path: Path) -> None:
+def secure_directory(path: Path, *, policy: RecordPolicy | None = None) -> None:
+    if policy is not None:
+        policy.validate(write=True)
+        _validate_ancestors(path, policy)
+        if not path.exists():
+            if _is_windows():
+                _windows_create_directory(path, policy=policy)
+            else:
+                path.mkdir(mode=0o700)
+                os.chown(path, int(policy.core_principal), policy.agent_group)
+                path.chmod(0o750)
+        _validate_directory(path, policy)
+        return
     if _is_windows():
         if not path.exists():
             if not path.parent.exists():
@@ -74,25 +263,48 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def atomic_owner_write(path: Path, payload: bytes) -> None:
-    assert_owner_file(path, allow_missing=True)
-    secure_directory(path.parent)
+def atomic_owner_write(
+    path: Path,
+    payload: bytes,
+    *,
+    policy: RecordPolicy | None = None,
+    agent_read: bool = True,
+) -> None:
+    if policy is not None:
+        policy.validate(write=True)
+    assert_owner_file(path, allow_missing=True, policy=policy, agent_read=agent_read)
+    secure_directory(path.parent, policy=policy if agent_read else None)
+    if policy is not None and not agent_read:
+        _validate_directory(path.parent, policy, agent_read=False)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
         if _is_windows():
-            _windows_secure(temporary, False)
-            _windows_validate(temporary)
+            if policy is None:
+                _windows_secure(temporary, False)
+                _windows_validate(temporary)
+            else:
+                _windows_secure(temporary, False, policy=policy, agent_read=agent_read)
+                _windows_validate(temporary, policy=policy, agent_read=agent_read)
         else:
-            os.fchmod(descriptor, 0o600)
+            if policy is not None:
+                os.fchown(
+                    descriptor,
+                    int(policy.core_principal),
+                    policy.agent_group if agent_read else _core_group(policy),
+                )
+            os.fchmod(descriptor, 0o640 if policy is not None and agent_read else 0o600)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        assert_owner_file(path, allow_missing=True)
+        assert_owner_file(temporary, policy=policy, agent_read=agent_read)
+        assert_owner_file(
+            path, allow_missing=True, policy=policy, agent_read=agent_read
+        )
         os.replace(temporary, path)
-        assert_owner_file(path)
+        assert_owner_file(path, policy=policy, agent_read=agent_read)
         fsync_directory(path.parent)
     finally:
         if descriptor != -1:
@@ -114,6 +326,19 @@ def _windows_api():
             w.BOOL,
         ),
         "ConvertSidToStringSidW": ([pointer, ctypes.POINTER(pointer)], w.BOOL),
+        "ConvertStringSidToSidW": ([w.LPCWSTR, ctypes.POINTER(pointer)], w.BOOL),
+        "LookupAccountSidW": (
+            [
+                w.LPCWSTR,
+                pointer,
+                w.LPWSTR,
+                ctypes.POINTER(w.DWORD),
+                w.LPWSTR,
+                ctypes.POINTER(w.DWORD),
+                ctypes.POINTER(w.DWORD),
+            ],
+            w.BOOL,
+        ),
         "ConvertStringSecurityDescriptorToSecurityDescriptorW": (
             [w.LPCWSTR, w.DWORD, ctypes.POINTER(pointer), pointer],
             w.BOOL,
@@ -175,14 +400,67 @@ def _win_check(success: object) -> None:
         raise SecureFileError("Windows private security operation failed")
 
 
-@contextmanager
-def _windows_descriptor(directory: bool):
+def _windows_validate_user_sid(identifier: str) -> None:
+    """Resolve an explicit account SID, rejecting groups and built-in identities."""
     from ctypes import wintypes as w
 
-    adv, kernel = _windows_api()
-    token = w.HANDLE()
-    sid_string = ctypes.c_void_p()
-    descriptor = ctypes.c_void_p()
+    if (
+        not re.fullmatch(
+            r"S-1-5-21-[1-9][0-9]*-[1-9][0-9]*-[1-9][0-9]*-[1-9][0-9]*", identifier
+        )
+        or int(identifier.rsplit("-", 1)[1]) < 1000
+    ):
+        raise SecureFileError("hardened Windows identity must be a distinct user SID")
+    try:
+        adv, kernel = _windows_api()
+    except (AttributeError, OSError):
+        raise SecureFileError(
+            "native Windows identity validation is unavailable"
+        ) from None
+    sid = ctypes.c_void_p()
+    _win_check(adv.ConvertStringSidToSidW(identifier, ctypes.byref(sid)))
+    try:
+        name_size, domain_size, kind = w.DWORD(), w.DWORD(), w.DWORD()
+        adv.LookupAccountSidW(
+            None,
+            sid,
+            None,
+            ctypes.byref(name_size),
+            None,
+            ctypes.byref(domain_size),
+            ctypes.byref(kind),
+        )
+        _win_check(0 < name_size.value <= 32768 and domain_size.value <= 32768)
+        name, domain = (
+            ctypes.create_unicode_buffer(name_size.value),
+            ctypes.create_unicode_buffer(max(1, domain_size.value)),
+        )
+        _win_check(
+            adv.LookupAccountSidW(
+                None,
+                sid,
+                name,
+                ctypes.byref(name_size),
+                domain,
+                ctypes.byref(domain_size),
+                ctypes.byref(kind),
+            )
+        )
+        _win_check(kind.value == 1)  # SidTypeUser, never a group SID.
+    finally:
+        kernel.LocalFree(sid)
+
+
+def _windows_current_sid() -> str:
+    from ctypes import wintypes as w
+
+    try:
+        adv, kernel = _windows_api()
+    except (AttributeError, OSError):
+        raise SecureFileError(
+            "native Windows identity validation is unavailable"
+        ) from None
+    token, sid_string = w.HANDLE(), ctypes.c_void_p()
     _win_check(
         adv.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token))
     )
@@ -194,26 +472,67 @@ def _windows_descriptor(directory: bool):
         _win_check(
             adv.GetTokenInformation(token, 1, token_user, size, ctypes.byref(size))
         )
-        sid = ctypes.c_void_p.from_buffer(token_user)
-        _win_check(adv.ConvertSidToStringSidW(sid, ctypes.byref(sid_string)))
-        identifier = ctypes.wstring_at(sid_string)
+        _win_check(
+            adv.ConvertSidToStringSidW(
+                ctypes.c_void_p.from_buffer(token_user), ctypes.byref(sid_string)
+            )
+        )
+        return ctypes.wstring_at(sid_string)
+    finally:
+        if sid_string:
+            kernel.LocalFree(sid_string)
+        kernel.CloseHandle(token)
+
+
+def _windows_sddl(
+    directory: bool, policy: RecordPolicy | None = None, *, agent_read: bool = True
+) -> str:
+    if policy is None:
+        identifier = _windows_current_sid()
         inheritance = "OICI" if directory else ""
-        sddl = f"O:{identifier}D:P(A;{inheritance};FA;;;{identifier})"
+        return f"O:{identifier}D:P(A;{inheritance};FA;;;{identifier})"
+    policy.validate(write=not agent_read)
+    # No inheritance: every record receives and verifies its exact protected ACL.
+    inheritance = "OICI" if directory and not agent_read else ""
+    result = (
+        f"O:{policy.core_principal}D:P(A;{inheritance};FA;;;{policy.core_principal})"
+    )
+    if agent_read:
+        mask = "0x1200a9" if directory else "0x120089"
+        result += f"(A;;{mask};;;{policy.agent_principal})"
+    return result
+
+
+@contextmanager
+def _windows_descriptor(
+    directory: bool, policy: RecordPolicy | None = None, *, agent_read: bool = True
+):
+    from ctypes import wintypes as w
+
+    adv, kernel = _windows_api()
+    descriptor = ctypes.c_void_p()
+    try:
+        sddl = _windows_sddl(directory, policy, agent_read=agent_read)
         _win_check(
             adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl, 1, ctypes.byref(descriptor), None
+            )
+        )
+        sid, defaulted = ctypes.c_void_p(), w.BOOL()
+        _win_check(
+            adv.GetSecurityDescriptorOwner(
+                descriptor, ctypes.byref(sid), ctypes.byref(defaulted)
             )
         )
         yield adv, kernel, descriptor, sid
     finally:
         if descriptor:
             kernel.LocalFree(descriptor)
-        if sid_string:
-            kernel.LocalFree(sid_string)
-        kernel.CloseHandle(token)
 
 
-def _windows_create_directory(path: Path) -> None:
+def _windows_create_directory(
+    path: Path, *, policy: RecordPolicy | None = None
+) -> None:
     from ctypes import wintypes as w
 
     class SecurityAttributes(ctypes.Structure):
@@ -223,17 +542,28 @@ def _windows_create_directory(path: Path) -> None:
             ("inherit", w.BOOL),
         ]
 
-    with _windows_descriptor(True) as (_, kernel, descriptor, _sid):
+    with _windows_descriptor(True, policy) as (_, kernel, descriptor, _sid):
         attributes = SecurityAttributes(
             ctypes.sizeof(SecurityAttributes), descriptor, False
         )
         _win_check(kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)))
 
 
-def _windows_secure(path: Path, directory: bool) -> None:
+def _windows_secure(
+    path: Path,
+    directory: bool,
+    *,
+    policy: RecordPolicy | None = None,
+    agent_read: bool = True,
+) -> None:
     from ctypes import wintypes as w
 
-    with _windows_descriptor(directory) as (adv, _kernel, descriptor, sid):
+    with _windows_descriptor(directory, policy, agent_read=agent_read) as (
+        adv,
+        _kernel,
+        descriptor,
+        sid,
+    ):
         present, defaulted = w.BOOL(), w.BOOL()
         dacl = ctypes.c_void_p()
         _win_check(
@@ -253,7 +583,9 @@ def _windows_secure(path: Path, directory: bool) -> None:
         )
 
 
-def _windows_validate(path: Path) -> None:
+def _windows_validate(
+    path: Path, *, policy: RecordPolicy | None = None, agent_read: bool = True
+) -> None:
     from ctypes import wintypes as w
 
     class AclSize(ctypes.Structure):
@@ -261,13 +593,18 @@ def _windows_validate(path: Path) -> None:
 
     class AceHeader(ctypes.Structure):
         _fields_ = [
-            ("kind", w.BYTE),
-            ("flags", w.BYTE),
-            ("size", w.WORD),
-            ("mask", w.DWORD),
+            ("kind", ctypes.c_uint8),
+            ("flags", ctypes.c_uint8),
+            ("size", ctypes.c_uint16),
+            ("mask", ctypes.c_uint32),
         ]
 
-    with _windows_descriptor(False) as (adv, kernel, _expected, sid):
+    context = (
+        _windows_descriptor(False)
+        if policy is None
+        else _windows_descriptor(path.is_dir(), policy, agent_read=agent_read)
+    )
+    with context as (adv, kernel, expected, sid):
         owner, dacl, descriptor = (
             ctypes.c_void_p(),
             ctypes.c_void_p(),
@@ -299,15 +636,48 @@ def _windows_validate(path: Path) -> None:
             _win_check(
                 adv.GetAclInformation(dacl, ctypes.byref(size), ctypes.sizeof(size), 2)
             )
-            _win_check(size.count == 1)
-            ace = ctypes.c_void_p()
-            _win_check(adv.GetAce(dacl, 0, ctypes.byref(ace)))
-            header = AceHeader.from_address(ace.value)
-            # ACCESS_ALLOWED_ACE, no inherited/inherit-only ACE, FILE_ALL_ACCESS.
-            _win_check(
-                header.kind == 0 and not header.flags & 0x18 and header.mask == 0x1F01FF
-            )
-            _win_check(header.size >= ctypes.sizeof(AceHeader) + 8)
-            _win_check(adv.EqualSid(ctypes.c_void_p(ace.value + 8), sid))
+            _win_check(size.count == (2 if policy is not None and agent_read else 1))
+            expected_acl = ctypes.c_void_p()
+            if policy is not None:
+                present, defaulted = w.BOOL(), w.BOOL()
+                _win_check(
+                    adv.GetSecurityDescriptorDacl(
+                        expected,
+                        ctypes.byref(present),
+                        ctypes.byref(expected_acl),
+                        ctypes.byref(defaulted),
+                    )
+                )
+                _win_check(present and expected_acl)
+            for index in range(size.count):
+                ace = ctypes.c_void_p()
+                _win_check(adv.GetAce(dacl, index, ctypes.byref(ace)))
+                header = AceHeader.from_address(ace.value)
+                _win_check(header.size >= ctypes.sizeof(AceHeader) + 8)
+                if policy is None:
+                    _win_check(
+                        header.kind == 0
+                        and not header.flags & 0x18
+                        and header.mask == 0x1F01FF
+                    )
+                    _win_check(adv.EqualSid(ctypes.c_void_p(ace.value + 8), sid))
+                else:
+                    expected_ace = ctypes.c_void_p()
+                    _win_check(
+                        adv.GetAce(expected_acl, index, ctypes.byref(expected_ace))
+                    )
+                    expected_header = AceHeader.from_address(expected_ace.value)
+                    _win_check(
+                        header.kind == 0
+                        and header.flags == expected_header.flags
+                        and header.mask == expected_header.mask
+                        and header.size == expected_header.size
+                    )
+                    _win_check(
+                        adv.EqualSid(
+                            ctypes.c_void_p(ace.value + 8),
+                            ctypes.c_void_p(expected_ace.value + 8),
+                        )
+                    )
         finally:
             kernel.LocalFree(descriptor)

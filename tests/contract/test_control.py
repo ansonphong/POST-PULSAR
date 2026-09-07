@@ -310,6 +310,49 @@ def test_shutdown_requires_authentication_and_exact_incarnation(tmp_path: Path) 
     assert stopped == [True]
 
 
+def test_shutdown_contract_and_capability_route_parity(tmp_path: Path) -> None:
+    from post_pulsar.control import SUPPORTED_OPERATIONS
+
+    document = json.loads(
+        (Path(__file__).parents[2] / "api/control-v1.openapi.json").read_text()
+    )
+    operations = set()
+    for item in document["paths"].values():
+        if "$ref" in item:
+            item = document["components"]["pathItems"][item["$ref"].rsplit("/", 1)[1]]
+        operations.update(
+            operation["operationId"]
+            for operation in item.values()
+            if isinstance(operation, dict) and "operationId" in operation
+        )
+    assert set(SUPPORTED_OPERATIONS) == operations
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text().strip()
+    capabilities = json.loads(
+        _call(app, "GET", "/control/v1/capabilities", token=token).body
+    )["data"]
+    assert set(capabilities["operations"]) == operations
+    operation = document["paths"]["/shutdown"]["post"]
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    response_schema = operation["responses"]["202"]["content"]["application/json"][
+        "schema"
+    ]
+    body = {"startup_nonce": "fixture-startup-nonce"}
+    Draft202012Validator(request_schema).validate(body)
+    for invalid in (
+        {},
+        {"startup_nonce": ""},
+        {"startup_nonce": 1},
+        {**body, "extra": True},
+    ):
+        assert not Draft202012Validator(request_schema).is_valid(invalid)
+    stopped = []
+    app.bind_shutdown(lambda: stopped.append(True), body["startup_nonce"])
+    response = _call(app, "POST", "/control/v1/shutdown", token=token, body=body)
+    assert response.status == 202 and stopped == [True]
+    Draft202012Validator(response_schema).validate(json.loads(response.body))
+
+
 def test_auth_cors_limits_version_and_capabilities(tmp_path: Path) -> None:
     app = _application(tmp_path)
     token = (tmp_path / "agent").read_text(encoding="ascii").strip()

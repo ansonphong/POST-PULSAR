@@ -16,6 +16,8 @@ from typing import Final, Literal, TypeAlias, cast
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from post_pulsar.secure_files import RecordPolicy, SecureFileError
+
 TargetName: TypeAlias = Literal["x", "instagram"]
 DeploymentMode: TypeAlias = Literal["simple", "hardened"]
 
@@ -81,6 +83,19 @@ class AppSettings:
     confirmation_ttl_seconds: int
     operator_max_failures: int
     operator_lockout_seconds: int
+    hardened_core_principal: str = ""
+    hardened_agent_principal: str = ""
+    hardened_agent_group: int | None = None
+
+    @property
+    def record_policy(self) -> RecordPolicy | None:
+        if self.deployment_mode == "simple":
+            return None
+        return RecordPolicy(
+            self.hardened_core_principal,
+            self.hardened_agent_principal,
+            self.hardened_agent_group,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +228,9 @@ def load_local_settings(
             "log_max_bytes",
             "log_backups",
             "deployment_mode",
+            "hardened_core_principal",
+            "hardened_agent_principal",
+            "hardened_agent_group",
             "allow_agent_publish",
             "control_host",
             "control_port",
@@ -245,6 +263,15 @@ def load_local_settings(
         log_max_bytes=_positive_int(app_data, "log_max_bytes", 5 * 1024 * 1024, "app"),
         log_backups=_nonnegative_int(app_data, "log_backups", 3, "app"),
         deployment_mode=_deployment_mode(app_data),
+        hardened_core_principal=_string(app_data, "hardened_core_principal", "", "app"),
+        hardened_agent_principal=_string(
+            app_data, "hardened_agent_principal", "", "app"
+        ),
+        hardened_agent_group=(
+            _nonnegative_int(app_data, "hardened_agent_group", 0, "app")
+            if "hardened_agent_group" in app_data
+            else None
+        ),
         allow_agent_publish=_boolean(app_data, "allow_agent_publish", False, "app"),
         control_host=_control_host(app_data),
         control_port=_port(app_data, "control_port", 8765, "app"),
@@ -304,6 +331,34 @@ def load_local_settings(
             app_data, "operator_lockout_seconds", 300, "app", 30, 3600
         ),
     )
+
+    policy = app.record_policy
+    if policy is not None:
+        try:
+            policy.validate()
+        except (SecureFileError, OSError, ValueError):
+            raise ConfigurationError(
+                "hardened OS identity policy cannot be established"
+            ) from None
+        discovery = app.bootstrap_file.parent
+        if (
+            app.agent_capability_file.parent != discovery
+            or app.endpoint_record_file.parent != discovery
+            or discovery.is_relative_to(app.state_directory)
+            or app.state_directory.is_relative_to(discovery)
+            or app.operator_verifier_file.is_relative_to(discovery)
+        ):
+            raise ConfigurationError(
+                "hardened discovery requires one dedicated directory outside private state and operator storage"
+            )
+    elif (
+        app.hardened_core_principal
+        or app.hardened_agent_principal
+        or app.hardened_agent_group is not None
+    ):
+        raise ConfigurationError(
+            "hardened identity fields require hardened deployment_mode"
+        )
 
     profiles_data = document.get("profiles")
     if not isinstance(profiles_data, list) or not profiles_data:

@@ -133,6 +133,37 @@ def test_local_config_allows_zero_enabled_targets(tmp_path: Path) -> None:
     assert settings.profile("ansonphong").enabled_targets == ()
 
 
+def test_hardened_requires_explicit_distinct_principals(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    path.write_text(
+        path.read_text().replace(
+            'deployment_mode = "simple"', 'deployment_mode = "hardened"'
+        )
+    )
+    with pytest.raises(ConfigurationError, match="hardened"):
+        load_local_settings(path)
+
+
+@pytest.mark.parametrize("discovery", [".post-pulsar/control", ".post-pulsar", "."])
+def test_hardened_requires_discovery_outside_private_state(
+    tmp_path, monkeypatch, discovery
+):
+    from post_pulsar.secure_files import RecordPolicy
+
+    monkeypatch.setattr(RecordPolicy, "validate", lambda *args, **kwargs: None)
+    path = _write_config(
+        tmp_path,
+        extra='hardened_core_principal = "1001"\nhardened_agent_principal = "1002"\nhardened_agent_group = 1003',
+    )
+    path.write_text(
+        path.read_text()
+        .replace('deployment_mode = "simple"', 'deployment_mode = "hardened"')
+        .replace(".post-pulsar/control/", discovery + "/")
+    )
+    with pytest.raises(ConfigurationError, match="hardened discovery"):
+        load_local_settings(path)
+
+
 def test_unknown_fields_and_legacy_top_level_targets_are_rejected(
     tmp_path: Path,
 ) -> None:

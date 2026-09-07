@@ -7,6 +7,26 @@ log_file = ".post-pulsar/logs/post_pulsar.log"
 log_max_bytes = 5242880
 log_backups = 3
 deployment_mode = "simple"
+# Hardened mode requires dedicated OS accounts and a shared discovery directory
+# OUTSIDE state_directory. Provision traversable, non-writable ancestors first.
+# Linux POSIX: numeric core/agent UIDs plus a dedicated GID whose only members are the
+# agent and optionally core. The agent must have no additional groups. Core must
+# be able to chown new records to that GID. Discovery is exactly 0750/0640, with
+# no extended ACLs; existing mismatches fail closed rather than being repaired.
+# hardened_core_principal = "1001"
+# hardened_agent_principal = "1002"
+# hardened_agent_group = 1003
+# Windows: omit hardened_agent_group and use distinct, resolvable user SIDs
+# (S-1-5-21-...-1001 / S-1-5-21-...-1002). Use unprivileged agent accounts and
+# provision protected core/agent ACLs on ancestors below the trusted volume root.
+# Other POSIX platforms fail closed until native extended-ACL checks are available.
+# Unsupported native ACL/identity checks fail closed. OS administrators remain
+# outside this account-isolation boundary.
+# Set all three discovery paths to one separate directory, for example:
+# agent_capability_file = "/var/lib/post-pulsar-discovery/agent-capability"
+# bootstrap_file = "/var/lib/post-pulsar-discovery/bootstrap.json"
+# endpoint_record_file = "/var/lib/post-pulsar-discovery/endpoint.json"
+# Keep operator_verifier_file in private core storage; it is never agent-readable.
 allow_agent_publish = false
 control_host = "127.0.0.1"
 control_port = 8765
