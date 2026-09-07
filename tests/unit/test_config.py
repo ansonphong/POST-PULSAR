@@ -164,6 +164,29 @@ def test_hardened_requires_discovery_outside_private_state(
         load_local_settings(path)
 
 
+def test_hardened_discovery_cannot_overlap_account_content(tmp_path, monkeypatch):
+    from post_pulsar.secure_files import RecordPolicy
+
+    monkeypatch.setattr(RecordPolicy, "validate", lambda *args, **kwargs: None)
+    path = _write_config(
+        tmp_path,
+        extra='hardened_core_principal = "1001"\nhardened_agent_principal = "1002"\nhardened_agent_group = 1003',
+    )
+    content = path.read_text().replace(
+        'deployment_mode = "simple"', 'deployment_mode = "hardened"'
+    )
+    for filename in ("agent-capability", "bootstrap.json", "endpoint.json"):
+        content = content.replace(
+            ".post-pulsar/control/" + filename,
+            "accounts/ansonphong/discovery/" + filename,
+        )
+    path.write_text(content)
+    with pytest.raises(
+        ConfigurationError, match="runtime directories must not overlap"
+    ):
+        load_local_settings(path)
+
+
 def test_unknown_fields_and_legacy_top_level_targets_are_rejected(
     tmp_path: Path,
 ) -> None:

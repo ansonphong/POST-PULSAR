@@ -22,10 +22,11 @@ deployment_mode = "simple"
 # Other POSIX platforms fail closed until native extended-ACL checks are available.
 # Unsupported native ACL/identity checks fail closed. OS administrators remain
 # outside this account-isolation boundary.
-# Set all three discovery paths to one separate directory, for example:
-# agent_capability_file = "/var/lib/post-pulsar-discovery/agent-capability"
-# bootstrap_file = "/var/lib/post-pulsar-discovery/bootstrap.json"
-# endpoint_record_file = "/var/lib/post-pulsar-discovery/endpoint.json"
+# Set all three discovery paths to one separate directory below the config root.
+# For example, provision /var/lib/post-pulsar as a traversable config root, then:
+# agent_capability_file = "discovery/agent-capability"
+# bootstrap_file = "discovery/bootstrap.json"
+# endpoint_record_file = "discovery/endpoint.json"
 # Keep operator_verifier_file in private core storage; it is never agent-readable.
 allow_agent_publish = false
 control_host = "127.0.0.1"

@@ -342,11 +342,10 @@ def load_local_settings(
             ) from None
         discovery = app.bootstrap_file.parent
         if (
-            app.agent_capability_file.parent != discovery
-            or app.endpoint_record_file.parent != discovery
-            or discovery.is_relative_to(app.state_directory)
-            or app.state_directory.is_relative_to(discovery)
-            or app.operator_verifier_file.is_relative_to(discovery)
+            not _paths_equal(app.agent_capability_file.parent, discovery)
+            or not _paths_equal(app.endpoint_record_file.parent, discovery)
+            or _paths_overlap(discovery, app.state_directory)
+            or _paths_overlap(app.operator_verifier_file, discovery)
         ):
             raise ConfigurationError(
                 "hardened discovery requires one dedicated directory outside private state and operator storage"
@@ -858,6 +857,8 @@ def _validate_path_separation(
     app: AppSettings, profiles: tuple[ProfileSettings, ...]
 ) -> None:
     directories: dict[str, Path] = {"app.state_directory": app.state_directory}
+    if app.deployment_mode == "hardened":
+        directories["hardened discovery directory"] = app.bootstrap_file.parent
     for profile in profiles:
         prefix = f"profiles[{profile.profile_id}]"
         directories[f"{prefix}.account_root"] = profile.account_root
@@ -890,8 +891,12 @@ def _validate_path_separation(
         "app.endpoint_record_file": app.endpoint_record_file,
     }
     for label, path in control_files.items():
-        if not _path_is_relative_to(path, app.state_directory) or _paths_equal(
-            path, app.state_directory
+        shared_discovery = (
+            app.deployment_mode == "hardened" and label != "app.operator_verifier_file"
+        )
+        if not shared_discovery and (
+            not _path_is_relative_to(path, app.state_directory)
+            or _paths_equal(path, app.state_directory)
         ):
             raise ConfigurationError(f"{label} must be inside app.state_directory")
     control_items = tuple(control_files.items())
