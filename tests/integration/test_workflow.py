@@ -1,3 +1,5 @@
+# mypy: disable-error-code=import-untyped
+# ruff: noqa: E402, I001
 """Offline end-to-end evidence for publication, recovery, and local control."""
 
 from __future__ import annotations
@@ -5,13 +7,37 @@ from __future__ import annotations
 import io
 import json
 import socket
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from PIL import Image
+
+TESTS_ROOT = str(Path(__file__).parents[1])
+if TESTS_ROOT not in sys.path:
+    sys.path.insert(0, TESTS_ROOT)
+
+if TYPE_CHECKING:
+    from tests.support.fake_daemon import (
+        AdapterPlan,
+        FakeAdapterRegistry,
+        FakeClock,
+        InjectedCrash,
+        LoopbackSocketGuard,
+        launch_fake_daemon,
+    )
+else:
+    from support.fake_daemon import (
+        AdapterPlan,
+        FakeAdapterRegistry,
+        FakeClock,
+        InjectedCrash,
+        LoopbackSocketGuard,
+        launch_fake_daemon,
+    )
 
 from post_pulsar import cli
 from post_pulsar.app import (
@@ -36,14 +62,6 @@ from post_pulsar.state import (
     SourceBucket,
     StateRepository,
     TransitionError,
-)
-from tests.support.fake_daemon import (
-    AdapterPlan,
-    FakeAdapterRegistry,
-    FakeClock,
-    InjectedCrash,
-    LoopbackSocketGuard,
-    launch_fake_daemon,
 )
 
 NOW = datetime(2026, 9, 5, 12, tzinfo=UTC)
@@ -209,7 +227,8 @@ def _bundle(
     ready: bool = True,
     media_suffix: str = ".jpg",
 ) -> Path:
-    directory = settings.profile(profile_id).account_root / bucket / bundle_id
+    account_root = cast(Path, settings.profile(profile_id).account_root)
+    directory = account_root / bucket / bundle_id
     directory.mkdir(parents=True)
     media = directory / f"{bundle_id}{media_suffix}"
     if media_suffix == ".jpg":
@@ -735,17 +754,17 @@ def test_post_create_crash_reconcile_archive_recovery_and_restart_idempotence(
         with (
             locks.acquire_profiles(instance, ("ansonphong",)) as profile_lease,
             StateRepository.open_existing(database, clock=clock.now) as repository,
+            pytest.raises(InjectedCrash),
         ):
-            with pytest.raises(InjectedCrash):
-                ArchiveManager(
-                    repository,
-                    locks,
-                    fault_injector=cast(ArchiveFaultInjector, archive_crash),
-                ).archive_bundle(
-                    bundle_key,
-                    instance_lease=instance,
-                    profile_lease=profile_lease,
-                )
+            ArchiveManager(
+                repository,
+                locks,
+                fault_injector=cast(ArchiveFaultInjector, archive_crash),
+            ).archive_bundle(
+                bundle_key,
+                instance_lease=instance,
+                profile_lease=profile_lease,
+            )
         with (
             locks.acquire_profiles(instance, ("ansonphong",)) as profile_lease,
             StateRepository.open_existing(database, clock=clock.now) as repository,

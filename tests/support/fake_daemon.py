@@ -1,3 +1,4 @@
+# mypy: disable-error-code=import-untyped
 """Hermetic fake-adapter launcher for the real POST PULSAR daemon core."""
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from post_pulsar import cli
 from post_pulsar.config import SecretValue, load_local_settings
@@ -167,14 +168,17 @@ class FakeAdapterRegistry:
         )
 
 
+class _MonkeyPatch(Protocol):
+    def setattr(self, target: object, name: str, value: object) -> None: ...
+
+
 @dataclass(slots=True)
 class LoopbackSocketGuard:
     """Record and reject every attempted non-loopback IP bind or connection."""
 
     denied: list[tuple[str, object]] = field(default_factory=list)
 
-    def install(self, monkeypatch: object) -> None:
-        patch = cast(object, monkeypatch)
+    def install(self, monkeypatch: _MonkeyPatch) -> None:
         original_bind = socket.socket.bind
         original_connect = socket.socket.connect
 
@@ -186,8 +190,8 @@ class LoopbackSocketGuard:
             self._assert_loopback("connect", address)
             return original_connect(instance, address)  # type: ignore[arg-type]
 
-        patch.setattr(socket.socket, "bind", checked_bind)  # type: ignore[attr-defined]
-        patch.setattr(socket.socket, "connect", checked_connect)  # type: ignore[attr-defined]
+        monkeypatch.setattr(socket.socket, "bind", checked_bind)
+        monkeypatch.setattr(socket.socket, "connect", checked_connect)
 
     def _assert_loopback(self, operation: str, address: object) -> None:
         if not isinstance(address, tuple) or not address:
@@ -259,14 +263,17 @@ def launch_fake_daemon(
     def execute(request: RunRequestRecord) -> Mapping[str, object]:
         executed.append(request.request_id)
         try:
-            return cli._execute_daemon_request(
-                settings,
-                request,
-                daemon=holder["daemon"],
-                environ=environ,
-                adapter_factory=registry.factory,
-                identity_verifier=lambda *_args: None,
-                clock=clock.now,
+            return cast(
+                Mapping[str, object],
+                cli._execute_daemon_request(
+                    settings,
+                    request,
+                    daemon=holder["daemon"],
+                    environ=environ,
+                    adapter_factory=registry.factory,
+                    identity_verifier=lambda *_args: None,
+                    clock=clock.now,
+                ),
             )
         finally:
             completed.set()
