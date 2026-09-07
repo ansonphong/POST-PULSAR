@@ -85,6 +85,12 @@ Evidence is repository-local and does not rely on a live social account:
   exposes the same hermetic fake-adapter daemon launcher for sibling
   compatibility checks without adding a runtime command or provider endpoint.
 
+Observed Stage 5 focused evidence for T5.3: `.venv/bin/uv run --frozen pytest
+tests/integration/test_workflow.py -q` exited 0 with `8 passed in 2.37s`; the
+scoped Ruff and mypy commands exited 0, and `git diff --exit-code -- uv.lock`
+exited 0. No broad suite, build, coverage, packaging, or audit result is claimed
+here; those remain Stage 6/CI evidence.
+
 These are automated, hermetic implementation checks. They do not constitute a
 provider-issued OAuth grant, a live post, public-host reachability from Meta, or
 an OS administrator's ACL attestation.
