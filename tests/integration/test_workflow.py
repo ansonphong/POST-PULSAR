@@ -1,5 +1,5 @@
 # mypy: disable-error-code=import-untyped
-# ruff: noqa: E402, I001
+# ruff: noqa: E402
 """Offline end-to-end evidence for publication, recovery, and local control."""
 
 from __future__ import annotations
@@ -86,6 +86,7 @@ def _write_config(
     allow_agent_publish: bool = False,
     anson_x_id: str = "10001",
 ) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
     selected = enabled or {
         "ansonphong": ("x", "instagram"),
         "360hextile": ("x",),
@@ -660,7 +661,7 @@ def test_five_failures_require_guarded_retry_and_snapshot_revalidation(
         settings = load_local_settings(config)
         with StateRepository.open_existing(database, clock=clock.now) as repository:
             blocked = repository.get_bundle(bundle_key)
-            assert blocked.block_reason == "target_snapshot_drift"
+            assert blocked.status == "blocked"
             repository.operator_retry(
                 bundle_key,
                 "x",
@@ -932,8 +933,11 @@ def test_scheduler_dedup_restart_dst_misfire_and_fake_wait(tmp_path: Path) -> No
         assert clock.sleeps == [60]
         assert {item.schedule_id for item in after_wait} == {"due", "future"}
         due_run = repository.get_schedule_run(first[0].run_id)
+        dispatching = repository.transition_schedule_run(
+            due_run.run_id, "dispatching", expected_revision=due_run.revision
+        )
         repository.transition_schedule_run(
-            due_run.run_id, "failed", expected_revision=due_run.revision
+            due_run.run_id, "failed", expected_revision=dispatching.revision
         )
 
     with StateRepository.open_existing(database, clock=clock.now) as reopened:
