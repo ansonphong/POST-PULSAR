@@ -640,6 +640,61 @@ def test_status_accepts_exact_profile_and_bundle_filters(tmp_path: Path) -> None
     assert invalid.status == 422
 
 
+def test_profile_cursor_schema_matches_page_two_behavior(tmp_path: Path) -> None:
+    path = Path(__file__).parents[2] / "api/control-v1.openapi.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    parameters = document["components"]["parameters"]
+    profile_cursor = parameters["ProfileCursor"]["schema"]
+    assert profile_cursor == {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]{0,31}$",
+    }
+    assert document["paths"]["/profiles"]["get"]["parameters"][0] == {
+        "$ref": "#/components/parameters/ProfileCursor"
+    }
+    assert parameters["Cursor"]["schema"] == {"type": "integer", "minimum": 0}
+    for route in ("/schedules", "/requests"):
+        refs = {
+            item["$ref"]
+            for item in document["paths"][route]["get"]["parameters"]
+        }
+        assert "#/components/parameters/Cursor" in refs
+        assert "#/components/parameters/ProfileCursor" not in refs
+
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text(encoding="ascii").strip()
+    with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
+        repository.register_profile(
+            "second-profile",
+            tmp_path / "second-account",
+            (
+                ProfileTargetSnapshot(
+                    "x", "2", "second-profile", "SECOND_TOKEN_REFERENCE", {}
+                ),
+            ),
+            config_hash="b" * 64,
+        )
+
+    first = _call(app, "GET", "/control/v1/profiles?limit=1", token=token)
+    first_page = json.loads(first.body)["data"]
+    assert first.status == 200
+    assert [item["profile_id"] for item in first_page["items"]] == ["profile"]
+    assert first_page["next_cursor"] == "profile"
+
+    second = _call(
+        app,
+        "GET",
+        "/control/v1/profiles?cursor=profile&limit=1",
+        token=token,
+    )
+    second_page = json.loads(second.body)["data"]
+    assert second.status == 200
+    assert [item["profile_id"] for item in second_page["items"]] == [
+        "second-profile"
+    ]
+    assert second_page["next_cursor"] == "second-profile"
+
+
 def test_openapi_is_authoritative_and_has_every_operation() -> None:
     path = Path(__file__).parents[2] / "api/control-v1.openapi.json"
     document = json.loads(path.read_text(encoding="utf-8"))
