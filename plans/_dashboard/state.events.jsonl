@@ -112,3 +112,16 @@
 {"event":"commit","sha":"6b2219f","message":"fix(integration): correct workflow fixtures","time":"2026-09-07T03:03:30Z"}
 {"event":"commit","sha":"e0def49","message":"fix(integration): assert durable scheduler contracts","time":"2026-09-07T03:04:12Z"}
 {"event":"commit","sha":"5d71eff","message":"docs(report): record focused integration evidence","time":"2026-09-07T03:04:44Z"}
+{"event":"commit","sha":"a31c22a","message":"chore(plan): mark T5.3 DONE","time":"2026-09-07T03:05:47Z"}
+{"event":"commit","sha":"38255cf","message":"docs(plan): make Windows dry-run explicit","time":"2026-09-07T03:12:39Z"}
+{"event":"commit","sha":"38255cf","message":"docs(plan): make Windows dry-run explicit","time":"2026-09-07T03:14:54Z"}
+{"event":"commit","sha":"34d27db","message":"Fail closed Windows task setup modes","time":"2026-09-07T03:14:59Z"}
+{"event":"commit","sha":"cde4201","message":"Align script test with documented console command","time":"2026-09-07T03:16:32Z"}
+{"event":"commit","sha":"10c1661","message":"test(integration): close T5.3 workflow evidence gaps","time":"2026-09-07T03:17:33Z"}
+{"event":"commit","sha":"a3f296a","message":"style(tests): sort integration harness exports","time":"2026-09-07T03:18:16Z"}
+{"event":"commit","sha":"d0e8b1d","message":"fix(tests): canonicalize fake daemon import","time":"2026-09-07T03:19:06Z"}
+{"event":"commit","sha":"f70d1e9","message":"test(control): stabilize idempotent replay evidence","time":"2026-09-07T03:21:29Z"}
+{"event":"commit","sha":"a160da6","message":"docs: update license product notice","time":"2026-09-07T03:29:30Z"}
+{"event":"commit","sha":"d39aa4e","message":"Harden Windows task setup ownership checks","time":"2026-09-07T03:31:42Z"}
+{"event":"commit","sha":"4fd3704","message":"Require exact Windows task ownership and refuse interactive collisions","time":"2026-09-07T03:50:50Z"}
+{"event":"commit","sha":"9be6963","message":"test: make workflow helper importable","time":"2026-09-07T03:59:32Z"}
