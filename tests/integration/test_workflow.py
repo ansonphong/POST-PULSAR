@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import socket
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from post_pulsar.app import (
     RunOutcome,
 )
 from post_pulsar.archive import ArchiveFaultInjector, ArchiveManager
+from post_pulsar.bootstrap import BootstrapRecord, write_bootstrap
 from post_pulsar.config import LocalSettings, load_local_settings
 from post_pulsar.content import PublishableBundle, scan_account_root
 from post_pulsar.control import initialize_operator_secret, rotate_agent_capability
@@ -555,8 +557,7 @@ def test_reels_video_runs_through_application_probe_and_isolated_adapters(
         )
         assert not source.exists() and isolated.is_dir()
         archived = (
-            settings.profile("ansonphong").account_root
-            / "POSTED/REELS/reel-publish"
+            settings.profile("ansonphong").account_root / "POSTED/REELS/reel-publish"
         )
         assert {path.name for path in archived.iterdir()} == {
             ".ready",
@@ -631,8 +632,7 @@ def test_recovery_blocks_member_fingerprint_drift_before_remote_mutation(
             "mutated only"
         )
         assert not (
-            settings.profile("ansonphong").account_root
-            / "POSTED/QUEUE/drift-recovery"
+            settings.profile("ansonphong").account_root / "POSTED/QUEUE/drift-recovery"
         ).exists()
         with StateRepository.open_existing(database, clock=clock.now) as repository:
             blocked = repository.get_bundle(bundle_key)
@@ -1136,6 +1136,16 @@ def test_real_loopback_daemon_control_confirmation_and_socket_sentinel(
     )
     instance.release()
     capability = rotate_agent_capability(settings.app.agent_capability_file)
+    bootstrap = write_bootstrap(
+        settings.app.bootstrap_file,
+        BootstrapRecord(
+            installation_id="a" * 32,
+            endpoint_record=settings.app.endpoint_record_file,
+            agent_capability=settings.app.agent_capability_file,
+            service_mode="manual",
+            service_identifier="post-pulsar",
+        ),
+    )
     operator_phrase = "fake operator phrase"
     initialize_operator_secret(
         settings.app.operator_verifier_file,
@@ -1154,6 +1164,15 @@ def test_real_loopback_daemon_control_confirmation_and_socket_sentinel(
         endpoint = EndpointRecord.read(settings.app.endpoint_record_file)
         assert endpoint.address.startswith("127.0.0.1:")
         assert running.capability == capability
+        status, response = running.request("GET", "/control/v1/capabilities")
+        assert status == 200
+        handshake = cast(Mapping[str, object], response["data"])
+        discovery = cast(Mapping[str, str], handshake["discovery"])
+        assert handshake["installation_id"] == bootstrap.installation_id
+        assert handshake["startup_nonce"] == endpoint.startup_nonce
+        assert handshake["pid"] == endpoint.pid
+        assert handshake["process_started_at"] == endpoint.process_started_at
+        assert discovery["bootstrap_record"] == str(settings.app.bootstrap_file)
         unauthenticated, _ = running.request(
             "GET", "/control/v1/health", authenticated=False
         )
@@ -1177,6 +1196,9 @@ def test_real_loopback_daemon_control_confirmation_and_socket_sentinel(
                 tmp_path / "other-endpoint.json",
                 "127.0.0.1",
                 0,
+                installation_id=bootstrap.installation_id,
+                bootstrap_record_file=settings.app.bootstrap_file,
+                agent_capability_file=settings.app.agent_capability_file,
             ).start()
 
         arguments = {
@@ -1294,17 +1316,21 @@ def test_real_loopback_daemon_control_confirmation_and_socket_sentinel(
         )
         first_binding = {field: first_data[field] for field in stable_fields}
         second_binding = {field: second_data[field] for field in stable_fields}
-        assert first_binding == second_binding == {
-            "request_id": first_data["request_id"],
-            "profile_id": "ansonphong",
-            "action": "run_now",
-            "arguments": arguments,
-            "idempotency_key": "consume-confirmed",
-            "expected_revision": intent.resource_revision,
-            "bundle_key": key,
-            "schedule_key": None,
-            "intent_id": intent.intent_id,
-        }
+        assert (
+            first_binding
+            == second_binding
+            == {
+                "request_id": first_data["request_id"],
+                "profile_id": "ansonphong",
+                "action": "run_now",
+                "arguments": arguments,
+                "idempotency_key": "consume-confirmed",
+                "expected_revision": intent.resource_revision,
+                "bundle_key": key,
+                "schedule_key": None,
+                "intent_id": intent.intent_id,
+            }
+        )
         assert running.completed.wait(2)
         request_id = cast(int, first_data["request_id"])
         with StateRepository.open_existing(database, clock=clock.now) as repository:

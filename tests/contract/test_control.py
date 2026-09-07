@@ -6,8 +6,8 @@ import io
 import json
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
 import pytest
+from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
 from post_pulsar.control import (
@@ -16,6 +16,7 @@ from post_pulsar.control import (
     initialize_operator_secret,
     rotate_agent_capability,
 )
+from post_pulsar.control_identity import DaemonIdentity, DiscoveryPaths
 from post_pulsar.state import ProfileTargetSnapshot, StateRepository
 
 
@@ -81,10 +82,11 @@ def test_every_action_has_matching_schema_and_durable_admission(
     tmp_path: Path, action: str
 ) -> None:
     from PIL import Image
+
     from post_pulsar.state import (
+        REQUEST_ARGUMENT_SCHEMAS,
         BundleFileSnapshot,
         TargetSnapshot,
-        REQUEST_ARGUMENT_SCHEMAS,
     )
 
     app = _application(tmp_path, allow_publish=True)
@@ -222,7 +224,9 @@ def test_every_action_has_matching_schema_and_durable_admission(
     assert json.loads(response.body)["data"]["action"] == action
 
 
-def _application(tmp_path: Path, *, allow_publish: bool = False) -> ControlApplication:
+def _application(
+    tmp_path: Path, *, allow_publish: bool = False, stopped: list[bool] | None = None
+) -> ControlApplication:
     database = tmp_path / "state.sqlite3"
     repository = StateRepository(database)
     repository.register_profile(
@@ -234,9 +238,23 @@ def _application(tmp_path: Path, *, allow_publish: bool = False) -> ControlAppli
     repository.close()
     capability_file = tmp_path / "agent"
     rotate_agent_capability(capability_file)
-    return ControlApplication(
+    app = ControlApplication(
         database, capability_file, allow_agent_publish=allow_publish
     )
+    destination = [] if stopped is None else stopped
+    app.bind_daemon(
+        lambda: destination.append(True),
+        DaemonIdentity(
+            "a" * 32,
+            1234,
+            123456,
+            "b" * 64,
+            DiscoveryPaths.from_paths(
+                tmp_path / "bootstrap", tmp_path / "endpoint", capability_file
+            ),
+        ),
+    )
+    return app
 
 
 def _call(
@@ -273,16 +291,15 @@ def test_pause_acceptance_persists_gate_before_response(tmp_path: Path) -> None:
 
 
 def test_shutdown_requires_authentication_and_exact_incarnation(tmp_path: Path) -> None:
-    app = _application(tmp_path)
-    stopped = []
-    app.bind_shutdown(lambda: stopped.append(True), "fixture-startup-nonce")
+    stopped: list[bool] = []
+    app = _application(tmp_path, stopped=stopped)
     fixture_capability = (tmp_path / "agent").read_text().strip()
     assert (
         _call(
             app,
             "POST",
             "/control/v1/shutdown",
-            body={"startup_nonce": "fixture-startup-nonce"},
+            body={"startup_nonce": "b" * 64},
         ).status
         == 401
     )
@@ -303,7 +320,7 @@ def test_shutdown_requires_authentication_and_exact_incarnation(tmp_path: Path) 
             "POST",
             "/control/v1/shutdown",
             token=fixture_capability,
-            body={"startup_nonce": "fixture-startup-nonce"},
+            body={"startup_nonce": "b" * 64},
         ).status
         == 202
     )
@@ -326,7 +343,8 @@ def test_shutdown_contract_and_capability_route_parity(tmp_path: Path) -> None:
             if isinstance(operation, dict) and "operationId" in operation
         )
     assert set(SUPPORTED_OPERATIONS) == operations
-    app = _application(tmp_path)
+    stopped: list[bool] = []
+    app = _application(tmp_path, stopped=stopped)
     token = (tmp_path / "agent").read_text().strip()
     capabilities = json.loads(
         _call(app, "GET", "/control/v1/capabilities", token=token).body
@@ -337,7 +355,7 @@ def test_shutdown_contract_and_capability_route_parity(tmp_path: Path) -> None:
     response_schema = operation["responses"]["202"]["content"]["application/json"][
         "schema"
     ]
-    body = {"startup_nonce": "fixture-startup-nonce"}
+    body = {"startup_nonce": "b" * 64}
     Draft202012Validator(request_schema).validate(body)
     for invalid in (
         {},
@@ -346,11 +364,81 @@ def test_shutdown_contract_and_capability_route_parity(tmp_path: Path) -> None:
         {**body, "extra": True},
     ):
         assert not Draft202012Validator(request_schema).is_valid(invalid)
-    stopped = []
-    app.bind_shutdown(lambda: stopped.append(True), body["startup_nonce"])
     response = _call(app, "POST", "/control/v1/shutdown", token=token, body=body)
     assert response.status == 202 and stopped == [True]
     Draft202012Validator(response_schema).validate(json.loads(response.body))
+
+
+def test_capabilities_and_endpoint_share_closed_identity_schemas(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import asdict
+
+    from post_pulsar.daemon import EndpointRecord
+
+    document = json.loads(
+        (Path(__file__).parents[2] / "api/control-v1.openapi.json").read_text()
+    )
+    app = _application(tmp_path)
+    token = (tmp_path / "agent").read_text().strip()
+    response = json.loads(
+        _call(app, "GET", "/control/v1/capabilities", token=token).body
+    )
+    schema = document["paths"]["/capabilities"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    validator = Draft202012Validator({**schema, "components": document["components"]})
+    validator.validate(response)
+    data = response["data"]
+    endpoint = EndpointRecord(
+        "post-pulsar.control/v1",
+        "127.0.0.1:8765",
+        data["pid"],
+        data["process_started_at"],
+        data["startup_nonce"],
+        {"control_api_major": 1},
+        data["installation_id"],
+        DiscoveryPaths.read(data["discovery"]),
+    )
+    endpoint_validator = Draft202012Validator(
+        {
+            "$ref": "#/components/schemas/EndpointRecord",
+            "components": document["components"],
+        }
+    )
+    endpoint_validator.validate(asdict(endpoint))
+    for name, value in (
+        ("DaemonCapabilities", data),
+        ("EndpointRecord", asdict(endpoint)),
+    ):
+        exact = Draft202012Validator(
+            {
+                "$ref": "#/components/schemas/" + name,
+                "components": document["components"],
+            }
+        )
+        for key in value:
+            assert not exact.is_valid(
+                {field: content for field, content in value.items() if field != key}
+            )
+        assert not exact.is_valid({**value, "token": "forbidden-fixture-value"})
+        for key, wrong in (
+            ("installation_id", "A" * 32),
+            ("pid", True),
+            ("process_started_at", 0),
+            ("startup_nonce", "b" * 63),
+            ("discovery", {**data["discovery"], "extra": "forbidden"}),
+        ):
+            assert not exact.is_valid({**value, key: wrong})
+    for name in ("DiscoveryPaths", "DaemonCapabilities"):
+        example_validator = Draft202012Validator(
+            {
+                "$ref": "#/components/schemas/" + name,
+                "components": document["components"],
+            }
+        )
+        for example in document["components"]["schemas"][name]["examples"]:
+            example_validator.validate(example)
 
 
 def test_auth_cors_limits_version_and_capabilities(tmp_path: Path) -> None:

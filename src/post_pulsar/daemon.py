@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Protocol
 
 from post_pulsar.control import CONTROL_SCHEMA, ControlApplication, ControlRequest
+from post_pulsar.control_identity import DaemonIdentity, DiscoveryPaths
 from post_pulsar.locking import LockLease, LockManager
 from post_pulsar.process_identity import (
     process_identity_matches,
@@ -47,6 +48,30 @@ class EndpointRecord:
     process_started_at: int
     startup_nonce: str
     capabilities: Mapping[str, object]
+    installation_id: str
+    discovery: DiscoveryPaths
+
+    def __post_init__(self) -> None:
+        DaemonIdentity(
+            self.installation_id,
+            self.pid,
+            self.process_started_at,
+            self.startup_nonce,
+            self.discovery,
+        )
+        if (
+            self.protocol != CONTROL_SCHEMA
+            or not isinstance(self.address, str)
+            or not self.address
+        ):
+            raise ValueError("endpoint record schema is invalid")
+        if (
+            not isinstance(self.capabilities, Mapping)
+            or set(self.capabilities) != {"control_api_major"}
+            or type(self.capabilities["control_api_major"]) is not int
+            or self.capabilities["control_api_major"] != 1
+        ):
+            raise ValueError("endpoint capabilities schema is invalid")
 
     @classmethod
     def read(
@@ -71,9 +96,15 @@ class EndpointRecord:
             "process_started_at",
             "startup_nonce",
             "capabilities",
+            "installation_id",
+            "discovery",
         }:
             raise RuntimeError("endpoint record schema is invalid")
-        return cls(**value)
+        try:
+            value["discovery"] = DiscoveryPaths.read(value["discovery"])
+            return cls(**value)
+        except (TypeError, ValueError):
+            raise RuntimeError("endpoint record schema is invalid") from None
 
     def write(self, path: str | Path, *, policy: RecordPolicy | None = None) -> None:
         from post_pulsar.secure_files import atomic_owner_write
@@ -95,8 +126,10 @@ class ForegroundDaemon:
         host: str,
         port: int,
         *,
+        installation_id: str,
+        bootstrap_record_file: str | Path,
+        agent_capability_file: str | Path,
         control_application: ControlApplication | None = None,
-        agent_capability_file: str | Path | None = None,
         record_policy: RecordPolicy | None = None,
         recovery: Callable[[], object] | None = None,
         schedule_admission: Callable[[], object] | None = None,
@@ -123,8 +156,8 @@ class ForegroundDaemon:
         self._port = port
         self._control = control_application
         self._record_policy = record_policy
-        self._capability_file = (
-            None if agent_capability_file is None else str(Path(agent_capability_file))
+        self._discovery = DiscoveryPaths.from_paths(
+            bootstrap_record_file, endpoint_record_file, agent_capability_file
         )
         self._recovery = recovery
         self._schedule_admission = schedule_admission
@@ -144,8 +177,11 @@ class ForegroundDaemon:
         self._nonce = secrets.token_hex(32)
         self._worker_token = f"daemon-{self._nonce[:16]}"
         self._started_at = process_start_identity(os.getpid())
+        self._identity = DaemonIdentity(
+            installation_id, os.getpid(), self._started_at, self._nonce, self._discovery
+        )
         if self._control is not None:
-            self._control.bind_shutdown(self._request_control_shutdown, self._nonce)
+            self._control.bind_daemon(self._request_control_shutdown, self._identity)
 
     def start(self) -> None:
         """Recover first, then expose admission and worker processing."""
@@ -183,13 +219,12 @@ class ForegroundDaemon:
             record = EndpointRecord(
                 protocol=CONTROL_SCHEMA,
                 address=f"{bound_host}:{bound_port}",
-                pid=os.getpid(),
+                pid=self._identity.pid,
                 process_started_at=self._started_at,
                 startup_nonce=self._nonce,
-                capabilities={
-                    "control_api_major": 1,
-                    "agent_capability_file": self._capability_file,
-                },
+                capabilities={"control_api_major": 1},
+                installation_id=self._identity.installation_id,
+                discovery=self._discovery,
             )
             record.write(self._endpoint, policy=self._record_policy)
             self._http_thread = threading.Thread(
@@ -340,6 +375,8 @@ class ForegroundDaemon:
             record = None
         if (
             record is not None
+            and record.installation_id == self._identity.installation_id
+            and record.discovery == self._discovery
             and record.pid == os.getpid()
             and record.process_started_at == self._started_at
             and secrets.compare_digest(record.startup_nonce, self._nonce)

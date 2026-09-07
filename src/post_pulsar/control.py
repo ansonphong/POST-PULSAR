@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from post_pulsar import __version__
 from post_pulsar.content import scan_inbox
+from post_pulsar.control_identity import DaemonIdentity
 from post_pulsar.secure_files import RecordPolicy
 from post_pulsar.state import (
     SCHEMA_VERSION,
@@ -263,14 +264,20 @@ class ControlApplication:
         self._max_results = max_results
         self._intent_ttl = confirmation_ttl_seconds
         self._shutdown: Callable[[], None] | None = None
-        self._startup_nonce: str | None = None
+        self._identity: DaemonIdentity | None = None
 
-    def bind_shutdown(self, callback: Callable[[], None], startup_nonce: str) -> None:
-        """Bind graceful shutdown to this authenticated daemon incarnation."""
-        if not startup_nonce or self._shutdown is not None:
-            raise ControlSecurityError("shutdown incarnation binding is invalid")
+    def bind_daemon(
+        self, callback: Callable[[], None], identity: DaemonIdentity
+    ) -> None:
+        """Bind handshake and graceful shutdown to exactly one daemon incarnation."""
+        if not isinstance(identity, DaemonIdentity) or self._identity is not None:
+            raise ControlSecurityError("daemon incarnation binding is invalid")
+        if identity.discovery.agent_capability_file != str(
+            self._capability_file.resolve()
+        ):
+            raise ControlSecurityError("daemon capability binding is invalid")
         self._shutdown = callback
-        self._startup_nonce = startup_nonce
+        self._identity = identity
 
     def handle(self, request: ControlRequest) -> ControlResponse:
         """Validate authentication and route one bounded local request."""
@@ -324,9 +331,9 @@ class ControlApplication:
         if method == "POST" and route == ("shutdown",):
             _exact_body(body, {"startup_nonce"}, {"startup_nonce"})
             nonce = _text(body, "startup_nonce")
-            if self._shutdown is None or self._startup_nonce is None:
+            if self._shutdown is None or self._identity is None:
                 raise TransitionError("daemon shutdown is unavailable")
-            if not hmac.compare_digest(nonce, self._startup_nonce):
+            if not hmac.compare_digest(nonce, self._identity.startup_nonce):
                 raise ConflictError("daemon incarnation changed")
             self._shutdown()
             return {"status": "stopping"}, 202
@@ -337,7 +344,10 @@ class ControlApplication:
                 "callback_failures": failures,
             }, 200
         if method == "GET" and route == ("capabilities",):
+            if self._identity is None:
+                raise TransitionError("daemon incarnation is unavailable")
             return {
+                **self._identity.document(),
                 "core_semver": __version__,
                 "control_api_major": CONTROL_API_MAJOR,
                 "state_schema": SCHEMA_VERSION,

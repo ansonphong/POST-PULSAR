@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from post_pulsar import cli
+from post_pulsar.bootstrap import load_bootstrap
 from post_pulsar.config import InstagramSettings, SecretValue, load_local_settings
 from post_pulsar.content import PublishableBundle
 from post_pulsar.control import ControlApplication, load_agent_capability
@@ -339,6 +340,9 @@ def launch_fake_daemon(
     """Start real daemon/control handlers on an ephemeral IPv4 loopback port."""
 
     settings = load_local_settings(config_path)
+    bootstrap = load_bootstrap(
+        settings.app.bootstrap_file, policy=settings.app.record_policy
+    )
     capability = load_agent_capability(settings.app.agent_capability_file)
     executed: list[int] = []
     completed = threading.Event()
@@ -376,6 +380,8 @@ def launch_fake_daemon(
         settings.app.endpoint_record_file,
         "127.0.0.1",
         0,
+        installation_id=bootstrap.installation_id,
+        bootstrap_record_file=settings.app.bootstrap_file,
         control_application=control,
         agent_capability_file=settings.app.agent_capability_file,
         request_executor=execute,

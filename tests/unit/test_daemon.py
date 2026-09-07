@@ -17,6 +17,7 @@ from post_pulsar.control import (
     rotate_agent_capability,
     verify_operator_secret,
 )
+from post_pulsar.control_identity import DiscoveryPaths
 from post_pulsar.daemon import EndpointRecord, ForegroundDaemon
 from post_pulsar.locking import LockContentionError
 
@@ -84,6 +85,9 @@ def test_daemon_holds_instance_lease_and_cleans_only_its_endpoint(
         "127.0.0.1",
         0,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     daemon.start()
     record = EndpointRecord.read(endpoint)
@@ -94,6 +98,9 @@ def test_daemon_holds_instance_lease_and_cleans_only_its_endpoint(
         "127.0.0.1",
         0,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     with pytest.raises(LockContentionError):
         second.start()
@@ -105,7 +112,14 @@ def test_daemon_holds_instance_lease_and_cleans_only_its_endpoint(
 def test_endpoint_record_rejects_hardlinks(tmp_path: Path) -> None:
     endpoint = tmp_path / "endpoint.json"
     record = EndpointRecord(
-        "post-pulsar.control/v1", "127.0.0.1:1", os.getpid(), 1, "n", {}
+        "post-pulsar.control/v1",
+        "127.0.0.1:1",
+        os.getpid(),
+        1,
+        "b" * 64,
+        {"control_api_major": 1},
+        "a" * 32,
+        DiscoveryPaths.from_paths(tmp_path / "bootstrap", endpoint, tmp_path / "agent"),
     )
     record.write(endpoint)
     alias = tmp_path / "alias.json"
@@ -139,6 +153,9 @@ def test_daemon_stops_worker_admission_before_http_shutdown(tmp_path: Path) -> N
         schedule_admission=schedule,
         server_factory=lambda *args: Server(*args),
         poll_seconds=0.01,
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     daemon.start()
     assert reevaluated.wait(0.5)
@@ -173,6 +190,9 @@ def test_callback_failure_is_durable_and_worker_continues(tmp_path: Path) -> Non
         schedule_admission=schedule,
         poll_seconds=0.01,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     try:
         daemon.start()
@@ -188,7 +208,13 @@ def test_callback_failure_is_durable_and_worker_continues(tmp_path: Path) -> Non
 
 def test_each_schedule_boundary_respects_shutdown(tmp_path: Path) -> None:
     daemon = ForegroundDaemon(
-        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     dispatched: list[int] = []
     assert daemon.dispatch_if_running(lambda: dispatched.append(1))
@@ -203,7 +229,14 @@ def test_endpoint_recovery_never_probes_with_signals(tmp_path: Path, monkeypatch
 
     endpoint = tmp_path / "endpoint.json"
     record = EndpointRecord(
-        "post-pulsar.control/v1", "127.0.0.1:1", os.getpid(), 1, "n", {}
+        "post-pulsar.control/v1",
+        "127.0.0.1:1",
+        os.getpid(),
+        1,
+        "b" * 64,
+        {"control_api_major": 1},
+        "a" * 32,
+        DiscoveryPaths.from_paths(tmp_path / "bootstrap", endpoint, tmp_path / "agent"),
     )
     record.write(endpoint)
 
@@ -217,6 +250,9 @@ def test_endpoint_recovery_never_probes_with_signals(tmp_path: Path, monkeypatch
         "127.0.0.1",
         0,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     try:
         daemon.start()
@@ -233,7 +269,14 @@ def test_endpoint_with_unverifiable_process_identity_is_preserved(
     identity = importlib.import_module("post_pulsar.process_identity")
     endpoint = tmp_path / "endpoint.json"
     record = EndpointRecord(
-        "post-pulsar.control/v1", "127.0.0.1:1", 987, 1, "existing", {}
+        "post-pulsar.control/v1",
+        "127.0.0.1:1",
+        987,
+        1,
+        "b" * 64,
+        {"control_api_major": 1},
+        "a" * 32,
+        DiscoveryPaths.from_paths(tmp_path / "bootstrap", endpoint, tmp_path / "agent"),
     )
     record.write(endpoint)
     daemon = ForegroundDaemon(
@@ -242,6 +285,9 @@ def test_endpoint_with_unverifiable_process_identity_is_preserved(
         "127.0.0.1",
         0,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
 
     def unverifiable(pid):
@@ -294,6 +340,9 @@ def test_signals_are_installed_before_recovery_and_stop_skips_startup_work(
         recovery=recover,
         schedule_admission=lambda: scheduled.append(True),
         server_factory=server_factory,
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     daemon.run_forever()
     assert set(during_recovery) == set(originals)
@@ -320,7 +369,13 @@ def test_signal_handlers_restore_across_entire_lifecycle(
         return previous
 
     daemon = ForegroundDaemon(
-        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
 
     def fail():
@@ -364,6 +419,9 @@ def test_concurrent_stop_drains_startup_callback_before_releasing_lease(tmp_path
         0,
         recovery=recover,
         server_factory=factory,
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
 
     def start():
@@ -406,6 +464,7 @@ def test_accepted_pause_drains_current_request_and_blocks_older_queue_and_due_wo
 ):
     from dataclasses import asdict
     from datetime import UTC, datetime, timedelta
+
     from post_pulsar.state import (
         BundleFileSnapshot,
         ProfileTargetSnapshot,
@@ -508,6 +567,9 @@ def test_accepted_pause_drains_current_request_and_blocks_older_queue_and_due_wo
         request_executor=execute,
         schedule_admission=schedule,
         server_factory=lambda *args: _Server(*args),
+        installation_id="a" * 32,
+        bootstrap_record_file=tmp_path / "bootstrap.json",
+        agent_capability_file=tmp_path / "agent",
     )
     try:
         daemon.start()
@@ -554,6 +616,7 @@ def test_http_adapter_rejects_duplicate_singletons_before_dispatch(header, secon
     from email.message import Message
     from io import BytesIO
     from types import SimpleNamespace
+
     from post_pulsar.daemon import _handler_for
 
     dispatched, statuses = [], []

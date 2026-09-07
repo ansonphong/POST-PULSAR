@@ -1180,9 +1180,18 @@ def _daemon_foreground(
     clock: Callable[[], datetime],
     daemon_factory: DaemonFactory | None,
 ) -> Mapping[str, object]:
+    from post_pulsar.bootstrap import load_bootstrap
     from post_pulsar.control import ControlApplication, load_agent_capability
     from post_pulsar.daemon import ForegroundDaemon
 
+    bootstrap = load_bootstrap(
+        settings.app.bootstrap_file, policy=settings.app.record_policy
+    )
+    if (
+        bootstrap.endpoint_record != settings.app.endpoint_record_file
+        or bootstrap.agent_capability != settings.app.agent_capability_file
+    ):
+        raise BootstrapError("bootstrap discovery does not match configured files")
     load_agent_capability(
         settings.app.agent_capability_file, policy=settings.app.record_policy
     )
@@ -1311,6 +1320,8 @@ def _daemon_foreground(
         settings.app.endpoint_record_file,
         settings.app.control_host,
         settings.app.control_port,
+        installation_id=bootstrap.installation_id,
+        bootstrap_record_file=settings.app.bootstrap_file,
         control_application=control,
         agent_capability_file=settings.app.agent_capability_file,
         record_policy=settings.app.record_policy,

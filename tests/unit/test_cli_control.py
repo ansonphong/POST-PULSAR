@@ -20,6 +20,7 @@ from post_pulsar.cli import (
     main,
 )
 from post_pulsar.control import ControlApplication, ControlRequest, ControlResponse
+from post_pulsar.control_identity import DiscoveryPaths
 from post_pulsar.daemon import EndpointRecord
 from post_pulsar.state import ProfileTargetSnapshot, StateRepository
 
@@ -96,6 +97,12 @@ def _live_control(root: Path, database: Path, *, allow_agent_publish: bool = Fal
         process_started_at=1,
         startup_nonce="d" * 64,
         capabilities={"control_api_major": 1},
+        installation_id="a" * 32,
+        discovery=DiscoveryPaths.from_paths(
+            root / "state/control/bootstrap.json",
+            root / "state/control/endpoint.json",
+            capability,
+        ),
     ).write(root / "state/control/endpoint.json")
     application = ControlApplication(
         database, capability, allow_agent_publish=allow_agent_publish
@@ -240,7 +247,13 @@ def test_daemon_reconcile_drives_exact_bundle_after_unlock(
         1,
     )
     daemon = ForegroundDaemon(
-        settings.app.state_directory, settings.app.endpoint_record_file, "127.0.0.1", 0
+        settings.app.state_directory,
+        settings.app.endpoint_record_file,
+        "127.0.0.1",
+        0,
+        installation_id="a" * 32,
+        bootstrap_record_file=settings.app.bootstrap_file,
+        agent_capability_file=settings.app.agent_capability_file,
     )
     calls = []
 
@@ -274,6 +287,7 @@ def test_daemon_reconcile_drives_exact_bundle_after_unlock(
 
 def test_draft_edit_failure_keeps_original_bytes(tmp_path: Path, monkeypatch) -> None:
     from PIL import Image
+
     from post_pulsar import cli
     from post_pulsar.config import load_local_settings
     from post_pulsar.content import scan_inbox
@@ -411,6 +425,7 @@ def test_hardened_lifecycle_threads_discovery_policy_and_keeps_operator_private(
     import grp
     import pwd
     from types import SimpleNamespace
+
     from post_pulsar import secure_files
     from post_pulsar.bootstrap import load_bootstrap
     from post_pulsar.config import load_local_settings
@@ -476,8 +491,36 @@ def test_hardened_lifecycle_threads_discovery_policy_and_keeps_operator_private(
     assert verify_operator_secret(verifier, "fixture operator phrase", policy=policy)
     assert verifier.stat().st_mode & 0o7777 == 0o600
     assert verifier.parent.stat().st_mode & 0o7777 == 0o700
+    startup: dict[str, object] = {}
+
+    class Daemon:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            startup.update(kwargs)
+
+        def run_forever(self) -> None:
+            return None
+
+    code, _output, errors = _invoke(
+        ["daemon", "foreground", "--config", str(config), "--json"],
+        daemon_factory=Daemon,
+    )
+    assert code == EXIT_OK and not errors
+    assert startup["record_policy"] == policy
+    assert startup["installation_id"] == bootstrap.installation_id
+    assert startup["bootstrap_record_file"] == tmp_path / "discovery/bootstrap.json"
     endpoint = EndpointRecord(
-        "post-pulsar.control/v1", "127.0.0.1:8765", os.getpid(), 1, "fixture-nonce", {}
+        "post-pulsar.control/v1",
+        "127.0.0.1:8765",
+        os.getpid(),
+        1,
+        "b" * 64,
+        {"control_api_major": 1},
+        bootstrap.installation_id,
+        DiscoveryPaths.from_paths(
+            tmp_path / "discovery/bootstrap.json",
+            bootstrap.endpoint_record,
+            bootstrap.agent_capability,
+        ),
     )
     endpoint.write(bootstrap.endpoint_record, policy=policy)
     assert EndpointRecord.read(bootstrap.endpoint_record, policy=policy) == endpoint
@@ -629,6 +672,12 @@ def test_live_control_outcomes_map_to_stable_exit_codes(
         process_started_at=1,
         startup_nonce="d" * 64,
         capabilities={"control_api_major": 1},
+        installation_id="a" * 32,
+        discovery=DiscoveryPaths.from_paths(
+            tmp_path / "state/control/bootstrap.json",
+            tmp_path / "state/control/endpoint.json",
+            capability,
+        ),
     )
     endpoint.write(tmp_path / "state/control/endpoint.json")
 
@@ -787,6 +836,16 @@ def test_foreground_daemon_receives_recovery_and_periodic_schedule_callbacks(
     capability.parent.mkdir(parents=True, exist_ok=True)
     capability.write_text("c" * 64 + "\n", encoding="ascii")
     capability.chmod(0o600)
+    write_bootstrap(
+        tmp_path / "state/control/bootstrap.json",
+        BootstrapRecord(
+            installation_id="a" * 32,
+            endpoint_record=tmp_path / "state/control/endpoint.json",
+            agent_capability=capability,
+            service_mode="manual",
+            service_identifier="post-pulsar",
+        ),
+    )
     captured: dict[str, object] = {}
 
     class Daemon:
@@ -805,3 +864,54 @@ def test_foreground_daemon_receives_recovery_and_periodic_schedule_callbacks(
     assert callable(captured["recovery"])
     assert callable(captured["schedule_admission"])
     assert callable(captured["request_executor"])
+    assert captured["installation_id"] == "a" * 32
+    assert (
+        captured["bootstrap_record_file"] == tmp_path / "state/control/bootstrap.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "invalid", "endpoint", "capability", "permissions"]
+)
+def test_daemon_startup_rejects_untrusted_or_mismatched_bootstrap(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    config, _database = _setup(tmp_path)
+    capability = tmp_path / "state/control/agent-capability"
+    from post_pulsar.control import rotate_agent_capability
+
+    rotate_agent_capability(capability)
+    bootstrap = tmp_path / "state/control/bootstrap.json"
+    if failure != "missing":
+        write_bootstrap(
+            bootstrap,
+            BootstrapRecord(
+                installation_id="a" * 32,
+                endpoint_record=tmp_path
+                / (
+                    "other/endpoint.json"
+                    if failure == "endpoint"
+                    else "state/control/endpoint.json"
+                ),
+                agent_capability=tmp_path / "other/agent"
+                if failure == "capability"
+                else capability,
+                service_mode="manual",
+                service_identifier="post-pulsar",
+            ),
+        )
+        if failure == "invalid":
+            bootstrap.write_text("{}")
+        if failure == "permissions":
+            bootstrap.chmod(0o644)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid bootstrap must fail before daemon construction")
+
+    code, output, errors = _invoke(
+        ["daemon", "foreground", "--config", str(config), "--json"],
+        daemon_factory=forbidden,
+    )
+    assert code != EXIT_OK
+    assert str(tmp_path) not in output + errors

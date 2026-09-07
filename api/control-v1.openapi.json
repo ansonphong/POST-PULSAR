@@ -89,10 +89,18 @@
     "/capabilities": {
       "get": {
         "operationId": "capabilities",
+        "description": "Authenticated installation/incarnation handshake. Compare installation_id, pid, process_started_at, startup_nonce and every discovery path with the opened bootstrap and endpoint records before accepting the service. Discovery paths are private bridge metadata and must be removed from agent/tool output. No credential values are returned.",
         "responses": {
           "200": {
-            "$ref": "#/components/responses/Success"
-          }
+            "description": "Capabilities bound to the running daemon and configured discovery files.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/CapabilitiesEnvelope"}
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/Error"},
+          "409": {"description": "The application has no bound daemon incarnation.", "$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -791,6 +799,81 @@
       }
     },
     "schemas": {
+      "DiscoveryPaths": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Canonical absolute configured paths on the daemon host. All three paths must be distinct. These locations are handshake metadata, never tool arguments or host-facing output.",
+        "required": ["bootstrap_record", "endpoint_record", "agent_capability_file"],
+        "properties": {
+          "bootstrap_record": {"type": "string", "minLength": 1, "pattern": "^(?:/|[A-Za-z]:\\\\|\\\\\\\\)"},
+          "endpoint_record": {"type": "string", "minLength": 1, "pattern": "^(?:/|[A-Za-z]:\\\\|\\\\\\\\)"},
+          "agent_capability_file": {"type": "string", "minLength": 1, "pattern": "^(?:/|[A-Za-z]:\\\\|\\\\\\\\)"}
+        },
+        "examples": [{
+          "bootstrap_record": "/srv/post-pulsar/discovery/bootstrap.json",
+          "endpoint_record": "/srv/post-pulsar/discovery/endpoint.json",
+          "agent_capability_file": "/srv/post-pulsar/discovery/agent-capability"
+        }]
+      },
+      "EndpointRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Closed non-secret endpoint discovery record written by the daemon. Identity and discovery values must exactly match the authenticated capabilities response.",
+        "required": ["protocol", "address", "installation_id", "pid", "process_started_at", "startup_nonce", "discovery", "capabilities"],
+        "properties": {
+          "protocol": {"const": "post-pulsar.control/v1"},
+          "address": {"type": "string", "minLength": 1},
+          "installation_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "pid": {"type": "integer", "minimum": 1},
+          "process_started_at": {"type": "integer", "minimum": 1},
+          "startup_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "discovery": {"$ref": "#/components/schemas/DiscoveryPaths"},
+          "capabilities": {
+            "type": "object", "additionalProperties": false,
+            "required": ["control_api_major"],
+            "properties": {"control_api_major": {"const": 1}}
+          }
+        }
+      },
+      "DaemonCapabilities": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["installation_id", "pid", "process_started_at", "startup_nonce", "discovery", "core_semver", "control_api_major", "state_schema", "operations", "allow_agent_publish"],
+        "properties": {
+          "installation_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "pid": {"type": "integer", "minimum": 1},
+          "process_started_at": {"type": "integer", "minimum": 1},
+          "startup_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "discovery": {"$ref": "#/components/schemas/DiscoveryPaths"},
+          "core_semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+          "control_api_major": {"const": 1},
+          "state_schema": {"type": "integer", "minimum": 1},
+          "operations": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "allow_agent_publish": {"type": "boolean"}
+        },
+        "examples": [{
+          "installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "pid": 1234, "process_started_at": 123456,
+          "startup_nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "discovery": {
+            "bootstrap_record": "/srv/post-pulsar/discovery/bootstrap.json",
+            "endpoint_record": "/srv/post-pulsar/discovery/endpoint.json",
+            "agent_capability_file": "/srv/post-pulsar/discovery/agent-capability"
+          },
+          "core_semver": "0.1.0", "control_api_major": 1, "state_schema": 1,
+          "operations": ["health", "capabilities"], "allow_agent_publish": false
+        }]
+      },
+      "CapabilitiesEnvelope": {
+        "type": "object", "additionalProperties": false,
+        "required": ["schema", "ok", "data", "request_id"],
+        "properties": {
+          "schema": {"const": "post-pulsar.control/v1"},
+          "ok": {"const": true},
+          "request_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+          "data": {"$ref": "#/components/schemas/DaemonCapabilities"}
+        }
+      },
       "Envelope": {
         "type": "object",
         "additionalProperties": false,
