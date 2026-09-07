@@ -48,8 +48,10 @@ def test_operator_documents_have_the_required_contract_sections() -> None:
             "reporting a vulnerability",
         },
         "MODERNIZATION_REPORT.md": {
-            "implemented through t5.3",
-            "evidence available through t5.3",
+            "implemented through t7.1",
+            "automated validation through t7.1",
+            "repository delivery status",
+            "known release limitations",
             "operator-only gates",
             "lock and api refresh",
             "easy future platform and api opportunities — not implemented",
@@ -143,14 +145,43 @@ def test_migration_and_security_are_explicit_about_revocation_and_limits() -> No
 
 def test_report_is_closed_evidence_not_a_future_capability_claim() -> None:
     report = _read("MODERNIZATION_REPORT.md")
-    assert "2026-09-05" in report
+    assert "2026-09-06" in report
     assert "NOT IMPLEMENTED" in report
     assert "through T5.2" not in report
-    assert "No item in this future section was implemented through T5.3." in report
+    assert "No item in this future section was implemented through T7.1." in report
     stale_evidence = (
         r"(?i)pending" + r" evidence|evidence " + r"pending|to be " + "verified"
     )
     assert re.search(stale_evidence, report) is None
+
+
+def test_report_pins_final_ecosystem_evidence_and_release_limits() -> None:
+    report = _read("MODERNIZATION_REPORT.md")
+    normalized = " ".join(report.split())
+    required = (
+        "78c7ebe131a8c18a24e3f0084085bad1c479c742",
+        "6ea89f0bd881d5dda82cfb3727195286434c42ef",
+        "post-pulsar.control/v1",
+        "a28a0cda8c1a1994166d5f4d211faa876547695cf3126b60cfbac450eb79c985",
+        "200` tests",
+        "778` tests",
+        "79.58%",
+        "below the unchanged `85%` CI threshold",
+        "real stdio cached-launch journeys",
+        "authenticated loopback endpoint",
+        "Public fresh-install onboarding",
+        "existing, initialized core profile",
+        "repository as not found",
+        "complete and clean locally",
+        "fake provider adapters",
+        "not been validated in a native Grok client",
+    )
+    for text in required:
+        assert text in normalized
+
+    assert "plugin commit is already on GitHub" not in report
+    assert "No live provider login or post was attempted." in normalized
+    assert "A live provider login or post was attempted." not in normalized
 
 
 def test_license_keeps_gpl3_and_ansons_authorship() -> None:

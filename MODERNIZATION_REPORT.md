@@ -1,9 +1,10 @@
 # POST PULSAR modernization report
 
-Report boundary: repository implementation and evidence through task T5.3.
-Refresh date: 2026-09-05.
+Report boundary: core implementation through task T7.1 and independently
+committed sibling-plugin evidence through task T6.6.
+Refresh date: 2026-09-06.
 
-## Implemented through T5.3
+## Implemented through T7.1
 
 The former flat PHONG-BOT scripts have been replaced by the `post_pulsar`
 Python 3.12 package and `post-pulsar` CLI while retaining Anson Phong's
@@ -49,9 +50,24 @@ Completed implementation includes:
   sentinel and is test-only, so it is absent from built runtime entry points.
 
 The implemented platform set is exactly X and Instagram professional-account
-publishing. There is no general platform plugin interface in core.
+publishing. There is no general social-platform adapter interface in core.
 
-## Evidence available through T5.3
+The separate `POST-PULSAR-PLUGINS` repository implements the agent-facing MCP
+surface over core's authenticated loopback control API. The independently
+committed plugin revision is
+`78c7ebe131a8c18a24e3f0084085bad1c479c742`. It is pinned to core integration
+revision `6ea89f0bd881d5dda82cfb3727195286434c42ef` and control contract
+`post-pulsar.control/v1`, whose canonical OpenAPI SHA-256 is
+`a28a0cda8c1a1994166d5f4d211faa876547695cf3126b60cfbac450eb79c985`.
+
+That sibling delivers a local stdio MCP server, guarded core discovery and
+cached launch, Codex and Claude Code configuration/install surfaces, and a
+generic MCP configuration recipe that can also be followed by compatible
+clients such as Grok. These are control-plane tools for existing POST PULSAR
+profiles; they do not add a GUI, host a public MCP service, store social
+credentials, or bypass the core approval and security boundaries.
+
+## Automated validation through T7.1
 
 Evidence is repository-local and does not rely on a live social account:
 
@@ -88,15 +104,61 @@ Evidence is repository-local and does not rely on a live social account:
   sibling compatibility checks without adding a runtime command or provider
   endpoint.
 
-Observed Stage 5 focused evidence for T5.3: `.venv/bin/uv run --frozen pytest
-tests/integration/test_workflow.py -q` exited 0 with `10 passed`; the
-scoped Ruff and mypy commands exited 0, and `git diff --exit-code -- uv.lock`
-exited 0. No broad suite, build, coverage, packaging, or audit result is claimed
-here; those remain Stage 6/CI evidence.
+The final offline core validation at integration revision
+`6ea89f0bd881d5dda82cfb3727195286434c42ef` completed `778` tests. Ruff,
+strict mypy, the package build, and the frozen dependency audit also passed;
+the frozen audit passed after the CI export path was corrected to audit the
+locked `pylock.toml` representation. Whole-core coverage measured `79.58%`,
+which is below the unchanged `85%` CI threshold and is therefore recorded as a
+release limitation rather than a passing coverage claim.
 
-These are automated, hermetic implementation checks. They do not constitute a
-provider-issued OAuth grant, a live post, public-host reachability from Meta, or
-an OS administrator's ACL attestation.
+The sibling plugin revision
+`78c7ebe131a8c18a24e3f0084085bad1c479c742` completed `200` tests. Its release
+validation exercised both the Codex and Claude Code integrations structurally
+and through real stdio cached-launch journeys against the real core application
+at the pinned integration revision. Provider traffic still used deterministic
+fake X/Instagram adapters, and control traffic remained on an authenticated
+loopback endpoint. No live provider login or post was attempted.
+
+The generic MCP/Grok setup is an implementation recipe, not native-client test
+evidence. No Grok-specific native package, Grok client run, hosted/public MCP
+deployment, or claim of compatibility beyond the documented standard MCP
+configuration is included.
+
+These automated checks do not constitute a provider-issued OAuth grant, a live
+post, public-host reachability from Meta, an OS administrator's ACL attestation,
+or native validation in an arbitrary MCP client.
+
+## Repository delivery status
+
+The core `origin` is configured as `git@github.com:ansonphong/POST-PULSAR.git`;
+the final core report commit is intended to be pushed there by the conductor
+after verification. This sentence records the pre-push handoff state, not a
+claim that the commit is already on GitHub.
+
+The plugin `origin` is configured as
+`git@github.com:ansonphong/POST-PULSAR-PLUGINS.git`, but GitHub currently reports
+that repository as not found. Plugin commit
+`78c7ebe131a8c18a24e3f0084085bad1c479c742` is complete and clean locally but
+cannot be pushed until the operator creates or grants access to that GitHub
+repository.
+
+## Known release limitations
+
+- Public fresh-install onboarding and an add-second-profile command are not
+  implemented. MCP/plugin operation requires an existing, initialized core
+  profile; creating the configuration, profile roots, environment credential
+  bindings, and initial state remains an operator prerequisite.
+- Whole-core coverage is `79.58%`, below the unchanged `85%` CI threshold even
+  though all `778` core tests, Ruff, strict mypy, the build, and frozen audit
+  pass.
+- The `200` plugin tests use the real core application and real loopback/stdio
+  paths, but fake provider adapters. They do not prove provider credentials,
+  entitlements, public media hosting, or a live post.
+- Codex and Claude Code have structural and real stdio cached-launch evidence.
+  The generic MCP/Grok recipe has not been validated in a native Grok client.
+- The plugin commit is locally complete but unpushed while its configured
+  GitHub repository does not exist.
 
 ## Operator-only gates
 
@@ -122,8 +184,8 @@ must be completed and recorded by the operator for each deployment:
   every positive and negative access test using a real agent logon/token, and
   operate the daemon as an administrator-enabled system service.
 - Independently review and verify any sibling MCP/plugin revision before
-  installation. T5.3 provides a reusable hermetic launcher, but records no
-  claim that an unreviewed sibling revision has passed compatibility checks.
+  installation. The exact reviewed revision and contract hash are recorded
+  above; later sibling revisions require a new compatibility review.
 
 ## Lock and API refresh
 
@@ -165,7 +227,7 @@ These are bounded opportunities, not current capabilities:
 
 Platform names sometimes suggested for expansion—such as Threads, Facebook or
 Bluesky—are not supported by this repository.
-No item in this future section was implemented through T5.3.
+No item in this future section was implemented through T7.1.
 
 ## Original recommendations and disposition
 
@@ -186,5 +248,6 @@ implemented above; it did not turn the core into a hosted service or a social
 platform plugin framework.
 
 For clarity, none of the future opportunities listed in the preceding section
-was implemented through T5.3. This report contains no forecast presented as
-test evidence and no assertion of a sibling repository revision.
+was implemented through T7.1. This report contains no forecast presented as
+test evidence. Its sibling-repository claims are limited to the exact local
+commit and automated validation recorded above.
