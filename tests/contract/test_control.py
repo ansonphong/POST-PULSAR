@@ -258,9 +258,14 @@ def _call(
 def test_pause_acceptance_persists_gate_before_response(tmp_path: Path) -> None:
     app = _application(tmp_path)
     fixture_capability = (tmp_path / "agent").read_text().strip()
-    response = _call(app, "POST", "/control/v1/pause", token=fixture_capability,
+    response = _call(
+        app,
+        "POST",
+        "/control/v1/pause",
+        token=fixture_capability,
         body={"profile_id": "profile", "arguments": {}},
-        headers={"Idempotency-Key": "fixture-pause", "If-Match": "1"})
+        headers={"Idempotency-Key": "fixture-pause", "If-Match": "1"},
+    )
     assert response.status == 202
     with StateRepository.open_existing(tmp_path / "state.sqlite3") as repository:
         assert repository.get_pause_state().pause_requested
@@ -272,13 +277,36 @@ def test_shutdown_requires_authentication_and_exact_incarnation(tmp_path: Path) 
     stopped = []
     app.bind_shutdown(lambda: stopped.append(True), "fixture-startup-nonce")
     fixture_capability = (tmp_path / "agent").read_text().strip()
-    assert _call(app, "POST", "/control/v1/shutdown",
-        body={"startup_nonce": "fixture-startup-nonce"}).status == 401
-    assert _call(app, "POST", "/control/v1/shutdown", token=fixture_capability,
-        body={"startup_nonce": "fixture-stale-nonce"}).status == 409
+    assert (
+        _call(
+            app,
+            "POST",
+            "/control/v1/shutdown",
+            body={"startup_nonce": "fixture-startup-nonce"},
+        ).status
+        == 401
+    )
+    assert (
+        _call(
+            app,
+            "POST",
+            "/control/v1/shutdown",
+            token=fixture_capability,
+            body={"startup_nonce": "fixture-stale-nonce"},
+        ).status
+        == 409
+    )
     assert stopped == []
-    assert _call(app, "POST", "/control/v1/shutdown", token=fixture_capability,
-        body={"startup_nonce": "fixture-startup-nonce"}).status == 202
+    assert (
+        _call(
+            app,
+            "POST",
+            "/control/v1/shutdown",
+            token=fixture_capability,
+            body={"startup_nonce": "fixture-startup-nonce"},
+        ).status
+        == 202
+    )
     assert stopped == [True]
 
 

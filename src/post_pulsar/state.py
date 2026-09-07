@@ -108,6 +108,18 @@ _EVENT_TYPES: Final = frozenset(
         "callback_failed",
     }
 )
+_LOCAL_MUTATION_ACTIONS: Final = frozenset(
+    {
+        "pause",
+        "resume",
+        "schedule_create",
+        "schedule_update",
+        "schedule_enable",
+        "schedule_disable",
+        "cancel",
+        "delete",
+    }
+)
 _REQUEST_ACTIONS: Final = frozenset(
     {
         "admit_draft",
@@ -467,6 +479,11 @@ class ScheduleRunRecord:
 class PauseRecord:
     paused: bool
     revision: int
+    pause_requested: bool = False
+
+    @property
+    def admission_blocked(self) -> bool:
+        return self.paused or self.pause_requested
 
 
 @dataclass(frozen=True, slots=True)
@@ -1085,14 +1102,21 @@ class StateRepository:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        self._connection.execute("BEGIN IMMEDIATE")
+        nested = self._connection.in_transaction
+        self._connection.execute(
+            "SAVEPOINT local_mutation" if nested else "BEGIN IMMEDIATE"
+        )
         try:
             yield
         except BaseException:
-            self._connection.execute("ROLLBACK")
+            if nested:
+                self._connection.execute("ROLLBACK TO local_mutation")
+                self._connection.execute("RELEASE local_mutation")
+            else:
+                self._connection.execute("ROLLBACK")
             raise
         else:
-            self._connection.execute("COMMIT")
+            self._connection.execute("RELEASE local_mutation" if nested else "COMMIT")
 
     def register_profile(
         self,
@@ -1363,6 +1387,8 @@ class StateRepository:
 
         with self._transaction():
             self._require_profile(profile_id)
+            if self.get_pause_state().admission_blocked:
+                raise TransitionError("new publication admission is paused")
             replay_rows = tuple(
                 self._connection.execute(
                     "SELECT * FROM bundles WHERE claimed_by_type = 'run_once' "
@@ -3473,11 +3499,7 @@ class StateRepository:
             schedule = self._schedule_row(schedule_key)
             if not bool(schedule["enabled"]):
                 raise TransitionError("disabled schedule cannot claim an occurrence")
-            if bool(
-                self._connection.execute(
-                    "SELECT paused FROM pause_state WHERE singleton = 1"
-                ).fetchone()[0]
-            ):
+            if self.get_pause_state().admission_blocked:
                 raise TransitionError("publication admission is paused")
             if str(schedule["config_hash"]) != schedule_hash:
                 raise ConflictError("schedule hash drift")
@@ -3583,6 +3605,8 @@ class StateRepository:
             self._require_revision(run, expected_revision, "schedule run")
             if str(run["state"]) != "due" or run["bundle_key"] is not None:
                 raise TransitionError("only an unclaimed due schedule run can admit")
+            if self.get_pause_state().admission_blocked:
+                raise TransitionError("new publication admission is paused")
             schedule = self._schedule_row(int(run["schedule_key"]))
             profile_id = str(schedule["profile_id"])
             bucket = _validate_bucket(str(schedule["bucket"]))
@@ -3829,9 +3853,17 @@ class StateRepository:
 
     def get_pause_state(self) -> PauseRecord:
         row = self._connection.execute(
-            "SELECT paused, revision FROM pause_state WHERE singleton = 1"
+            "SELECT paused, revision, EXISTS (SELECT 1 FROM run_requests "
+            "WHERE action = 'pause' AND status IN ('queued', 'claimed')) "
+            "AS pause_requested FROM pause_state WHERE singleton = 1"
         ).fetchone()
-        return PauseRecord(paused=bool(row["paused"]), revision=int(row["revision"]))
+        # The accepted durable row is the gate: insertion and gate activation
+        # are one commit, so no accepted pause can be lost between writes.
+        return PauseRecord(
+            paused=bool(row["paused"]),
+            revision=int(row["revision"]),
+            pause_requested=bool(row["pause_requested"]),
+        )
 
     def create_run_request(
         self,
@@ -3921,12 +3953,11 @@ class StateRepository:
             schedule_key=schedule_key,
             expected_revision=expected_revision,
         )
-        if self._request_admits_publication_locked(
-            action, json.loads(arguments_json), schedule_key
-        ) and bool(
-            self._connection.execute(
-                "SELECT paused FROM pause_state WHERE singleton = 1"
-            ).fetchone()[0]
+        if (
+            self._request_admits_publication_locked(
+                action, json.loads(arguments_json), schedule_key
+            )
+            and self.get_pause_state().admission_blocked
         ):
             raise TransitionError("new publication admission is paused")
         now = self._now_text()
@@ -3961,10 +3992,27 @@ class StateRepository:
     def claim_next_run_request(self, worker_token: str) -> RunRequestRecord | None:
         _validate_identifier(worker_token, "worker token")
         with self._transaction():
-            row = self._connection.execute(
+            rows = self._connection.execute(
                 "SELECT * FROM run_requests WHERE status = 'queued' "
-                "ORDER BY request_id LIMIT 1"
-            ).fetchone()
+                "ORDER BY CASE WHEN action = 'pause' THEN 0 ELSE 1 END, request_id"
+            )
+            pause = self.get_pause_state()
+            row = next(
+                (
+                    candidate
+                    for candidate in rows
+                    if not (
+                        pause.admission_blocked
+                        and self._request_admits_publication_locked(
+                            str(candidate["action"]),
+                            json.loads(str(candidate["arguments_json"])),
+                            cast(int | None, candidate["schedule_key"]),
+                        )
+                    )
+                    and not (pause.pause_requested and candidate["action"] == "resume")
+                ),
+                None,
+            )
             if row is None:
                 return None
             self._connection.execute(
@@ -3984,15 +4032,7 @@ class StateRepository:
         """Resolve dead-incarnation claims before accepting new work."""
 
         _validate_identifier(current_worker_token, "worker token")
-        unsafe = {
-            "enqueue",
-            "run_now",
-            "publish_now",
-            "edit_caption",
-            "edit_alt",
-            "retry",
-            "reconcile",
-        }
+        safe = _LOCAL_MUTATION_ACTIONS | {"admit_draft"}
         recovered: list[int] = []
         with self._transaction():
             rows = tuple(
@@ -4005,7 +4045,7 @@ class StateRepository:
             now = self._now_text()
             for row in rows:
                 request_id = int(row["request_id"])
-                if str(row["action"]) in unsafe:
+                if str(row["action"]) not in safe:
                     self._connection.execute(
                         "UPDATE run_requests SET status = 'failed', result_json = ?, "
                         "worker_token = NULL, revision = revision + 1, updated_at = ? "
@@ -4028,6 +4068,47 @@ class StateRepository:
                 recovered.append(request_id)
         return tuple(self.get_run_request(item) for item in recovered)
 
+    def execute_local_run_request(
+        self,
+        request: RunRequestRecord,
+        operation: Callable[[], Mapping[str, object]],
+    ) -> Mapping[str, object]:
+        """Commit an exact local mutation and its durable completion together.
+
+        Only the fixed local executor supplies the operation. Nested repository
+        writes use savepoints, so a crash cannot commit the resource without
+        committing this exact request's result in the same transaction.
+        """
+        with self._transaction():
+            stored = self._request_row(request.request_id)
+            if (
+                request.action not in _LOCAL_MUTATION_ACTIONS
+                or self._request_from_row(stored) != request
+                or request.status != "claimed"
+                or stored["worker_token"] is None
+            ):
+                raise ConflictError("local mutation lost its exact claimed request")
+            binding = self._safe_json(
+                {
+                    "profile_id": request.profile_id,
+                    "action": request.action,
+                    "arguments": request.arguments,
+                    "expected_revision": request.expected_revision,
+                    "bundle_key": request.bundle_key,
+                    "schedule_key": request.schedule_key,
+                    "intent_id": request.intent_id,
+                }
+            )
+            if _sha256_text(binding) != stored["request_sha256"]:
+                raise ConflictError("local mutation request binding changed")
+            result = operation()
+            completed = self.complete_run_request(
+                request.request_id,
+                worker_token=str(stored["worker_token"]),
+                result=result,
+            )
+            return cast(Mapping[str, object], completed.result)
+
     def complete_run_request(
         self,
         request_id: int,
@@ -4040,10 +4121,26 @@ class StateRepository:
         with self._transaction():
             row = self._request_row(request_id)
             if (
+                str(row["status"]) == "completed"
+                and str(row["action"]) in _LOCAL_MUTATION_ACTIONS
+                and str(row["worker_token"]) == worker_token
+                and str(row["result_json"]) == result_json
+                and not failed
+            ):
+                return self._request_from_row(row)
+            if (
                 str(row["status"]) != "claimed"
                 or str(row["worker_token"]) != worker_token
             ):
                 raise TransitionError("run request is not claimed by this worker")
+            if str(row["action"]) == "pause":
+                # A failed pause must remain safe; completing/clearing its
+                # pending gate always leaves the finalized paused state set.
+                self._connection.execute(
+                    "UPDATE pause_state SET paused = 1, revision = revision + 1, "
+                    "updated_at = ? WHERE singleton = 1 AND paused = 0",
+                    (self._now_text(),),
+                )
             self._connection.execute(
                 "UPDATE run_requests SET status = ?, result_json = ?, "
                 "revision = revision + 1, updated_at = ? WHERE request_id = ?",
@@ -4333,6 +4430,20 @@ class StateRepository:
         )
         with self._transaction():
             self._require_profile(profile_id)
+            request: sqlite3.Row | None = None
+            if intent_id is not None:
+                if (
+                    source_path != "DRAFTS"
+                    or destination_path != f"{bucket}/{bundle_id}"
+                ):
+                    raise ConflictError("admission confirmation path binding drift")
+                request = self._admission_request_binding_locked(
+                    intent_id,
+                    profile_id=profile_id,
+                    bucket=bucket,
+                    bundle_id=bundle_id,
+                    fingerprint=fingerprint,
+                )
             existing = self._connection.execute(
                 "SELECT * FROM admission_journals WHERE profile_id = ? "
                 "AND bucket = ? AND bundle_id = ?",
@@ -4343,7 +4454,6 @@ class StateRepository:
                     fingerprint,
                     source_path,
                     destination_path,
-                    intent_id,
                 )
                 stored = tuple(
                     existing[name]
@@ -4351,14 +4461,37 @@ class StateRepository:
                         "fingerprint",
                         "source_path",
                         "destination_path",
-                        "intent_id",
                     )
                 )
                 if stored != expected:
                     raise ConflictError(
                         "admission journal conflicts with existing bundle"
                     )
-                return self._admission_from_row(existing)
+                if str(existing["phase"]) != "rolled_back":
+                    if existing["intent_id"] != intent_id:
+                        raise ConflictError("admission journal confirmation conflicts")
+                    return self._admission_from_row(existing)
+                if request is None or str(request["status"]) not in {
+                    "queued",
+                    "claimed",
+                }:
+                    raise ConflictError(
+                        "admission retry requires a live confirmed request"
+                    )
+                if existing["intent_id"] != intent_id:
+                    original_intent = existing["intent_id"]
+                    if original_intent is None:
+                        raise ConflictError("admission retry confirmation conflicts")
+                    original_request = self._admission_request_binding_locked(
+                        str(original_intent),
+                        profile_id=profile_id,
+                        bucket=bucket,
+                        bundle_id=bundle_id,
+                        fingerprint=fingerprint,
+                    )
+                    if str(original_request["status"]) != "failed":
+                        raise ConflictError("admission original request is still live")
+                self._reset_rolled_back_admission_locked(existing)
             now = self._now_text()
             try:
                 cursor = self._connection.execute(
@@ -4383,6 +4516,127 @@ class StateRepository:
                 ) from None
             journal_id = _lastrowid(cursor)
         return self.get_admission(journal_id)
+
+    def _admission_request_binding_locked(
+        self,
+        intent_id: str,
+        *,
+        profile_id: str,
+        bucket: SourceBucket,
+        bundle_id: str,
+        fingerprint: str,
+    ) -> sqlite3.Row:
+        """Bind an admission attempt to the one request that consumed its approval."""
+        intent = self._intent_row(intent_id)
+        arguments = {"bucket": bucket, "bundle_id": bundle_id}
+        arguments_json = self._safe_json(arguments)
+        revision = int(intent["resource_revision"])
+        expected_intent = (
+            "consumed",
+            "admit_draft",
+            profile_id,
+            arguments_json,
+            fingerprint,
+            None,
+            None,
+            self._intent_binding(
+                "admit_draft",
+                arguments_json,
+                profile_id,
+                None,
+                None,
+                revision,
+                fingerprint,
+            ),
+        )
+        stored_intent = tuple(
+            intent[name]
+            for name in (
+                "state",
+                "action",
+                "profile_id",
+                "arguments_json",
+                "fingerprint",
+                "bundle_key",
+                "schedule_key",
+                "binding_sha256",
+            )
+        )
+        if stored_intent != expected_intent:
+            raise ConflictError("admission consumed confirmation binding drift")
+        requests = tuple(
+            self._connection.execute(
+                "SELECT * FROM run_requests WHERE intent_id = ?", (intent_id,)
+            )
+        )
+        if len(requests) != 1:
+            raise ConflictError("admission confirmation lacks its exact request")
+        request = requests[0]
+        request_hash = _sha256_text(
+            self._safe_json(
+                {
+                    "profile_id": profile_id,
+                    "action": "admit_draft",
+                    "arguments": arguments,
+                    "expected_revision": revision,
+                    "bundle_key": None,
+                    "schedule_key": None,
+                    "intent_id": intent_id,
+                }
+            )
+        )
+        expected_request = (
+            profile_id,
+            "admit_draft",
+            arguments_json,
+            revision,
+            None,
+            None,
+            request_hash,
+        )
+        stored_request = tuple(
+            request[name]
+            for name in (
+                "profile_id",
+                "action",
+                "arguments_json",
+                "expected_revision",
+                "bundle_key",
+                "schedule_key",
+                "request_sha256",
+            )
+        )
+        if stored_request != expected_request:
+            raise ConflictError("admission durable request binding drift")
+        return request
+
+    def _reset_rolled_back_admission_locked(self, journal: sqlite3.Row) -> None:
+        """Replace a fully rolled-back attempt without changing the canonical schema.
+
+        SQLite transactionally restores both checkpoints and the delete guard if
+        any later step fails. The new INSERT allocates a fresh journal/staging
+        identity; the consumed intents and durable requests retain their history.
+        """
+        journal_id = int(journal["journal_id"])
+        trigger = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'admission_members_no_delete'"
+        ).fetchone()
+        if trigger is None or trigger["sql"] is None:
+            raise StateError("admission member delete guard is unavailable")
+        trigger_sql = str(trigger["sql"])
+        self._connection.execute("DROP TRIGGER admission_members_no_delete")
+        self._connection.execute(
+            "DELETE FROM admission_members WHERE journal_id = ?", (journal_id,)
+        )
+        self._connection.execute(trigger_sql)
+        deleted = self._connection.execute(
+            "DELETE FROM admission_journals WHERE journal_id = ? "
+            "AND phase = 'rolled_back' AND revision = ?",
+            (journal_id, int(journal["revision"])),
+        )
+        if deleted.rowcount != 1:
+            raise ConflictError("admission rollback became stale")
 
     def checkpoint_admission_member(
         self,

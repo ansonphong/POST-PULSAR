@@ -59,6 +59,7 @@ from post_pulsar.state import (
     StateRepository,
     StateValidationError,
     TargetSnapshot,
+    TransitionError,
 )
 
 if TYPE_CHECKING:
@@ -249,7 +250,7 @@ class OneRunApplication:
             selected: PublishableBundle | None = None
             media: PreparedMedia | None = None
 
-            if repository.get_pause_state().paused:
+            if repository.get_pause_state().admission_blocked:
                 crossed_safe_boundary = False
                 if bundle is not None:
                     paused_deliveries = repository.list_bundle_deliveries(
@@ -371,6 +372,16 @@ class OneRunApplication:
                             expected_bundle_id=preview.bundle_id,
                             expected_fingerprint=preview.fingerprint,
                         )
+                except TransitionError:
+                    _cleanup_media(
+                        media,
+                        private_root,
+                        instagram_settings,
+                        outcome="failed",
+                    )
+                    if repository.get_pause_state().admission_blocked:
+                        return RunOutcome("blocked", code="publication_paused")
+                    raise
                 except (ConflictError, StateValidationError):
                     _cleanup_media(
                         media,
@@ -573,6 +584,8 @@ class OneRunApplication:
             self._inject("after_preflight_barrier")
 
             for platform in sorted(adapters):
+                if repository.get_pause_state().admission_blocked:
+                    return _outcome("blocked", bundle, "publication_paused")
                 delivery = claimed[platform]
                 publication = publications[platform]
                 writer = _StateCheckpointWriter(

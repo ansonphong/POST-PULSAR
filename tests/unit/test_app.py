@@ -322,14 +322,109 @@ def _factory(
 def test_pending_pause_blocks_new_content_before_credentials(tmp_path: Path) -> None:
     config, locks, instance = _initialize(tmp_path)
     _bundle(tmp_path, "post")
-    with StateRepository.open_existing(tmp_path / "state/post_pulsar.sqlite3") as repository:
-        repository.create_run_request(profile_id="operator", action="pause", arguments={},
-            idempotency_key="fixture-pause", expected_revision=1)
-    app = OneRunApplication(config, locks=locks, instance_lease=instance,
-                             environ={}, clock=lambda: NOW)
+    with StateRepository.open_existing(
+        tmp_path / "state/post_pulsar.sqlite3"
+    ) as repository:
+        repository.create_run_request(
+            profile_id="operator",
+            action="pause",
+            arguments={},
+            idempotency_key="fixture-pause",
+            expected_revision=1,
+        )
+    app = OneRunApplication(
+        config, locks=locks, instance_lease=instance, environ={}, clock=lambda: NOW
+    )
     try:
         result = app.run_once(RunOnceRequest("operator", "QUEUE", "fixture-run"))
         assert result.code == "publication_paused"
+    finally:
+        instance.release()
+
+
+def test_pause_during_media_preparation_blocks_atomic_content_admission(
+    tmp_path: Path,
+) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    _bundle(tmp_path, "post")
+
+    def prepare(*args, **kwargs):
+        media = prepare_bundle_media(*args, **kwargs)
+        with StateRepository.open_existing(
+            tmp_path / "state/post_pulsar.sqlite3"
+        ) as repository:
+            repository.create_run_request(
+                profile_id="operator",
+                action="pause",
+                arguments={},
+                idempotency_key="fixture-pause",
+                expected_revision=1,
+            )
+        return media
+
+    app = OneRunApplication(
+        config,
+        locks=locks,
+        instance_lease=instance,
+        environ={},
+        clock=lambda: NOW,
+        media_preparer=prepare,
+    )
+    try:
+        result = app.run_once(RunOnceRequest("operator", "QUEUE", "fixture-run"))
+        assert result.code == "publication_paused"
+        with StateRepository.open_existing(
+            tmp_path / "state/post_pulsar.sqlite3"
+        ) as repository:
+            assert repository.list_protected_bundles("operator") == ()
+    finally:
+        instance.release()
+
+
+def test_pause_during_current_target_commit_prevents_next_target(
+    tmp_path: Path,
+) -> None:
+    config, locks, instance = _initialize(tmp_path)
+    _write_config(tmp_path, instagram_enabled=True)
+    _bundle(tmp_path, "post")
+    adapters = []
+
+    class PausingAdapter(FakeAdapter):
+        def commit(self, prepared, *, delivery):
+            result = super().commit(prepared, delivery=delivery)
+            with StateRepository.open_existing(
+                tmp_path / "state/post_pulsar.sqlite3"
+            ) as repository:
+                repository.create_run_request(
+                    profile_id="operator",
+                    action="pause",
+                    arguments={},
+                    idempotency_key="fixture-pause",
+                    expected_revision=1,
+                )
+            return result
+
+    def build(snapshot, *_args):
+        adapter = PausingAdapter(snapshot)
+        adapters.append(adapter)
+        return adapter
+
+    app = OneRunApplication(
+        config,
+        locks=locks,
+        instance_lease=instance,
+        environ={
+            "POST_PULSAR_X_OPERATOR_USER_ACCESS_TOKEN": "fixture-only-x",
+            "POST_PULSAR_INSTAGRAM_OPERATOR_ACCESS_TOKEN": "fixture-only-instagram",
+        },
+        clock=lambda: NOW,
+        adapter_factory=build,
+    )
+    try:
+        result = app.run_once(RunOnceRequest("operator", "QUEUE", "fixture-run"))
+        assert result.code == "publication_paused"
+        assert sum(adapter.commits for adapter in adapters) == 1
+        assert sum(adapter.prepares for adapter in adapters) == 1
     finally:
         instance.release()
 

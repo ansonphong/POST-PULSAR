@@ -154,7 +154,10 @@ class DeterministicScheduler:
 
         now = _aware_utc(self._wall_clock())
         pause = getattr(self._repository, "get_pause_state", lambda: None)()
-        if pause is not None and bool(getattr(pause, "paused", False)):
+        if pause is not None and (
+            bool(getattr(pause, "paused", False))
+            or bool(getattr(pause, "pause_requested", False))
+        ):
             return ()
         retries = tuple(
             self._work(run, self._repository.get_schedule(run.schedule_key), True)
@@ -164,6 +167,14 @@ class DeterministicScheduler:
         for schedule in self._repository.list_enabled_schedules():
 
             def admit_occurrence() -> None:
+                current_pause = getattr(
+                    self._repository, "get_pause_state", lambda: None
+                )()
+                if current_pause is not None and (
+                    getattr(current_pause, "paused", False)
+                    or getattr(current_pause, "pause_requested", False)
+                ):
+                    return
                 try:
                     work = self._admit_occurrence(schedule, now)
                     if work is not None:

@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import signal
 import stat
 import sys
 import tempfile
@@ -520,7 +519,9 @@ def _dispatch(
             settings, arguments, transport=control_transport
         ), EXIT_OK
     if command == "shutdown":
-        return _shutdown(settings, arguments.profile), EXIT_OK
+        return _shutdown(
+            settings, arguments.profile, transport=control_transport
+        ), EXIT_OK
     if command == "daemon":
         return _daemon_foreground(
             settings,
@@ -1113,9 +1114,14 @@ def _local_durable_request(
         )
 
 
-def _shutdown(settings: LocalSettings, profile_id: str) -> Mapping[str, object]:
-    from post_pulsar.control import load_agent_capability
+def _shutdown(
+    settings: LocalSettings,
+    profile_id: str,
+    *,
+    transport: ControlTransport | None,
+) -> Mapping[str, object]:
     from post_pulsar.daemon import EndpointRecord
+    from post_pulsar.process_identity import ProcessIdentityError
 
     settings.profile(profile_id)
     try:
@@ -1133,25 +1139,32 @@ def _shutdown(settings: LocalSettings, profile_id: str) -> Mapping[str, object]:
             "incompatible_control_version",
             "daemon control version is incompatible",
         )
-    load_agent_capability(settings.app.agent_capability_file)
-    if not _endpoint_process_is_live(endpoint):
+    try:
+        matching = _endpoint_process_is_live(endpoint)
+    except ProcessIdentityError:
+        matching = False
+    if not matching:
         raise _RemoteControlError(
             503, "daemon_unavailable", "foreground daemon endpoint is stale"
         )
-    os.kill(endpoint.pid, signal.SIGTERM)
+    remote = _control_call(
+        settings,
+        "POST",
+        "/control/v1/shutdown",
+        body={"startup_nonce": endpoint.startup_nonce},
+        transport=transport,
+    )
+    if remote is None:
+        raise _RemoteControlError(
+            503, "daemon_unavailable", "foreground daemon is not running"
+        )
     return {"status": "shutdown_requested", "profile_id": profile_id}
 
 
 def _endpoint_process_is_live(endpoint: EndpointRecord) -> bool:
-    try:
-        os.kill(endpoint.pid, 0)
-    except (OSError, ValueError):
-        return False
-    try:
-        fields = Path(f"/proc/{endpoint.pid}/stat").read_text(encoding="ascii").split()
-        return int(fields[21]) == endpoint.process_started_at
-    except (OSError, ValueError, IndexError):
-        return os.name == "nt"
+    from post_pulsar.process_identity import process_identity_matches
+
+    return process_identity_matches(endpoint.pid, endpoint.process_started_at)
 
 
 def _daemon_foreground(
@@ -1302,6 +1315,76 @@ def _daemon_foreground(
     return {"status": "stopped"}
 
 
+def _execute_local_mutation(
+    repository: StateRepository, request: RunRequestRecord
+) -> Mapping[str, object]:
+    """Apply the fixed local action inside its durable completion transaction."""
+    if request.action in {"pause", "resume"}:
+        pause_record = repository.set_paused(
+            request.action == "pause", expected_revision=request.expected_revision
+        )
+        return {"paused": pause_record.paused, "revision": pause_record.revision}
+    if request.action == "schedule_create":
+        schedule_record = repository.create_schedule(
+            profile_id=request.profile_id,
+            schedule_id=cast(str, request.arguments["schedule_id"]),
+            bucket=cast(
+                "Literal['QUEUE', 'RANDOM', 'REELS']",
+                request.arguments["bucket"],
+            ),
+            timezone=cast(str, request.arguments["timezone"]),
+            weekdays=cast(Sequence[int], request.arguments["weekdays"]),
+            local_time=cast(str, request.arguments["local_time"]),
+            misfire_grace_seconds=cast(int, request.arguments["misfire_grace_seconds"]),
+            enabled=cast(bool, request.arguments["enabled"]),
+            expected_revision=request.expected_revision,
+        )
+        return _schedule_document(schedule_record)
+    if request.action == "schedule_update":
+        if request.schedule_key is None:
+            raise StateError("schedule update lost its exact resource")
+        schedule_record = repository.update_schedule(
+            request.schedule_key,
+            profile_id=request.profile_id,
+            schedule_id=cast(str, request.arguments["schedule_id"]),
+            bucket=cast(
+                "Literal['QUEUE', 'RANDOM', 'REELS']",
+                request.arguments["bucket"],
+            ),
+            timezone=cast(str, request.arguments["timezone"]),
+            weekdays=cast(Sequence[int], request.arguments["weekdays"]),
+            local_time=cast(str, request.arguments["local_time"]),
+            misfire_grace_seconds=cast(int, request.arguments["misfire_grace_seconds"]),
+            enabled=cast(bool, request.arguments["enabled"]),
+            expected_revision=request.expected_revision,
+        )
+        return _schedule_document(schedule_record)
+    if request.action in {"schedule_enable", "schedule_disable"}:
+        if request.schedule_key is None:
+            raise StateError("schedule toggle lost its exact resource")
+        schedule_record = repository.set_schedule_enabled(
+            request.schedule_key,
+            request.action == "schedule_enable",
+            expected_revision=request.expected_revision,
+        )
+        return _schedule_document(schedule_record)
+    if request.action in {"cancel", "delete"}:
+        if request.bundle_key is None:
+            raise StateError("pending terminal request lost its exact resource")
+        bundle = repository.get_bundle(request.bundle_key)
+        if bundle.bundle_id != request.arguments.get("bundle_id"):
+            raise ConflictError("pending bundle identity changed before execution")
+        tombstone = repository.terminalize_pending_bundle(
+            profile_id=request.profile_id,
+            bundle_key=request.bundle_key,
+            expected_revision=request.expected_revision,
+            fingerprint=cast(str, request.arguments["fingerprint"]),
+            action=request.action,
+        )
+        return _bundle_document(repository, tombstone)
+    raise StateError("unsupported local mutation")
+
+
 def _execute_daemon_request(
     settings: LocalSettings,
     request: RunRequestRecord,
@@ -1354,7 +1437,7 @@ def _execute_daemon_request(
             request.action in {"schedule_create", "schedule_update"}
             and request.arguments.get("enabled") is True
         )
-        if pause_blocked and repository.get_pause_state().paused:
+        if pause_blocked and repository.get_pause_state().admission_blocked:
             raise TransitionError("new publication admission is paused")
         if request.action == "admit_draft":
             from post_pulsar.admission import DraftAdmissionService
@@ -1377,73 +1460,19 @@ def _execute_daemon_request(
             return asdict(record)
         if request.action in {"edit_caption", "edit_alt"}:
             return _edit_draft_text(settings, request)
-        if request.action in {"pause", "resume"}:
-            pause_record = repository.set_paused(
-                request.action == "pause", expected_revision=request.expected_revision
+        if request.action in {
+            "pause",
+            "resume",
+            "schedule_create",
+            "schedule_update",
+            "schedule_enable",
+            "schedule_disable",
+            "cancel",
+            "delete",
+        }:
+            return repository.execute_local_run_request(
+                request, lambda: _execute_local_mutation(repository, request)
             )
-            return asdict(pause_record)
-        if request.action == "schedule_create":
-            schedule_record = repository.create_schedule(
-                profile_id=request.profile_id,
-                schedule_id=cast(str, request.arguments["schedule_id"]),
-                bucket=cast(
-                    "Literal['QUEUE', 'RANDOM', 'REELS']",
-                    request.arguments["bucket"],
-                ),
-                timezone=cast(str, request.arguments["timezone"]),
-                weekdays=cast(Sequence[int], request.arguments["weekdays"]),
-                local_time=cast(str, request.arguments["local_time"]),
-                misfire_grace_seconds=cast(
-                    int, request.arguments["misfire_grace_seconds"]
-                ),
-                enabled=cast(bool, request.arguments["enabled"]),
-                expected_revision=request.expected_revision,
-            )
-            return _schedule_document(schedule_record)
-        if request.action == "schedule_update":
-            if request.schedule_key is None:
-                raise StateError("schedule update lost its exact resource")
-            schedule_record = repository.update_schedule(
-                request.schedule_key,
-                profile_id=request.profile_id,
-                schedule_id=cast(str, request.arguments["schedule_id"]),
-                bucket=cast(
-                    "Literal['QUEUE', 'RANDOM', 'REELS']",
-                    request.arguments["bucket"],
-                ),
-                timezone=cast(str, request.arguments["timezone"]),
-                weekdays=cast(Sequence[int], request.arguments["weekdays"]),
-                local_time=cast(str, request.arguments["local_time"]),
-                misfire_grace_seconds=cast(
-                    int, request.arguments["misfire_grace_seconds"]
-                ),
-                enabled=cast(bool, request.arguments["enabled"]),
-                expected_revision=request.expected_revision,
-            )
-            return _schedule_document(schedule_record)
-        if request.action in {"schedule_enable", "schedule_disable"}:
-            if request.schedule_key is None:
-                raise StateError("schedule toggle lost its exact resource")
-            schedule_record = repository.set_schedule_enabled(
-                request.schedule_key,
-                request.action == "schedule_enable",
-                expected_revision=request.expected_revision,
-            )
-            return _schedule_document(schedule_record)
-        if request.action in {"cancel", "delete"}:
-            if request.bundle_key is None:
-                raise StateError("pending terminal request lost its exact resource")
-            bundle = repository.get_bundle(request.bundle_key)
-            if bundle.bundle_id != request.arguments.get("bundle_id"):
-                raise ConflictError("pending bundle identity changed before execution")
-            tombstone = repository.terminalize_pending_bundle(
-                profile_id=request.profile_id,
-                bundle_key=request.bundle_key,
-                expected_revision=request.expected_revision,
-                fingerprint=cast(str, request.arguments["fingerprint"]),
-                action=request.action,
-            )
-            return _bundle_document(repository, tombstone)
         if request.action == "retry":
             if request.bundle_key is None:
                 raise StateError("retry request lost its exact resource")

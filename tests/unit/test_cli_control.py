@@ -145,14 +145,28 @@ def test_shutdown_uses_authenticated_http_and_never_signals(
         assert request.headers["Authorization"] == "Bearer " + "c" * 64
         assert json.loads(request.body) == {"startup_nonce": endpoint.startup_nonce}
         return ControlResponse(
-            202, {},
-            json.dumps({"schema": "post-pulsar.control/v1", "ok": True,
-                        "data": {"status": "stopping"}}).encode(),
+            202,
+            {},
+            json.dumps(
+                {
+                    "schema": "post-pulsar.control/v1",
+                    "ok": True,
+                    "data": {"status": "stopping"},
+                }
+            ).encode(),
         )
 
     code, _, _ = _invoke(
-        ["shutdown", "--profile", "operator", "--confirm", "SHUTDOWN",
-         "--config", str(config), "--json"],
+        [
+            "shutdown",
+            "--profile",
+            "operator",
+            "--confirm",
+            "SHUTDOWN",
+            "--config",
+            str(config),
+            "--json",
+        ],
         control_transport=transport,
     )
     assert code == (EXIT_OK if matching else EXIT_DAEMON_UNAVAILABLE)

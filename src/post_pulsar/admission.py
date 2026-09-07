@@ -59,6 +59,9 @@ class DraftAdmissionService:
     ) -> AdmissionRecord:
         if bucket not in _BUCKETS:
             raise AdmissionError("admission bucket is invalid")
+        profile = self._repository.get_profile(profile_id)
+        if profile.account_root.resolve(strict=False) != self._root:
+            raise AdmissionError("admission account root differs from approved profile")
         drafts = self._root / "DRAFTS"
         try:
             scan = scan_inbox(drafts)
@@ -89,7 +92,6 @@ class DraftAdmissionService:
         bucket_root = self._root / bucket
         _secure_directory(bucket_root)
         destination = bucket_root / bundle_id
-        temporary = bucket_root / f".admitting-{bundle_id}-{expected_fingerprint[:16]}"
         journal = self._repository.start_admission(
             profile_id=profile_id,
             bucket=bucket,
@@ -99,6 +101,7 @@ class DraftAdmissionService:
             destination_path=f"{bucket}/{bundle_id}",
             intent_id=intent_id,
         )
+        temporary = self._temporary_path(journal)
         self._inject("after_journal")
         if journal.phase == "installed":
             self._verify_installed(destination, expected_fingerprint)
@@ -110,10 +113,8 @@ class DraftAdmissionService:
                     journal.journal_id, "installed", expected_revision=journal.revision
                 )
             raise ConflictError("admission destination already exists")
-        if temporary.exists():
-            if temporary.is_symlink() or not temporary.is_dir():
-                raise AdmissionError("admission staging path is unsafe")
-            shutil.rmtree(temporary)
+        if journal.phase != "started" or os.path.lexists(temporary):
+            raise AdmissionError("admission requires recovery before retry")
         temporary.mkdir(mode=0o700)
         _fsync_directory(bucket_root)
 
@@ -187,10 +188,11 @@ class DraftAdmissionService:
             if profile.account_root.resolve(strict=False) != self._root:
                 continue
             destination = self._root / journal.destination_path
-            temporary = (
-                destination.parent
-                / f".admitting-{journal.bundle_id}-{journal.fingerprint[:16]}"
-            )
+            temporary = self._recovery_temporary_path(journal)
+            if os.path.lexists(temporary) and (
+                temporary.is_symlink() or not temporary.is_dir()
+            ):
+                raise AdmissionError("admission staging path is unsafe")
             if destination.exists() and journal.phase == "ready_installed":
                 self._verify_installed(destination, journal.fingerprint)
                 journal = self._repository.advance_admission(
@@ -210,6 +212,7 @@ class DraftAdmissionService:
             else:
                 if temporary.exists() and not temporary.is_symlink():
                     shutil.rmtree(temporary)
+                    _fsync_directory(destination.parent)
                 journal = self._repository.advance_admission(
                     journal.journal_id,
                     "rolled_back",
@@ -217,6 +220,25 @@ class DraftAdmissionService:
                 )
             recovered.append(journal)
         return tuple(recovered)
+
+    def _temporary_path(self, journal: AdmissionRecord) -> Path:
+        destination = self._root / journal.destination_path
+        return destination.parent / (
+            f".admitting-{journal.bundle_id}-{journal.fingerprint[:16]}"
+            f"-{journal.journal_id}"
+        )
+
+    def _recovery_temporary_path(self, journal: AdmissionRecord) -> Path:
+        """Recover pre-upgrade staging names as well as attempt-specific copies."""
+        temporary = self._temporary_path(journal)
+        legacy = temporary.parent / (
+            f".admitting-{journal.bundle_id}-{journal.fingerprint[:16]}"
+        )
+        if os.path.lexists(legacy):
+            if os.path.lexists(temporary):
+                raise AdmissionError("admission staging identity is ambiguous")
+            return legacy
+        return temporary
 
     def _inject(self, boundary: str) -> None:
         if self._fault is not None:

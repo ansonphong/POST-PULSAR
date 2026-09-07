@@ -143,7 +143,9 @@ def test_windows_identity_reads_creation_time_and_closes_handle(monkeypatch):
         CloseHandle=_NativeCall(lambda handle: closed.append(handle) or 1),
     )
     monkeypatch.setattr(identity.sys, "platform", "win32")
-    monkeypatch.setattr(identity.ctypes, "WinDLL", lambda *a, **k: native, raising=False)
+    monkeypatch.setattr(
+        identity.ctypes, "WinDLL", lambda *a, **k: native, raising=False
+    )
     assert identity.process_start_identity(73) == (12 << 32) | 234
     assert opened == [(0x1000, False, 73)]
     assert closed == [456]
@@ -158,7 +160,9 @@ def test_windows_failed_time_lookup_still_closes_handle(monkeypatch):
         CloseHandle=_NativeCall(lambda handle: closed.append(handle) or 1),
     )
     monkeypatch.setattr(identity.sys, "platform", "win32")
-    monkeypatch.setattr(identity.ctypes, "WinDLL", lambda *a, **k: native, raising=False)
+    monkeypatch.setattr(
+        identity.ctypes, "WinDLL", lambda *a, **k: native, raising=False
+    )
     with pytest.raises(identity.ProcessIdentityError):
         identity.process_start_identity(73)
     assert closed == [456]

@@ -230,7 +230,10 @@ _PRE_READY_BOUNDARIES = (
 
 
 def _crash_admission(
-    repository: StateRepository, root: Path, fingerprint: str, intent_id: str,
+    repository: StateRepository,
+    root: Path,
+    fingerprint: str,
+    intent_id: str,
     boundary: str,
 ) -> None:
     def fail(selected: str) -> None:
@@ -249,7 +252,8 @@ def _crash_admission(
 
 @pytest.mark.parametrize("boundary", _PRE_READY_BOUNDARIES)
 def test_daemon_replays_same_request_after_each_pre_ready_admission_crash(
-    tmp_path: Path, boundary: str,
+    tmp_path: Path,
+    boundary: str,
 ) -> None:
     import threading
     from types import SimpleNamespace
@@ -362,9 +366,9 @@ def test_rolled_back_admission_restarts_with_fresh_checkpoints_and_staging_ident
     )
     restarted = repository.list_recoverable_admissions()[0]
     assert restarted.journal_id != rolled_back.journal_id
-    assert [item.phase for item in repository.list_admission_members(
-        restarted.journal_id
-    )] == ["planned"]
+    assert [
+        item.phase for item in repository.list_admission_members(restarted.journal_id)
+    ] == ["planned"]
     new_temporary = tuple((root / "QUEUE").glob(".admitting-*"))
     assert len(new_temporary) == 1 and new_temporary != old_temporary
     assert not (new_temporary[0] / ".ready").exists()
@@ -407,7 +411,8 @@ def test_fresh_approval_can_retry_failed_rolled_back_unchanged_draft(
 
 @pytest.mark.parametrize("claimed", [False, True])
 def test_fresh_approval_cannot_supersede_a_live_admission_request(
-    tmp_path: Path, claimed: bool,
+    tmp_path: Path,
+    claimed: bool,
 ) -> None:
     root, fingerprint = _draft(tmp_path)
     repository = _repository(tmp_path)
@@ -419,25 +424,30 @@ def test_fresh_approval_cannot_supersede_a_live_admission_request(
     new_intent = _intent(repository, fingerprint, idempotency_key="admit-hello-other")
     with pytest.raises(ConflictError):
         DraftAdmissionService(repository, root).admit(
-            profile_id="profile", bucket="QUEUE", bundle_id="hello",
-            expected_fingerprint=fingerprint, intent_id=new_intent,
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            expected_fingerprint=fingerprint,
+            intent_id=new_intent,
         )
     assert repository.get_admission(rolled_back.journal_id).phase == "rolled_back"
     assert not (root / "QUEUE/hello").exists()
 
 
 @pytest.mark.parametrize(
-    ("table", "column", "value"),
+    ("statement", "value"),
     [
-        ("confirmation_intents", "binding_sha256", "0" * 64),
-        ("run_requests", "request_sha256", "0" * 64),
-        ("run_requests", "action", "pause"),
-        ("run_requests", "expected_revision", 2),
-        ("run_requests", "intent_id", None),
+        ("UPDATE confirmation_intents SET binding_sha256 = ?", "0" * 64),
+        ("UPDATE run_requests SET request_sha256 = ?", "0" * 64),
+        ("UPDATE run_requests SET action = ?", "pause"),
+        ("UPDATE run_requests SET expected_revision = ?", 2),
+        ("UPDATE run_requests SET intent_id = ?", None),
     ],
 )
 def test_rolled_back_retry_revalidates_consumed_intent_and_exact_request_binding(
-    tmp_path: Path, table: str, column: str, value: object,
+    tmp_path: Path,
+    statement: str,
+    value: object,
 ) -> None:
     root, fingerprint = _draft(tmp_path)
     repository = _repository(tmp_path)
@@ -445,13 +455,92 @@ def test_rolled_back_retry_revalidates_consumed_intent_and_exact_request_binding
     _crash_admission(repository, root, fingerprint, intent_id, "before_ready_install")
     rolled_back = DraftAdmissionService(repository, root).recover()[0]
     members = repository.list_admission_members(rolled_back.journal_id)
-    repository._connection.execute(f"UPDATE {table} SET {column} = ?", (value,))
+    repository._connection.execute(statement, (value,))
     with pytest.raises((AdmissionError, ConflictError)):
         repository.start_admission(
-            profile_id="profile", bucket="QUEUE", bundle_id="hello",
-            fingerprint=fingerprint, source_path="DRAFTS",
-            destination_path="QUEUE/hello", intent_id=intent_id,
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            fingerprint=fingerprint,
+            source_path="DRAFTS",
+            destination_path="QUEUE/hello",
+            intent_id=intent_id,
         )
     assert repository.get_admission(rolled_back.journal_id).phase == "rolled_back"
     assert repository.list_admission_members(rolled_back.journal_id) == members
     assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+
+
+def test_admission_retry_reset_is_atomic_and_restores_member_delete_protection(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    intent_id = _intent(repository, fingerprint)
+    _crash_admission(repository, root, fingerprint, intent_id, "before_ready_install")
+    rolled_back = DraftAdmissionService(repository, root).recover()[0]
+    members = repository.list_admission_members(rolled_back.journal_id)
+    repository._connection.execute(
+        "CREATE TEMP TRIGGER fail_admission_retry BEFORE INSERT ON admission_journals "
+        "BEGIN SELECT RAISE(ABORT, 'simulated reset interruption'); END"
+    )
+    with pytest.raises(ConflictError):
+        DraftAdmissionService(repository, root).admit(
+            profile_id="profile",
+            bucket="QUEUE",
+            bundle_id="hello",
+            expected_fingerprint=fingerprint,
+            intent_id=intent_id,
+        )
+    assert repository.get_admission(rolled_back.journal_id) == rolled_back
+    assert repository.list_admission_members(rolled_back.journal_id) == members
+    with pytest.raises(sqlite3.IntegrityError, match="immutable admission member"):
+        repository._connection.execute(
+            "DELETE FROM admission_members WHERE journal_id = ?",
+            (rolled_back.journal_id,),
+        )
+    with StateRepository.open_existing(repository.path) as fresh:
+        assert fresh.get_admission(rolled_back.journal_id) == rolled_back
+    assert (root / "DRAFTS/hello.jpg").read_bytes() == b"image"
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"profile_id": "other"},
+        {"bucket": "RANDOM"},
+        {"bundle_id": "other"},
+        {"fingerprint": "b" * 64},
+        {"source_path": "DRAFTS/other"},
+        {"destination_path": "QUEUE/other"},
+        {"intent_id": None},
+    ],
+)
+def test_admission_retry_cannot_change_approved_source_or_destination_binding(
+    tmp_path: Path,
+    changed: dict[str, object],
+) -> None:
+    root, fingerprint = _draft(tmp_path)
+    repository = _repository(tmp_path)
+    repository.register_profile(
+        "other", tmp_path / "other-account", (), config_hash="a" * 64
+    )
+    intent_id = _intent(repository, fingerprint)
+    _crash_admission(repository, root, fingerprint, intent_id, "before_ready_install")
+    rolled_back = DraftAdmissionService(repository, root).recover()[0]
+    members = repository.list_admission_members(rolled_back.journal_id)
+    arguments = {
+        "profile_id": "profile",
+        "bucket": "QUEUE",
+        "bundle_id": "hello",
+        "fingerprint": fingerprint,
+        "source_path": "DRAFTS",
+        "destination_path": "QUEUE/hello",
+        "intent_id": intent_id,
+    }
+    with pytest.raises(ConflictError):
+        repository.start_admission(**{**arguments, **changed})
+    assert repository.get_admission(rolled_back.journal_id) == rolled_back
+    assert repository.list_admission_members(rolled_back.journal_id) == members

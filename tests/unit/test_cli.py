@@ -684,6 +684,8 @@ def test_daemon_pending_terminal_executor_preserves_source_media(
             idempotency_key=f"{action}-executor",
             bundle_key=bundle_key,
         )
+        request = repository.claim_next_run_request("fixture-local-worker")
+        assert request is not None
     locks = LockManager(tmp_path / "state")
     with locks.acquire_instance() as lease:
         daemon = cast(ForegroundDaemon, SimpleNamespace(_locks=locks, _lease=lease))

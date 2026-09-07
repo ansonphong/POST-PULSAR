@@ -11,7 +11,6 @@ import signal
 import socket
 import stat
 import threading
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -20,6 +19,10 @@ from typing import Protocol
 
 from post_pulsar.control import CONTROL_SCHEMA, ControlApplication, ControlRequest
 from post_pulsar.locking import LockLease, LockManager
+from post_pulsar.process_identity import (
+    process_identity_matches,
+    process_start_identity,
+)
 from post_pulsar.state import RunRequestRecord, StateRepository
 
 RequestExecutor = Callable[[RunRequestRecord], Mapping[str, object]]
@@ -128,28 +131,45 @@ class ForegroundDaemon:
         self._server: _Server | None = None
         self._http_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
+        self._shutdown_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._claim_gate = threading.Lock()
+        self._lifecycle = threading.RLock()
+        self._startup_thread: int | None = None
         self._nonce = secrets.token_hex(32)
         self._worker_token = f"daemon-{self._nonce[:16]}"
-        self._started_at = _process_start_identity(os.getpid())
+        self._started_at = process_start_identity(os.getpid())
+        if self._control is not None:
+            self._control.bind_shutdown(self._request_control_shutdown, self._nonce)
 
     def start(self) -> None:
         """Recover first, then expose admission and worker processing."""
+        with self._lifecycle:
+            self._startup_thread = threading.get_ident()
+            try:
+                self._start_runtime()
+            finally:
+                self._startup_thread = None
+
+    def _start_runtime(self) -> None:
         if self._lease is not None:
             raise RuntimeError("daemon is already started")
+        if self._stop.is_set():
+            return
         lease = self._locks.acquire_instance()
         self._lease = lease
         try:
-            self._stop.clear()
-            if self._recovery is not None:
-                self._invoke_callback("recovery", self._recovery)
-            if self._schedule_admission is not None:
-                self._invoke_callback("schedule", self._schedule_admission)
             if self._endpoint.exists():
                 existing = EndpointRecord.read(self._endpoint)
                 if _record_process_is_live(existing):
                     raise RuntimeError("endpoint record is owned by a live process")
+            if self._recovery is not None:
+                self._invoke_callback("recovery", self._recovery)
+            if self._schedule_admission is not None:
+                self._invoke_callback("schedule", self._schedule_admission)
+            if self._stop.is_set():
+                self._cleanup_runtime()
+                return
             handler = _handler_for(self._control)
             self._server = self._server_factory((self._host, self._port), handler)
             bound_host, bound_port = self._server.server_address[:2]
@@ -176,39 +196,67 @@ class ForegroundDaemon:
             )
             self._worker_thread.start()
         except BaseException:
-            self._cleanup_runtime()
+            self._stop.set()
+            self._finish_stop()
             raise
 
     def run_forever(self) -> None:
         """Start and block until SIGINT/SIGTERM requests an orderly stop."""
-        self.start()
-        stopped = threading.Event()
         previous: dict[int, object] = {}
 
         def request_stop(_signum: int, _frame: object) -> None:
-            stopped.set()
+            # Signal handlers can interrupt code holding the claim gate on this
+            # same thread. Only record the request here; cleanup runs below.
+            self._stop.set()
 
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous[signum] = signal.signal(signum, request_stop)
         try:
-            while not stopped.wait(0.1) and not self._stop.is_set():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.signal(signum, request_stop)
+            self.start()
+            while not self._stop.wait(0.1):
                 continue
         finally:
-            self.stop()
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)  # type: ignore[arg-type]
+            try:
+                self.stop()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)  # type: ignore[arg-type]
+
+    def _request_control_shutdown(self) -> None:
+        """Let the HTTP response finish while another thread drains the daemon."""
+        with self._claim_gate:
+            self._stop.set()
+            if self._shutdown_thread is not None:
+                return
+            worker = threading.Thread(
+                target=self.stop, name="post-pulsar-shutdown", daemon=False
+            )
+            self._shutdown_thread = worker
+        worker.start()
 
     def stop(self) -> None:
         """Stop admission, then wait for the current sequential safe boundary."""
-        if self._lease is None:
-            return
         with self._claim_gate:
             self._stop.set()
-        if self._server is not None:
+        # A callback may request its own stop. Its caller drains that callback
+        # before cleanup; another thread must wait for the lifecycle lock.
+        if self._startup_thread == threading.get_ident():
+            return
+        with self._lifecycle:
+            self._finish_stop()
+
+    def _finish_stop(self) -> None:
+        if self._lease is None:
+            return
+        if (
+            self._server is not None
+            and self._http_thread is not None
+            and self._http_thread.ident is not None
+        ):
             self._server.shutdown()
-        if self._http_thread is not None:
+        if self._http_thread is not None and self._http_thread.ident is not None:
             self._http_thread.join()
-        if self._worker_thread is not None:
+        if self._worker_thread is not None and self._worker_thread.ident is not None:
             self._worker_thread.join()
         self._cleanup_runtime()
 
@@ -369,23 +417,8 @@ def _make_http_server(
     return HTTPServer(address, handler, bind_and_activate=True)
 
 
-def _process_start_identity(pid: int) -> int:
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()
-        return int(fields[21])
-    except (OSError, ValueError, IndexError):
-        if pid == os.getpid():
-            return time.time_ns()
-        return -1
-
-
 def _record_process_is_live(record: EndpointRecord) -> bool:
-    try:
-        os.kill(record.pid, 0)
-    except (OSError, ValueError):
-        return False
-    identity = _process_start_identity(record.pid)
-    return identity < 0 or identity == record.process_started_at
+    return process_identity_matches(record.pid, record.process_started_at)
 
 
 def _fsync_parent(path: Path) -> None:

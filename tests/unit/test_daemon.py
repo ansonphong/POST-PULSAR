@@ -212,7 +212,10 @@ def test_endpoint_recovery_never_probes_with_signals(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(module.os, "kill", forbidden)
     daemon = ForegroundDaemon(
-        tmp_path / "state", endpoint, "127.0.0.1", 0,
+        tmp_path / "state",
+        endpoint,
+        "127.0.0.1",
+        0,
         server_factory=lambda *args: _Server(*args),
     )
     try:
@@ -222,7 +225,9 @@ def test_endpoint_recovery_never_probes_with_signals(tmp_path: Path, monkeypatch
         daemon.stop()
 
 
-def test_endpoint_with_unverifiable_process_identity_is_preserved(tmp_path: Path, monkeypatch):
+def test_endpoint_with_unverifiable_process_identity_is_preserved(
+    tmp_path: Path, monkeypatch
+):
     import importlib
 
     identity = importlib.import_module("post_pulsar.process_identity")
@@ -232,7 +237,10 @@ def test_endpoint_with_unverifiable_process_identity_is_preserved(tmp_path: Path
     )
     record.write(endpoint)
     daemon = ForegroundDaemon(
-        tmp_path / "state", endpoint, "127.0.0.1", 0,
+        tmp_path / "state",
+        endpoint,
+        "127.0.0.1",
+        0,
         server_factory=lambda *args: _Server(*args),
     )
 
@@ -279,8 +287,12 @@ def test_signals_are_installed_before_recovery_and_stop_skips_startup_work(
         return _Server(*args)
 
     daemon = ForegroundDaemon(
-        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
-        recovery=recover, schedule_admission=lambda: scheduled.append(True),
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        recovery=recover,
+        schedule_admission=lambda: scheduled.append(True),
         server_factory=server_factory,
     )
     daemon.run_forever()
@@ -315,8 +327,12 @@ def test_signal_handlers_restore_across_entire_lifecycle(
         raise RuntimeError("injected lifecycle failure")
 
     monkeypatch.setattr(module.signal, "signal", install)
-    monkeypatch.setattr(daemon, "start", fail if failure_phase == "start" else daemon._stop.set)
-    monkeypatch.setattr(daemon, "stop", fail if failure_phase == "stop" else lambda: None)
+    monkeypatch.setattr(
+        daemon, "start", fail if failure_phase == "start" else daemon._stop.set
+    )
+    monkeypatch.setattr(
+        daemon, "stop", fail if failure_phase == "stop" else lambda: None
+    )
     with pytest.raises(RuntimeError, match="injected lifecycle failure"):
         daemon.run_forever()
     assert len(history) == 4
@@ -342,8 +358,12 @@ def test_concurrent_stop_drains_startup_callback_before_releasing_lease(tmp_path
         return _Server(*args)
 
     daemon = ForegroundDaemon(
-        tmp_path / "state", tmp_path / "endpoint.json", "127.0.0.1", 0,
-        recovery=recover, server_factory=factory,
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        recovery=recover,
+        server_factory=factory,
     )
 
     def start():
@@ -379,3 +399,134 @@ def test_concurrent_stop_drains_startup_callback_before_releasing_lease(tmp_path
     assert failures == []
     assert servers == []
     assert daemon._lease is None
+
+
+def test_accepted_pause_drains_current_request_and_blocks_older_queue_and_due_work(
+    tmp_path,
+):
+    from dataclasses import asdict
+    from datetime import UTC, datetime, timedelta
+    from post_pulsar.state import (
+        BundleFileSnapshot,
+        ProfileTargetSnapshot,
+        StateRepository,
+        TargetSnapshot,
+    )
+
+    database = tmp_path / "state/post_pulsar.sqlite3"
+    with StateRepository(database) as repository:
+        repository.register_profile(
+            "fixture",
+            tmp_path / "account",
+            (
+                ProfileTargetSnapshot(
+                    "x", "fixture-user", "fixture", "FIXTURE_TOKEN_REFERENCE", {}
+                ),
+            ),
+            config_hash="a" * 64,
+        )
+        key = repository.add_bundle(
+            profile_id="fixture",
+            bundle_id="post",
+            fingerprint="b" * 64,
+            source_bucket="QUEUE",
+            files=(
+                BundleFileSnapshot(
+                    "post.jpg", "image", None, "image", "image/jpeg", 1, "a" * 64
+                ),
+            ),
+            targets=(
+                TargetSnapshot(
+                    "x",
+                    "fixture-user",
+                    "fixture",
+                    "FIXTURE_TOKEN_REFERENCE",
+                    "2",
+                    1,
+                    {},
+                ),
+            ),
+        )
+        for trigger in ("fixture-current", "fixture-queued"):
+            arguments = {
+                "bundle_id": "post",
+                "bucket": "QUEUE",
+                "fingerprint": "b" * 64,
+                "trigger_id": trigger,
+            }
+            intent = repository.create_confirmation_intent(
+                action="run_now",
+                arguments=arguments,
+                profile_id="fixture",
+                resource_revision=1,
+                fingerprint="b" * 64,
+                consequence="Fixture-only publication callback.",
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                bundle_key=key,
+            )
+            repository.approve_confirmation_intent(
+                intent.intent_id, expected_revision=1
+            )
+            repository.consume_intent_with_request(
+                intent_id=intent.intent_id,
+                action="run_now",
+                arguments=arguments,
+                profile_id="fixture",
+                resource_revision=1,
+                fingerprint="b" * 64,
+                idempotency_key=trigger,
+                bundle_key=key,
+            )
+    entered, release, paused, due = (threading.Event() for _ in range(4))
+    publications, schedules = [], []
+
+    def schedule():
+        if due.is_set():
+            with StateRepository.open_existing(database) as repository:
+                if not repository.get_pause_state().admission_blocked:
+                    schedules.append("fixture-new-due")
+
+    def execute(request):
+        if request.action == "pause":
+            with StateRepository.open_existing(database) as repository:
+                result = repository.execute_local_run_request(
+                    request,
+                    lambda: asdict(repository.set_paused(True, expected_revision=1)),
+                )
+            paused.set()
+            return result
+        publications.append(request.arguments["trigger_id"])
+        entered.set()
+        assert release.wait(2)
+        return {"status": "fixture-completed"}
+
+    daemon = ForegroundDaemon(
+        tmp_path / "state",
+        tmp_path / "endpoint.json",
+        "127.0.0.1",
+        0,
+        request_executor=execute,
+        schedule_admission=schedule,
+        server_factory=lambda *args: _Server(*args),
+    )
+    try:
+        daemon.start()
+        assert entered.wait(1)
+        with StateRepository.open_existing(database) as repository:
+            repository.create_run_request(
+                profile_id="fixture",
+                action="pause",
+                arguments={},
+                idempotency_key="fixture-pause",
+                expected_revision=1,
+            )
+        due.set()
+        release.set()
+        assert paused.wait(1)
+    finally:
+        release.set()
+        daemon.stop()
+    assert publications == ["fixture-current"] and schedules == []
+    with StateRepository.open_existing(database) as repository:
+        assert repository.get_run_request(2).status == "queued"
+        assert repository.get_pause_state().paused

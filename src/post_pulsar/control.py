@@ -10,7 +10,7 @@ import re
 import secrets
 import stat
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -241,6 +241,15 @@ class ControlApplication:
         self._max_body = max_body_bytes
         self._max_results = max_results
         self._intent_ttl = confirmation_ttl_seconds
+        self._shutdown: Callable[[], None] | None = None
+        self._startup_nonce: str | None = None
+
+    def bind_shutdown(self, callback: Callable[[], None], startup_nonce: str) -> None:
+        """Bind graceful shutdown to this authenticated daemon incarnation."""
+        if not startup_nonce or self._shutdown is not None:
+            raise ControlSecurityError("shutdown incarnation binding is invalid")
+        self._shutdown = callback
+        self._startup_nonce = startup_nonce
 
     def handle(self, request: ControlRequest) -> ControlResponse:
         """Validate authentication and route one bounded local request."""
@@ -291,6 +300,15 @@ class ControlApplication:
         if segments[:2] != ("control", "v1"):
             raise StateValidationError("unknown control route")
         route = segments[2:]
+        if method == "POST" and route == ("shutdown",):
+            _exact_body(body, {"startup_nonce"}, {"startup_nonce"})
+            nonce = _text(body, "startup_nonce")
+            if self._shutdown is None or self._startup_nonce is None:
+                raise TransitionError("daemon shutdown is unavailable")
+            if not hmac.compare_digest(nonce, self._startup_nonce):
+                raise ConflictError("daemon incarnation changed")
+            self._shutdown()
+            return {"status": "stopping"}, 202
         if method == "GET" and route == ("health",):
             failures = repository.control_events(limit=10)
             return {
@@ -328,6 +346,7 @@ class ControlApplication:
                 raise StateValidationError("bundle filter requires exact profile")
             return {
                 "paused": pause.paused,
+                "pause_requested": pause.pause_requested,
                 "revision": pause.revision,
                 "due_work": repository.has_due_work(),
                 "profiles": len(repository.list_profiles(limit=self._max_results)),
