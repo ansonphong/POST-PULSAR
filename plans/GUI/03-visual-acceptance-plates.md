@@ -49,6 +49,8 @@ Acceptance notes:
 - Profile color is never the only identity; every item names the profile.
 - Global Running/Paused state stays outside selected-profile chrome.
 - No follower/engagement vanity statistics.
+- The shown Cmd+K hint becomes Ctrl+K on Windows/Linux. Its commands are the
+  closed navigation/search/profile/Lock set in design §13.4.
 
 Narrow adaptation: drawer navigation; intervention card first; Pulse Rail
 becomes a vertical chronological list; content counts become two compact rows.
@@ -84,7 +86,8 @@ Acceptance notes:
   renders as zero content.
 - POSTED differentiates proven publication from imported unknown archive.
 - Grid/list preference may persist as non-sensitive presentation state; no
-  resource or mutation data is persisted.
+  captions or mutation bodies are persisted. The bounded auth/observation-only
+  sessionStorage exceptions are defined in design §§7.2 and 10.3.
 
 Narrow adaptation: one card per row; tabs horizontally scroll with visible
 edge affordance; filter opens a sheet; no hover-only controls.
@@ -135,6 +138,12 @@ Acceptance notes:
 - DRAFTS never shows Publish now.
 - Terminal approval renders/recomputes the canonical consequence independently.
 - A stale save preserves local content and presents old/current/local values.
+- F5 restores server-validated tab authentication and pending receipt lookup;
+  it does not submit Save again. Unsubmitted text still needs a leave warning.
+- Without verified media-inspection evidence, replace the illustrated pixel
+  dimensions with `Dimensions not inspected`; size/MIME alone do not prove them.
+- Occupied admission destinations show `Bundle ID already admitted here`;
+  editing the draft does not permit replacing the previously admitted copy.
 - Focus returns to the originating button after dialog close.
 
 ## Plate D — weekly pulse calendar
@@ -152,11 +161,8 @@ Acceptance notes:
 │                                                                             │
 │ NEXT OCCURRENCES                                                           │
 │ Sep 8 12:30 PDT · RANDOM · projection may change                           │
-│ Sep 9 07:00 PDT · QUEUE · no content possible if prior pulse consumes it   │
+│ Sep 9 07:00 PDT · QUEUE · projection may change                           │
 │ Sep 10 12:30 PDT · RANDOM · projection may change                          │
-│                                                                             │
-│ DST TEST FIXTURE — not this displayed week                                 │
-│ Mar 8 2026 02:00 America/Vancouver → 03:00; 3600 s counts against grace.   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,6 +175,15 @@ Acceptance notes:
 - Existing schedule ID is read-only.
 - The visible list is an excerpt; the implemented accessible list represents
   every graphical occurrence in the selected week.
+- Historical dates with no durable occurrence show `No execution record`;
+  current rules cannot prove a past missed or completed run.
+- Forecasts are instants, not simulated bundle consumption. Rail is the next
+  24 hours capped at 12, week is the selected seven-date window, editor shows
+  the next five. Browser-local display timezone is labelled.
+
+Separate acceptance fixture, not interface copy: March 8, 2026 at 02:00 in
+America/Vancouver resolves to 03:00; the 3,600-second gap counts against grace.
+The September reference week has no DST transition.
 
 ## Plate E — partial/ambiguous recovery
 
@@ -201,6 +216,12 @@ Acceptance notes:
 
 ## Plate F — disconnected/degraded system
 
+The illustrated Start service variant is a validated **simple-mode,
+systemd-user** installation. Hardened, manual, Windows-service, unknown, or
+unvalidated deployments show fixed operator instructions in its place, without
+a Start control. Offline inspection facts carry `Last observed` timestamps;
+otherwise display `Unknown` instead of the sample availability values.
+
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ SYSTEM                                            STUDIO ONLINE · DAEMON — │
@@ -218,6 +239,7 @@ Acceptance notes:
 │ ffmpeg                optional poster generation            — unavailable   │
 │                                                                             │
 │ [Copy redacted diagnostics]              No telemetry · GPL-3.0 source ↗   │
+│ Closing this tab does not stop scheduled publishing.                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 

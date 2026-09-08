@@ -5,7 +5,7 @@ stage: 2
 stage_state: done
 created: 2026-09-07
 core_ref: 2c775d13171775aa0e8bff00424744f9a6bac0a8
-design_version: 1
+design_version: 2
 ---
 
 # POST PULSAR Studio — local GUI design
@@ -22,6 +22,11 @@ It is optimized for Windows, macOS, and Linux desktop browsers and deliberately
 prepared for a future Tauri 2 shell. The full application remains open source.
 A future paid desktop build may charge approximately USD $20 for signed,
 packaged, store-delivered convenience without withholding functionality.
+
+Routine observation, editing, and forecasting are visual. Publication-enabling
+actions still receive exact approval in a trusted terminal; an enabled schedule
+then runs unattended under that approved rule. F5 retains the browser session
+and resumes observation of pending requests.
 
 ```text
 Browser tab
@@ -89,8 +94,9 @@ changes daemon state. Browser traffic cannot call platform adapters directly.
 1. The daemon is the sole durable state and publishing authority.
 2. The gateway never opens canonical SQLite state, provider credentials,
    account roots, or platform adapters.
-3. Every GUI mutation becomes the same durable request or confirmation flow
-   available to other clients.
+3. Every domain mutation becomes the same durable request or confirmation flow
+   available to other clients. Ephemeral session, preview-job, and inert-proposal
+   operations do not mutate publishing state or grant operator authority.
 4. HTTP `202 Accepted` means queued, never completed.
 5. A timed-out mutation has an unknown local transport outcome; the client
    resolves the original idempotency key/request instead of creating another.
@@ -104,8 +110,10 @@ changes daemon state. Browser traffic cannot call platform adapters directly.
 10. GUI closure, browser reload, gateway failure, and gateway upgrade cannot
     stop the daemon or invalidate durable work.
 11. MCP remains independently usable if the GUI is absent.
-12. No secret, filesystem path, raw provider response, or discovery record is
-    sent to browser JavaScript.
+12. No daemon/operator/provider secret, absolute filesystem path, raw provider
+    response, or discovery record is sent to browser JavaScript. The dedicated
+    ephemeral browser credential is the explicitly bounded exception in §7.2;
+    safe member basenames and public identities are presentation data.
 
 ## 5. Deployment topology and lifecycle
 
@@ -161,12 +169,20 @@ Scheduler, or administrator-provisioned service lifecycle remains independent.
 
 ### 5.2 Daemon startup convenience
 
-Allowed simple-mode commands are closed and rendered from validated installed
-service metadata:
+Commands are closed and rendered from validated installed service metadata:
 
-- Linux: `systemctl --user start post-pulsar.service`
-- macOS: the exact installed launchd label with `launchctl kickstart`
-- Windows: the exact installed Task Scheduler name with `schtasks.exe /run`
+| Service mode | Studio Start control |
+| --- | --- |
+| `systemd-user` | Simple mode only: fixed installed `systemctl --user start post-pulsar.service` |
+| `launchd-agent` | Simple mode only: `launchctl kickstart` with the exact installed user-domain label |
+| `windows-task` | Simple mode only: `schtasks.exe /run` with the exact installed task name |
+| `windows-service` | Instructions only; no SCM/elevation call |
+| `manual` | Instructions only |
+| Any service mode under hardened deployment | Instructions only; no Start button or start request |
+
+Unknown/unvalidated service metadata is instructions-only, never a guessed
+command. System always explains: `Closing this tab does not stop scheduled
+publishing.`
 
 Studio may start but never install, enable, stop, remove, or rewrite a service.
 Contention uses one bounded startup lock and rechecks authenticated discovery.
@@ -289,7 +305,7 @@ files. Hardened mode preserves distinct service/agent principals and ACLs.
 Studio stores its own lock, incarnation/launcher record, owner-only launch
 artifacts, and web log beneath platformdirs-derived directories for the current
 Studio principal, keyed by installation ID. Disposable preview metadata/cache
-lives in the matching cache location; browser/daemon sessions and ticket
+lives in the matching cache location; server-side browser-session and ticket
 hashes remain in memory. These locations are validated not to overlap daemon
 state, content roots, discovery, operator storage, logs, or each other. Creation
 and cleanup reuse symlink/hardlink-safe owner-only atomic file policy. Hardened
@@ -310,13 +326,18 @@ weak confidentiality boundary.
    JSON request and custom header.
 4. Studio consumes the ticket once and returns a separate random browser
    bearer that has no meaning to the daemon. A session has a 30-minute idle
-   expiry and eight-hour absolute expiry; an authenticated active tab may
-   rotate it before idle expiry without extending the absolute deadline.
-5. The Svelte client holds the bearer only in JavaScript memory and sends it in
-   `Authorization` for every protected read, mutation, and preview fetch.
+   expiry and eight-hour absolute expiry. Authenticated traffic slides the idle
+   deadline but never the absolute deadline; the bearer stays unchanged until
+   expiry, Lock, or gateway restart. There is no session-rotate operation.
+5. The Svelte client holds the bearer in same-origin, tab-scoped
+   `sessionStorage` and sends it in `Authorization` for every protected read,
+   mutation, and preview fetch. This survives F5; another loopback port has a
+   different origin and cannot read it. Server expiry/revocation remains final.
 6. The launch file is removed after successful exchange or expiry. The
-   browser-held credential disappears on tab closure; server session state
-   disappears only on gateway restart, expiry, or explicit lock.
+   browser's storage normally disappears on tab closure, but restored browser
+   sessions may restore it. Security relies on server expiry/revocation, not a
+   guarantee of browser deletion. Server state disappears on gateway restart,
+   expiry, or explicit lock.
 
 At most four unconsumed launch tickets and eight browser sessions exist per
 Studio incarnation. Minting a fifth ticket revokes the oldest unconsumed
@@ -324,15 +345,20 @@ ticket. A ninth session exchange is rejected with `session_capacity` and
 instructions to lock another tab or wait for expiry; Studio never silently
 evicts an active session. At most one ticket is emitted by a single CLI
 gesture. Ticket/session records contain only hashes. Expired records are reaped
-before every mint, exchange, rotation, and authenticated request and by a
-bounded 60-second maintenance task. Tab closure destroys the browser-held
-credential but is not relied on to notify the server; its server record expires
-normally. Explicit Lock and gateway shutdown revoke it immediately.
+before every mint, exchange, and authenticated request and by a
+bounded 60-second maintenance task. Tab closure is not relied on to notify the
+server; its server record expires normally. Explicit Lock revokes the session
+and clears its tab storage; gateway shutdown revokes every server session.
 
 No browser bearer is placed in a cookie, URL, query string, localStorage,
-sessionStorage, IndexedDB, log, error report, or static asset. A hard refresh
-intentionally requires a fresh secure launch. The session-loss screen explains
-the exact `post-pulsar web --open` recovery path without weakening auth.
+IndexedDB, log, error report, or static asset. Restore the session after refresh
+only by presenting its bearer to the server; stale storage is not proof of
+access. On expiry/restart, clear it and offer the exact `post-pulsar web --open`
+or trusted-terminal one-time-code path. If sessionStorage is blocked, announce
+memory-only fallback and its refresh limitation. Open external links with
+`noopener,noreferrer`; never copy a session into a new window intentionally.
+Same-origin XSS can access either memory or sessionStorage, so strict CSP and
+text-only rendering remain the relevant boundary.
 
 Static shell assets may be fetched without a session; all product data and
 preview bytes require the browser bearer. No route returns a credential that
@@ -377,48 +403,84 @@ background work returns a stale/degraded DTO rather than growing the queue. It
 revalidates discovery before starting the following daemon-authentication
 handshake.
 
-The long-lived daemon capability is never sent as a bearer to an unproven TCP
-peer. In hardened mode the gateway first validates the core-owned discovery
-record and establishes the pinned TLS channel defined in Section 8; HMAC then
-authorizes the agent client inside that server-authenticated channel. In simple
-same-principal mode, HMAC provides protocol authentication but does not pretend
-to defend against another process running as that principal. The control
-contract adds this bounded HMAC challenge/session exchange:
+Use standard pinned TLS and the existing per-request capability bearer, with
+no custom HMAC challenge, derived daemon-session bearer, or session-generation
+cache. The client first validates the protected discovery record and TLS peer
+using §7.5, then sends `Authorization: Bearer <capability>`. The core re-reads
+and compares the current capability on every request, including keepalive
+connections. Rotation/revocation therefore has no derived session to invalidate.
+Proposal records bind the current capability digest internally and are reaped
+on a capability change; that digest is never a credential or a browser field.
 
-1. The gateway sends a fresh client nonce without a secret.
-2. The daemon returns a fresh one-use server nonce, incarnation facts, expiry,
-   and a server proof MAC bound to installation ID, startup nonce, both nonces,
-   and the literal protocol label.
-3. The gateway verifies the MAC locally with the long-lived capability before
-   releasing a client proof.
-4. The daemon consumes the nonce pair and returns an incarnation-bound random
-   control-session bearer with ten-minute idle and one-hour absolute expiry.
-5. Normal control calls carry only that revocable session bearer. The gateway
-   rotates it through another challenge before idle expiry.
+Both simple and hardened new-match releases use this one transport. Simple
+mode provisions its identity automatically as the owner, without claiming
+protection from a compromised same-user process. Hardened mode uses the same
+wire protocol with pre-provisioned core/agent ACL separation. Keeping TLS in
+simple mode avoids sending credentials to a recycled port and avoids shipping
+two authentication implementations. The previously considered HMAC protocol
+is removed, not deferred for a planner to invent. Old matching HTTP core/plugin
+pairs remain supported as old installations; a new Studio never falls back to
+their transport.
 
-Proof labels, canonical encoding, nonce length, expiry, replay cache, constant-
-time comparison, request bounds, and test vectors are part of the checked-in
-control contract. Every challenge and control session binds the current
-capability generation. Capability rotate or revoke atomically invalidates every
-outstanding challenge and derived session before returning; no cached session
-may extend revoked authority. The daemon compares that generation on every
-authenticated request, not only at session creation. A daemon restart,
-discovery-identity change, or startup-nonce change invalidates the gateway's
-local session immediately and requires discovery validation plus a fresh
-challenge. A process that merely takes over the old port cannot present the
-pinned daemon identity in hardened mode, obtain the long-lived capability, or
-mint a valid daemon session. The session is bound to the validated TLS peer
-identity and is invalid after certificate rotation.
-Peer-authenticated Unix sockets/named pipes remain a possible later
-replacement, not an implicit assumption.
-
-Safe GETs may retry once only after a fresh handshake. Writes are never blindly
+Safe GETs may retry once only after renewed discovery and TLS validation. Writes are never blindly
 retried. A daemon incarnation, installation, version, operation, or capability
 mismatch immediately disables mutations and clears dependent cached data.
 
 The BFF maps explicit Pydantic DTOs. It never relays daemon dictionaries,
 headers, error bodies, paths, nonces, environment variable names, platform
 responses, or future operations generically.
+
+### 7.5 Pinned TLS control contract
+
+This is a required **new** core/plugin contract, not a claim about today's
+`control-v1.openapi.json`. Preserve existing application operation semantics;
+update discovery, server transport, CLI, MCP client, and contract pins together.
+
+| Item | Closed design choice |
+| --- | --- |
+| Transport | TLS 1.3 only, HTTP/1.1, literal loopback IP, no redirects/proxy/system trust, no TLS early data |
+| Key/certificate | Per-installation ECDSA P-256 key; self-signed X.509 v3 leaf; SHA-256 signature; critical CA=false and digitalSignature; EKU serverAuth; IP SANs `127.0.0.1` and `::1`; random 128-bit positive serial |
+| Certificate lifetime | Starts five minutes before creation, ends 365 days after; System warns at 30 days remaining. Expiry fails closed and gives the fixed renewal command. |
+| Discovery addition | Closed `control_transport` object: `scheme: "https"`, `auth: "capability-bearer-v1"`, `certificate_pem` (one certificate, ≤8 KiB), `certificate_sha256` (64 lower-case hex SHA-256 of complete DER), `identity_generation` (32 lower-case random hex) |
+| Existing identity | Installation ID, PID creation identity, startup nonce, exact endpoint and API major stay required; no file path is added to public transport metadata |
+| Trust setup | Validate file ACL/identity and PEM fingerprint locally; use a fresh `ssl.PROTOCOL_TLS_CLIENT` context trusting only that certificate, hostname/IP verification and `CERT_REQUIRED`; compare the peer's complete DER SHA-256 immediately after TLS negotiation and before any HTTP bytes; never load system roots, certifi, environment overrides, or TLS key logging |
+| Authentication | Existing `Authorization: Bearer`; operator routes additionally require existing operator-secret authentication. Only after successful TLS verification may HTTP headers/body be sent. |
+| Identity change | Close all pooled connections; discard cached authority and outstanding proposals; validate discovery and connect afresh. No opportunistic downgrade or trust-on-first-use. |
+
+The certificate is an exact leaf pin, replacing the earlier SPKI-pin wording.
+Python `ssl` and HTTPX's explicit SSL-context support provide transport and
+certificate validation; use a maintained certificate library for provisioning,
+never handwritten TLS or certificate parsing. Its exact compatible dependency
+belongs in the refreshed lock. The browser never sees this certificate,
+capability, key, or control endpoint; its Studio origin remains loopback HTTP.
+
+`post-pulsar control tls initialize` is an owner/core-only local command with no
+network input. Simple first setup runs it automatically. Hardened setup runs it
+explicitly after ACL provisioning. `post-pulsar control tls rotate` requires
+the daemon stopped at a verified safe boundary. It writes/fsyncs a fresh
+immutable key/certificate generation in core storage, then atomically replaces
+one core-owned active-generation manifest. Startup derives the public
+certificate and fingerprint from that committed generation before publishing
+the endpoint. A crash before the manifest replacement uses the old generation;
+after replacement it uses the new one. Retain at most the previous generation
+for explicit stopped-daemon rollback, never simultaneous old/new trust. Neither
+command accepts a browser-supplied path or adjusts hardened ACLs.
+
+Tests use fixed non-production certificate fixtures: exact pin success, wrong
+certificate even with the same public key, wrong installation/IP, expired/not-
+yet-valid certificate, TLS 1.2, changed discovery while pooled, rotation crash
+before/after manifest switch, capability revocation on a live connection, and
+zero HTTP credential bytes sent to a rejected peer. These are required future
+contract tests, not pre-existing vectors or executed evidence.
+
+Bound socket work in the daemon, not only the BFF: TLS handshake/header/body
+deadlines of 2 seconds each, 16 KiB headers, 64 KiB request bodies, 2 MiB JSON
+responses, and 2-second response writes. At most eight socket-reader slots
+feed a bounded queue of 32 complete requests; timeout/overflow closes or returns
+`busy`. Parse and verify complete requests before entering the single domain
+dispatcher. No slow socket holds the publishing lock or an open database
+transaction. The daemon retains one serialized mutation authority and one
+publisher; the socket readers add no scheduler or database writer.
 
 ## 8. Authority and approval model
 
@@ -464,7 +526,7 @@ returns an opaque 128-bit base32 proposal ID restricted to the literal grammar
 Proposals are single-use and expire after five minutes. Their action-bearing
 bodies are deleted on terminal completion, cancellation, expiry, daemon
 restart, relevant resource/profile change, or originating agent-capability
-generation rotation/revocation. A bounded reaper runs before proposal
+rotation/revocation. A bounded reaper runs before proposal
 operations and every 60 seconds. The closed record is no larger than 32 KiB and
 contains:
 
@@ -475,8 +537,20 @@ contains:
   ID where applicable;
 - full content fingerprint, ordered target account/platform IDs, and any
   delivery/request preconditions;
-- the daemon session epoch Studio observed and a SHA-256 hash of the complete
-  length-delimited canonical proposal fields.
+- core-stamped `installation_id` and `startup_nonce`, checked against validated
+  discovery by the trusted CLI, and a SHA-256 hash of the complete canonical
+  proposal fields. The BFF's opaque browser `daemon_session` is never part of
+  the canonical proposal or accepted as core identity.
+
+Canonical hashing is fixed: exclude only the `canonical_sha256` field; encode
+the closed record with sorted object keys, ASCII-escaped JSON strings, no
+insignificant whitespace, literal JSON booleans/null, integers only (no floats
+or NaN), explicit null for absent optional fields, and arrays in domain order.
+Do not normalize Unicode content. Hash UTF-8 bytes of the literal prefix
+`post-pulsar.authorization-proposal/v1` followed by one NUL byte and that JSON.
+The core and trusted Python CLI share this pure encoding function; browser
+JSON serialization is not an authority input. Contract fixtures must cover
+non-ASCII text, nulls, reordered keys, changed target order, and one-field drift.
 
 The browser receives only proposal ID/state/expiry and the fixed command; it
 never receives the record body. The proposal ID is non-secret and doubles as
@@ -519,8 +593,8 @@ unknown`. Claim is an atomic daemon operation, and only one proposal may be
 `claimed` installation-wide; concurrent terminals receive
 `authorization_busy`. The claim inherits the proposal's five-minute absolute
 deadline and cannot be renewed. After terminal review and immediately before
-intent creation, the daemon rechecks expiry, daemon incarnation, capability
-generation, policy, profile/resource revisions, targets, fingerprint, and
+intent creation, the daemon rechecks expiry, daemon incarnation, current
+capability digest, policy, profile/resource revisions, targets, fingerprint, and
 exact arguments under the same serialization boundary. Terminal Ctrl+C
 declines an unmutated claim. Browser Cancel may delete only `staged`; once
 claimed, Cancel, Lock, tab close, or Studio loss merely abandons observation
@@ -535,20 +609,25 @@ whole trusted operator path. Existing `confirmations approve` must also be
 hardened to fetch and render the canonical intent before reading/submitting the
 secret and to validate the returned exact identity before claiming success.
 
-The new authorize CLI and hardened existing approval command do not trust the
-agent-capability HMAC as server identity. In hardened mode the daemon exposes
-TLS 1.3 on literal loopback using a core-only private key; the corresponding
-SPKI pin and installation ID are provisioned in a core-owned discovery record
-readable but not writable by the operator or agent principal. The CLI rejects
-system-PKI fallback, redirects, pin/installation/incarnation mismatch, weak TLS,
-or an invalid record ACL and sends no operator-authenticated request until that
-pinned channel is established. Certificate rotation is an explicit operator
-operation that atomically writes the new pin and certificate, invalidates all
-sessions/proposals, and restarts discovery; no trust-on-first-use is allowed.
-Simple mode uses the same protocol where available, while acknowledging its
-same-principal threat boundary. The agent-capability challenge remains client
-authorization inside the authenticated channel; it is not described as proof
-to the operator that the peer is the core daemon.
+This separation is enforced in the daemon, not just in Studio's route allowlist.
+Every consume entry point checks the stored immutable intent origin before
+consumption or mutation replay: operator-origin intents require operator
+authentication over the pinned channel; a capability/session alone receives
+`operator_required`, even with the correct ID, binding, and idempotency key.
+The existing generic consume route must enforce this check too. Agent-origin
+consumption remains available only under its existing enabled policy and exact
+approved binding. Safe request-status lookup grants no consumption authority.
+Tests include a second agent racing the trusted CLI between approval and
+consumption, and replaying a consumed operator intent under an agent session.
+
+The new authorize CLI and existing approval command use the same §7.5 pinned
+TLS transport as Studio and MCP; the capability proves client access, not server
+identity. In hardened mode discovery is readable but not writable by agent/
+Studio. The trusted approval CLI runs as the existing core principal and has
+that principal's file rights. This does not invent a third operator identity
+or claim process isolation from trusted core tools. No operator-authenticated
+request is sent until certificate, installation, incarnation, and ACL checks
+pass. Simple mode uses the same transport with its documented same-user limit.
 
 A future Tauri native approval helper requires a separate authority design and
 OS user-presence review.
@@ -619,11 +698,12 @@ authority and data requirements are fixed.
 | `GET /profiles/{id}/content/{bucket}/{bundle}` | Exact bundle detail | Browser bearer |
 | `GET .../preview/{member}` | Bounded derived preview blob | Browser bearer |
 | `PATCH .../caption` / `.../alt` | Fingerprint-bound editorial request | Browser bearer + revision + idempotency |
-| `POST .../admit` | Create/consume exact admission intent | Existing confirmation policy |
-| `POST .../publish` | Create/consume exact publish intent | Existing confirmation policy |
+| `POST .../admit` | Default: stage inert admission proposal; enabled agent policy: exact agent-intent flow | Existing confirmation policy; never browser consumption of an operator intent |
+| `POST .../publish` | Default: stage inert publish proposal; enabled agent policy: exact agent-intent flow | Existing confirmation policy; never browser consumption of an operator intent |
 | `POST /authorization-proposals` | Stage inert exact proposal under default policy | Browser bearer + revision; no authority granted |
 | `GET/DELETE /authorization-proposals/{id}` | Poll safe state or cancel only an unclaimed proposal | Browser bearer + proposal ownership |
 | `GET /schedules` | Rules plus bounded forecast | Browser bearer |
+| `POST /schedule-preview` | Bounded read-only forecast for one unsaved exact rule | Browser bearer; no schedule or request is created |
 | `POST/PATCH /schedules` | Durable schedule mutations | Existing confirmation policy |
 | `GET /activity` | Descending unified history | Browser bearer |
 | `GET /requests/{id}` | Durable request progress | Browser bearer |
@@ -664,7 +744,8 @@ the full experience:
    `missed`, `no_content`, and execution state.
 9. Unified activity with timestamps, source kind, state transition, safe
    summary, filters, and descending pagination.
-10. Explicit caption/alt unset semantics; whitespace-only content is rejected.
+10. Exact caption/alt `change` union in §10.1; whitespace-only text, null and
+    ambiguous change bodies are rejected.
 11. Caller-viewed fingerprint precondition for editorial writes.
 12. Stable request `Location`, request ID, idempotency outcome, and safe timeout
     lookup guidance.
@@ -679,9 +760,12 @@ the full experience:
 17. Core-owned inert authorization proposals with the Section 8 schema, limits,
     state machine, one-claim mutex, safe agent status projection, and exact
     operator CLI retrieval/authorization operations.
-18. Hardened TLS server identity with core-only private key, pinned core-owned
-    discovery metadata, certificate rotation, and session invalidation; the
-    capability HMAC remains client authorization rather than server identity.
+18. Standard pinned TLS server identity per §7.5, protected discovery and key,
+    stopped-daemon rotation, and per-request capability authentication; no
+    custom challenge protocol or derived control-session cache.
+19. Operator-origin consumption enforcement across new and existing routes,
+    including replay paths; proposal possession never substitutes for operator
+    authentication.
 
 These additions preserve the current operation semantics. Any control schema
 change triggers a coordinated core/plugin contract release. The old matching
@@ -732,7 +816,14 @@ The browser never receives a path or direct file URL.
    input may not exceed the existing admitted platform limit or 512 MiB,
    whichever is lower. The parent rejects size changes while copying, verifies
    the staged hash, and removes scratch data on every exit path.
-4. The web release ships and self-tests a small platform sandbox launcher:
+4. Derived previews are a capability, independently gated per platform. The
+   first usable shell may render metadata/placeholders while decoder adapters
+   are developed; that milestone does not complete the designed Content/media
+   experience. The full GUI design retains working image previews on supported
+   reference systems, with video posters optional. A source build has the same
+   capability code/build instructions as a convenience package. Preview work
+   does not gate the safe observation/edit/scheduling surfaces. When enabled,
+   each platform uses a small self-tested sandbox launcher:
    Linux uses user/mount/network namespaces plus a seccomp syscall allowlist;
    macOS uses a signed App Sandbox helper with no network or broad file
    entitlements; Windows uses an AppContainer/restricted token with no network
@@ -762,7 +853,7 @@ The browser never receives a path or direct file URL.
    after ten minutes. Studio abandonment does not cancel the daemon job.
 9. A new authenticated daemon binary route serves only a ready cached
    derivative on the existing literal-loopback listener. It requires the
-   incarnation-bound control-session bearer plus opaque job/result ID, allows
+   current capability bearer over pinned TLS plus opaque job/result ID, allows
    GET only, disallows Range/redirect/chunked responses, requires exact
    `Content-Type` and `Content-Length`, sets `no-store`/`nosniff`, and sends at
    most 512 KiB. It never accepts a path or performs generation.
@@ -779,6 +870,16 @@ Initial target: WebP/JPEG/PNG derivative no larger than 1024 px on its longest
 edge and 512 KiB. Unsupported/corrupt images and unavailable video poster
 generation produce a safe placeholder plus metadata. Original video streaming
 is out of scope.
+
+With no verified decoder capability, show only safe member role, size, claimed
+MIME, and hash from the bounded scan. Dimensions, duration, codec, and visual
+preview are `not inspected`, unless exact-fingerprint cached inspection
+evidence exists. Do not run Pillow or ffprobe as an unadvertised fallback to
+populate metadata. The existing publish preflight is unchanged. Native sandbox
+availability is a per-platform capability/release gate, not a claim that every
+source checkout already has signed helper binaries. Planning must preserve
+this intended preview capability rather than declaring the whole media feature
+finished at a metadata-only milestone.
 
 Health requests must remain below 100 ms p95 and durable write acceptance below
 250 ms p95 on the reference local test host while the preview queue is full and
@@ -798,13 +899,42 @@ carries:
 - exact profile, bucket `DRAFTS`, and bundle ID;
 - exact fingerprint displayed to the operator;
 - exact resource/profile revision where applicable;
-- replacement text or explicit null/unset;
+- the exact replacement/unset `change` union below;
 - one idempotency key for that user gesture.
+
+For both caption and alt, the UI/core PATCH body has exactly
+`expected_fingerprint` (64 lower-case hex) and `change`. `change` is exactly one
+of `{"text":"non-empty text"}` or `{"unset":true}`. Reject null, empty or
+whitespace-only text, false unset, both fields, extra fields, or text over
+10,000 Unicode code points / the 64 KiB request bound. Preserve accepted text
+verbatim; do not trim or normalize it silently. `If-Match` is the profile
+revision (configuration changes), not a fictitious draft counter; the viewed
+fingerprint detects content edits. `Idempotency-Key` binds the whole request.
+The daemon's closed durable edit arguments carry bucket, bundle ID, fingerprint,
+and the same `change` union. This is a coordinated schema change, including MCP.
+
+Unset removes the exact caption/alt member under the same safe-file and
+mutation-lock policy as Save. Absent member is a completed `unchanged` result;
+never write an empty file. If unsetting would remove the draft's last semantic
+member, reject `last_draft_member` and preserve it; this operation is not bundle
+deletion. Successful edits return the resulting fingerprint and field presence.
 
 The daemon compares the viewed fingerprint at ingress and immediately before
 atomic replacement. Any mismatch returns a conflict. Studio preserves unsaved
 text, fetches the current version, and shows `Your version`, `Current version`,
 and a deliberate retry action. It never silently rebases.
+
+The guaranteed lost-update protection covers daemon-mediated GUI, CLI, and MCP
+edits: one per-bundle mutation serialization boundary spans final validation,
+replacement, and result observation. Admission uses that same boundary for
+daemon-mediated edits. A directly editing filesystem process need not obey it;
+two scans and `os.replace` cannot provide atomic compare-and-swap against such
+a writer. Folder-first workflows remain supported, but the editor explains
+that an external editor must be closed while saving through Studio. Detected
+external changes preserve the local form and return a conflict, never an
+automatic replay. Post-write identity drift is shown as unverified, not Saved.
+This is not a claim to isolate arbitrary DRAFTS writers: publication still
+copies and verifies every exact fingerprint-bound member independently.
 
 ### 10.2 Resource/action matrix
 
@@ -814,7 +944,7 @@ Studio does not implement a composite `Admit and publish` action.
 | --- | --- | --- | --- |
 | DRAFTS, current fingerprint never admitted | `Admit to…` | Approved `admit_draft`; profile revision + full fingerprint + exact destination bucket | Track admission request; show linked ready copy only after complete |
 | DRAFTS, same fingerprint already admitted | `View admitted copy` | Read-only navigation using admission provenance | Repeat admission disabled; editing creates a new fingerprint |
-| DRAFTS changed after prior admission | `Admit updated version…` | New approved `admit_draft` with new fingerprint | Existing ready copy remains a distinct immutable identity |
+| DRAFTS changed after prior admission | `Review admission destinations…` | New approved `admit_draft` only to an unused eligible destination | A changed fingerprint does not free an existing destination identity |
 | Ready on-disk QUEUE/RANDOM/REELS bundle not yet durable | `Publish now` | Approved `enqueue`; profile + bucket + ID + full fingerprint + revision | Success only after admitted bundle/deliveries/archive agree |
 | Eligible durable pending/recoverable bundle | `Run now` | Approved `run_now`; bundle key + revision + fingerprint | Follow exact bundle/delivery result, never request status alone |
 | Known blocked failed delivery | `Review recovery` then `Retry` | Approved `retry`; exact bundle/platform/revision/fingerprint | Only after current target validation; never for ambiguous |
@@ -835,6 +965,18 @@ Draft inventory includes `admission_state`, admitted fingerprint, destination
 identity, intent/request identity, admitted time, and `changed_since_admission`.
 The original DRAFT and ready copy link to one another without being conflated.
 
+Admission journals permanently reserve `(profile, destination bucket, bundle
+ID)` and also prevent reuse of a fingerprint within a profile. Archiving or
+removing the ready directory does not release that reservation. Destination
+eligibility therefore consults journals and filesystem state together. An
+occupied destination shows `Bundle ID already admitted here` and a link to its
+history. A changed draft may use a different eligible unused bucket; otherwise
+the operator prepares a new semantic bundle ID in DRAFTS with the existing
+folder workflow. Studio v1 never renames files, invents a version suffix,
+overwrites a ready copy, or promises replacement admission. The final admission
+check repeats these constraints after approval, so another client can make the
+displayed destination stale without causing replacement.
+
 ### 10.3 Idempotency
 
 - Generate one cryptographically random idempotency key per explicit gesture.
@@ -846,12 +988,30 @@ The original DRAFT and ready copy link to one another without being conflated.
 - Out-of-order responses with an older resource revision or daemon session
   cannot replace newer client state.
 
-Within a living tab, an unknown response is resolved using the in-memory
-canonical request and original key. After browser/gateway loss, Studio does not
-auto-replay: it first shows recent durable requests/activity and asks the
-operator to identify the result. Transparent cross-restart retry receipts are
-out of scope unless separately designed as a bounded owner-only journal; they
-must never become an offline mutation queue.
+Within a living document, unknown outcomes use the in-memory canonical request
+and original key. To survive F5, tab sessionStorage may additionally retain at
+most 32 safe pending receipts (≤1 KiB each, eight-hour expiry): operation ID,
+profile/resource IDs, idempotency key, request digest, observed revision/epoch,
+and known request/proposal ID. No caption, alt text, action body, provider data,
+or automatic replay instruction is stored. A 33rd unresolved mutation is not
+dispatched until a receipt settles or the operator deliberately abandons its
+observation; never silently evict a live receipt. This exception is
+observation-only.
+After refresh, restore auth then resolve these receipts through exact key/ID
+lookup before enabling another mutation on the affected resource. `not_found`
+while an earlier dispatch may still be live means unknown, not permission to
+replay. The BFF retains bounded in-flight dispatch state across a browser
+disconnect; it does not cancel a forwarded write because fetch was aborted.
+Only a known terminal result clears the pending lock automatically. An operator
+may deliberately abandon observation after reviewing fresh authoritative state;
+the UI never reports that as cancellation of the original work.
+
+After gateway loss, connection ambiguity or lost receipts, Studio shows durable
+requests/activity and asks the operator to identify the result; it does not
+auto-replay. A lost unsaved form is not reconstructed from storage. Dirty-form
+navigation/refresh uses the browser's supported leave warning, and queued Save
+is visibly distinct from Saved. No offline mutation queue or persistent BFF
+journal is introduced.
 
 ### 10.4 Separate state axes
 
@@ -955,11 +1115,15 @@ renders authoritative core forecasts, not JavaScript timezone calculations.
 - Weekdays use Monday `0` through Sunday `6` in the daemon but human labels in
   the UI.
 - Time is `HH:MM` in the explicit IANA schedule timezone.
-- Show schedule-local time and the operator's current local equivalent.
+- Show schedule-local time and the operator's browser-reported current IANA
+  timezone equivalent. If unavailable, show UTC with that label; never guess.
+  Browser conversion formats a daemon-supplied UTC instant only and never
+  calculates a schedule occurrence.
 - A repeated DST time fires once at the earlier instant.
 - A nonexistent time moves to the first valid minute; the gap counts against
   misfire grace.
-- Missed work is recorded, not backfilled.
+- An evaluated current-date occurrence beyond grace is recorded as `missed`;
+  past dates are not backfilled.
 - Simultaneous schedules can yield `no_content` after another occurrence uses
   the only eligible bundle.
 - A projected bundle may change before the pulse; no card says `reserved`.
@@ -967,6 +1131,41 @@ renders authoritative core forecasts, not JavaScript timezone calculations.
 New schedules begin disabled by default. Enabling, changing an enabled rule,
 or modifying one with due work uses the confirmation flow. Disable uses the
 existing safe operation but still waits for its durable request to complete.
+
+Forecasts and execution evidence are different records. History shows only
+persisted `schedule_runs`, retaining their captured scheduled instant and rule
+hash. If the daemon was offline for whole dates, those dates may have no record;
+show `No execution record`, never infer `missed`, `no_content`, or successful
+execution from today's schedule. Editing a rule does not rewrite past history.
+Forecast responses identify the current rule revision and observation time;
+disabled rules are marked hypothetical and cannot appear as enabled pulses.
+
+Forecast algorithm and bounds are shared by every view:
+
+1. The daemon walks successive matching local dates and calls the existing
+   `resolve_occurrence`; never step through UTC hours or simulate publication.
+2. Pulse Rail uses `(observed_now, observed_now + 24 hours]`, shows at most 12
+   occurrences, and links overflow to Schedules. A selected calendar week is
+   an explicit half-open UTC window corresponding to seven browser-local dates;
+   its maximum span is 169 hours across DST. Each rule is evaluated in its own
+   stored timezone and then clipped to that shared window.
+3. Editor preview returns the next five instants for one exact candidate rule,
+   searching at most 35 successive local dates. Unsaved/disabled previews are
+   explicitly hypothetical; no durable occurrence is created. A date with no
+   valid instant yields a bounded `unresolvable_local_date` issue, not a crash
+   or invented instant.
+4. One forecast call examines at most 128 rules and returns at most 500
+   occurrences; exceeding either bound yields `truncated=true` with a scope-
+   narrowing instruction. Only a complete bounded result may show an exact
+   overflow count; otherwise say `More occurrences`.
+5. Order by UTC instant, profile ID, schedule ID. Each item includes rule
+   revision/hash, nominal local date/time, resolved UTC instant, offset,
+   gap-delay seconds, and fold/gap annotation. Past durable history stays a
+   separate projection.
+6. No consumption simulation, future RANDOM-counter increment, reservation,
+   or predicted `no_content` execution state is performed. A bucket's current
+   projected-next candidate is a separate observed fact, using core
+   `preview_selected_bundle` semantics without changing the counter.
 
 ## 12. Information architecture and screens
 
@@ -1022,8 +1221,8 @@ Overview is intervention-first:
 7. Enabled schedules and next canonical occurrences.
 8. Recent durable activity.
 
-The signature **Pulse Rail** spans the main content width and shows the next
-24 hours or next 12 occurrences across profiles. Each mark contains profile,
+The signature **Pulse Rail** spans the main content width and shows at most
+12 occurrences within the next 24 hours across profiles. Each mark contains profile,
 bucket, schedule-local time, operator-local time, and forecast state. It is
 fully duplicated by an accessible list.
 
@@ -1190,6 +1389,15 @@ Provisional dark palette:
 | Warning | `#F0B45A` |
 | Danger | `#F06D7A` |
 
+The paired light palette is canvas `#F7F8FA`, surface `#FFFFFF`, raised surface
+`#EEF1F5`, border `#778395`, primary text `#121923`, muted text `#4D5B6D`, accent
+`#086779`, success `#17653F`, warning `#805100`, and danger `#A62A3D`. Accent-fill
+buttons use `#071317` text in dark mode and white in light mode. Dark input and
+focus boundaries that must identify a control use `#63758B`; the darker panel
+border is decorative, not its only interaction boundary. Hover/selected states
+use these opaque tokens, never opacity that reduces required contrast. State
+text always includes the icon/label defined in the closed state model.
+
 A complete accessible light theme is designed from the same semantic tokens,
 not produced by inversion. Final colors require automated contrast checks in
 default, hover, focus, selected, disabled, and high-contrast states.
@@ -1202,9 +1410,12 @@ default, hover, focus, selected, disabled, and high-contrast states.
 - Header: 56 px. Main content max: 1600 px.
 - Data-heavy text: 13–14 px; body: 15–16 px; page title: 24–28 px.
 
-Bundle an open-source variable sans font and mono font or use an explicit
-cross-platform system fallback. Never fetch fonts remotely. Font files,
-licenses, subsetting, and Linux/macOS/Windows rendering are release gates.
+Use the system sans stack `ui-sans-serif, system-ui, -apple-system,
+BlinkMacSystemFont, "Segoe UI", sans-serif` with line-height 1.45, and mono
+`ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace` for
+technical identities. This is the v1 font decision, with native OS rendering
+checked in the browser matrix. A later bundled brand font is optional and
+requires its own license/contrast review; never fetch fonts remotely.
 
 ### 13.3 Phosphor usage
 
@@ -1242,6 +1453,20 @@ Initial owned primitives:
 One component renders each domain status axis from a closed enum. Pages do not
 invent colors or labels ad hoc.
 
+CommandPalette opens with Cmd+K on macOS and Ctrl+K elsewhere, with the matching
+visible accelerator. Its closed command set is navigation to the five screens,
+profile switch, focus bundle-ID search, and Lock session. No shell, publication,
+approval, hidden admin command, or arbitrary route runs through it. It follows
+the labelled combobox/listbox keyboard pattern, supports Escape, and returns
+focus to its invoker.
+
+TimeField is a labelled native `input type="time"` with minute precision, a
+visible 24-hour HH:MM example and separate timezone label. It emits a local
+time string, never a Date/UTC timestamp; invalid/incomplete input cannot submit.
+PulseRail has decorative marks paired with the same ordered semantic
+OccurrenceList. Every available mark action has a labelled keyboard-operable
+list action; neither surface requires dragging or implements an ARIA grid.
+
 ### 13.5 Motion
 
 - 120 ms hover/focus, 160–180 ms sheet/dialog transitions.
@@ -1275,6 +1500,8 @@ Target WCAG 2.2 AA.
 
 - Semantic landmarks, headings, lists, tables, fieldsets, labels, and native
   controls precede ARIA.
+- Set document `lang="en"`; provide a first-focusable Skip to main content
+  link, one main landmark, and route-change focus on the new page heading.
 - Full keyboard operation; no drag-only, hover-only, or pointer-only action.
 - Follow WAI-ARIA Authoring Practices for dialogs, grids, menus, tabs, and focus
   restoration.
@@ -1572,9 +1799,9 @@ work cannot starve health, scheduling, publishing, or control operations.
 - Caption/filename/error XSS, CSP enforcement, frame denial, no remote assets.
 - Daemon capability rotation, endpoint replacement, PID reuse, port collision,
   and incompatible API.
-- Every derived daemon session is rejected immediately after capability
-  rotation/revocation, discovery identity change, or daemon restart; the
-  generation check occurs on every authenticated request.
+- Every control request rechecks the current capability, including a pooled
+  connection after rotation/revocation. Discovery/certificate/incarnation
+  changes discard connections and proposals; no derived authority survives.
 - Ninth browser-session rejection, TTL reaping, ticket/session capacity
   recovery, and tab-close expiry without a fictitious close notification.
 - Browser never receives daemon/operator/provider secrets or absolute paths.
@@ -1624,6 +1851,15 @@ No live social post is required for CI or GUI release verification.
   fallback, not the primary Windows deployment.
 - macOS: current supported release, Safari/WebKit and launchd.
 
+This browser/service matrix covers simple same-user deployments on all three
+OSes. Hardened split-principal deployment additionally requires the current
+native policy validation: Linux POSIX policy and Windows protected ACLs.
+macOS hardened mode is currently unsupported because the core's native ACL
+validator fails closed there; requesting it must show `hardened_unsupported`,
+never silently start simple mode. macOS simple mode remains a full web-app
+target. Adding hardened macOS later requires its own native ACL/principal
+design and tests; a sandboxed preview helper does not establish that support.
+
 Mocked service rendering runs in CI; one approved native browser smoke per OS is
 a release gate. Future Tauri adds WebView2, WKWebView, WebKitGTK, code signing,
 notarization, updater, sandbox, install/uninstall, and background-service tests.
@@ -1633,7 +1869,7 @@ notarization, updater, sandbox, install/uninstall, and background-service tests.
 1. Land secure read-only gateway, session, handshake, health, and typed UI shell
    against current control endpoints.
 2. In one non-shippable compatibility phase, add pinned hardened TLS identity,
-   daemon challenge auth, exact read projections, preview workers/routes,
+   per-request capability auth, exact read projections, preview workers/routes,
    fingerprint-safe edits, inert proposal rendezvous, and trusted authorization;
    update OpenAPI, sibling plugin contract copy/hash/core pin, and old-match/
    new-match integration pairs. None ships independently.
@@ -1663,14 +1899,14 @@ diagnostics only; it does not attempt compatibility by guessing.
 | Risk | Severity | Design mitigation | Falsifying evidence |
 | --- | --- | --- | --- |
 | Browser gains daemon/operator authority | High | Separate bearer, allowlisted DTO/actions, terminal approval | Browser can invoke raw route/header or read capability |
-| Local cross-port credential theft | High | No auth cookie; one-use launch and in-memory bearer | Other port obtains a credential accepted by Studio |
-| Stale draft overwrite | High | Caller-viewed fingerprint checked twice | Second editor overwrites changed content |
+| Local cross-port credential theft | High | No auth cookie; one-use launch and origin-scoped tab bearer | Other port obtains a credential accepted by Studio |
+| Stale daemon-mediated draft overwrite | High | Viewed fingerprint plus shared mutation serialization; external-writer limit explicit | Second GUI/MCP edit overwrites a changed draft using the old fingerprint |
 | Wrong-account approval | High | Exact profile/targets/fingerprint/revision/consequence | Any bound field changes and intent still consumes |
 | Unknown response duplicates work | High | Stable idempotency and lookup-before-retry | Dropped response creates a second request/post |
 | Preview harms publisher | High | Background bounded derivative, small cached result | Poisoned media raises control/scheduler latency beyond budget |
 | Scan error looks empty | High | Explicit blocked issue/freshness model | Failed authoritative scan renders zero items without warning |
 | UI offers retry for ambiguity | High | Closed recovery action matrix | Ambiguous state presents or automatically issues Retry |
-| Daemon replacement accepted | High | Core-owned SPKI pin, TLS identity, and incarnation/installation handshake | Stale/reused endpoint enables writes |
+| Daemon replacement accepted | High | Protected exact certificate pin, TLS, incarnation/installation validation | Stale/reused endpoint enables writes |
 | GUI/MCP semantics diverge | High | Same durable operations and coordinated contract journey | Same inputs yield different binding/state outcomes |
 | Upgrade damages state | High | Avoid schema change; backups/fail-closed migrations | Older/newer binary mutates unknown schema |
 | GUI exit stops schedules | High | Independent daemon/service lifecycle | Closing tab/gateway stops daemon |
@@ -1686,7 +1922,7 @@ Resolved:
 - Tailwind 4, owned shadcn-svelte/Bits UI components, Phosphor icons.
 - Intervention-first product and weekly pulse calendar.
 - Existing bucket semantics; projections rather than invented reservations.
-- One-use launch plus in-memory browser bearer; no authentication cookie.
+- One-use launch plus origin-scoped sessionStorage bearer; no auth cookie.
 - Independent real-TTY approval over core-pinned TLS; no operator secret in
   browser/BFF or agent-principal child.
 - Polling first, bounded previews, disposable GUI caches.
@@ -1695,7 +1931,8 @@ Resolved:
 
 Deferred operator/product gates:
 
-- Exact visual brand palette/font selection after contrast and license proof.
+- Validate the specified dark/light tokens and system typography in rendered
+  components before accepting visual baselines; a later brand font is optional.
 - Native browser smoke sessions on each OS require scheduled human approval.
 - Browser upload/import needs its own staging/ACL/crash-recovery design.
 - Native Tauri approval, file import, service installer, updater, and store
@@ -1743,6 +1980,10 @@ future implementation/release gates; this design does not claim they ran.
 - [shadcn-svelte introduction](https://www.shadcn-svelte.com/docs)
 - [Phosphor Icons](https://phosphoricons.com/)
 - [FastAPI features](https://fastapi.tiangolo.com/features/)
+- [Python SSL contexts and certificate validation](https://docs.python.org/3/library/ssl.html)
+- [HTTPX explicit SSL context](https://www.python-httpx.org/advanced/ssl/)
+- [Browser sessionStorage lifetime and origin scope](https://developer.mozilla.org/en-US/docs/Web/API/Window/sessionStorage)
+- [Apple App Sandbox and helper constraints](https://developer.apple.com/documentation/security/protecting-user-data-with-app-sandbox)
 - [FastAPI strict content-type/CSRF note](https://fastapi.tiangolo.com/advanced/strict-content-type/)
 - [RFC 6265 cookie weak confidentiality](https://www.rfc-editor.org/rfc/rfc6265#section-8.5)
 - [Tauri 2 overview](https://v2.tauri.app/start/)

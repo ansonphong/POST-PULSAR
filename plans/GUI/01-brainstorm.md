@@ -254,7 +254,7 @@ not change the repository license.
 - Weekly recurring bucket-pulse calendar, occurrence forecast, enable/disable,
   and schedule editing.
 - Durable activity, pause/resume, request tracking, retry, and reconciliation.
-- Real-TTY operator approval broker or exact CLI handoff.
+- Independent real-TTY operator approval through the daemon-owned rendezvous.
 - Coordinated MCP contract compatibility.
 
 ### Deliberately later
